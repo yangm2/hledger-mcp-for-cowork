@@ -1,0 +1,7 @@
+[package]
+name = "hledger-mcp-for-cowork"
+version = "0.1.0"
+edition = "2024"
+description = "An hledger MCP (model context protocol) implementation for Claude Cowork"
+
+[dependencies]
