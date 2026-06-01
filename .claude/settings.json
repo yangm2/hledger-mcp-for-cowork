@@ -12,7 +12,9 @@
       "WebFetch(domain:static.crates.io)",
       "WebFetch(domain:static.rust-lang.org)",
       "WebFetch(domain:crates.io)",
-      "WebFetch(domain:claude.com)"
+      "WebFetch(domain:claude.com)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:index.crates.io)"
     ]
   },
   "hooks": {

@@ -87,8 +87,11 @@ container)**, so **there is no cross-compilation step.** Each target builds on i
 
 Use **`tracing`** as the facade everywhere; select the subscriber at runtime by platform:
 
-- **macOS → the system unified logger** (`os_log`), via a `tracing` → oslog layer (e.g.
-  `tracing-oslog`). Inspect with `log stream` / Console.app.
+- **macOS → the system unified logger** (`os_log`), via a `tracing` → oslog layer built on
+  **[`apple-log`](https://docs.rs/apple-log/0.6.0/apple_log) 0.6.0** (a thin
+  `tracing_subscriber::Layer` forwarding events to `apple_log` under a fixed subsystem +
+  category). Inspect with `log stream` / Console.app; tests assert log lines via
+  `apple_log::OSLogStore`. (`apple-log` is the pinned choice — not `tracing-oslog`.)
 - **Linux (container) → conventional structured logs on stdout/stderr** (12-factor:
   `tracing-subscriber` JSON, collected by the container runtime). No log files in the image.
 
