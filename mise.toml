@@ -115,12 +115,40 @@ run = "cargo test --test smoke -- --nocapture"
 description = "Coverage (strict bar: >=85% lines)"
 run = "cargo llvm-cov --all-features --workspace --fail-under-lines 85"
 
+[tasks.golden]
+description = "Regenerate the hledger -O json golden fixtures from the pinned binary + synthetic sample journal. Run deliberately after an hledger version bump; commit the diff. Scrubs the absolute -f path so fixtures stay machine-independent and PII-free."
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+hl="${HLEDGER_EXECUTABLE_PATH:-hledger}"
+dir="tests/fixtures"
+[ -f "$dir/sample.journal" ] || { echo "golden: missing $dir/sample.journal" >&2; exit 1; }
+# Run from the fixtures dir with a RELATIVE -f so hledger's tsourcepos paths are relative;
+# then scrub the absolute form hledger expands to (no $HOME / machine path leaks — public repo).
+abs="$(cd "$dir" && pwd)/sample.journal"
+( cd "$dir"
+  "$hl" balance assets:checking -f sample.journal -O json > balance_single.json
+  "$hl" balance               -f sample.journal -O json > balance_all.json
+  "$hl" print                 -f sample.journal -O json > print_basic.json
+  "$hl" register expenses     -f sample.journal -O json > register_basic.json
+)
+python3 - "$abs" "$dir" <<'PY'
+import pathlib, sys
+abspath, dir = sys.argv[1], pathlib.Path(sys.argv[2])
+for f in ("balance_single.json","balance_all.json","print_basic.json","register_basic.json"):
+    p = dir / f
+    p.write_text(p.read_text().replace(abspath, "sample.journal"))
+PY
+echo "golden: regenerated fixtures in $dir (scrubbed). Review the diff before committing."
+'''
+
 [tasks.mutants]
 description = "Mutation testing on the pure, high-stakes modules (assertion strength; periodic/on-demand, not in the Stop-hook gate). Surviving mutants = test gaps."
 # Scope to pure correctness-critical code where a surviving mutant is a real hole;
 # the subprocess/transport/logging glue is excluded (mutants there mostly time out).
-# Tighten --in-place/paths as modules land (M1 parser, M2 formatter, M3 CAS, M4 domain).
-run = "cargo mutants --no-shuffle -- --all-features"
+# M1 in-scope: the -O json parser + the exact-decimal amount. Extend as modules land
+# (M2 formatter, M3 CAS, M4 domain).
+run = "cargo mutants --no-shuffle -f src/hledger/json.rs -f src/hledger/amount.rs -- --all-features"
 
 [tasks.mutants-diff]
 description = "Fast mutation testing: only mutate lines changed vs the merge base (suitable for PR CI gating)."
@@ -203,14 +231,16 @@ sudo log stream \
 '''
 
 [tasks.install]
-description = "Register this MCP server in Claude Desktop config (also exposes it to Claude Cowork via Desktop's SDK bridge). Builds a debug binary, writes an absolute-path stdio entry. Idempotent; restart Claude to load it. Pass -v/-vv to register with debug/trace logging."
+description = "Register this MCP server in Claude Desktop config (also exposes it to Claude Cowork via Desktop's SDK bridge). Builds a debug binary, writes an absolute-path stdio entry pinning hledger + the journal. Idempotent; restart Claude to load it. Pass -v/-vv for debug/trace logging, --journal <path> for the ledger to serve."
 quiet = true
 depends = ["build"]
-# `usage` spec parses task flags (mise surfaces them as `usage_*` env vars). The
-# repeatable `-v` sets how many `-v`s are baked into the registered server's args, so
-# Cowork/Desktop launches it at debug (-v) or trace (-vv) verbosity for diagnosis.
+# `usage` spec parses task flags (mise surfaces them as `usage_*` env vars). `-v` (repeatable)
+# sets how many `-v`s are baked into the registered server's args (debug/trace verbosity).
+# `--journal` sets the ledger the registered server serves (baked into the entry as LEDGER_FILE,
+# which the binary reads); falls back to the LEDGER_FILE in the environment when omitted.
 usage = '''
 flag "-v --verbose" count=#true help="Register the server with raised log verbosity (-v = debug, -vv = trace)"
+flag "-j --journal <path>" help="Journal file the registered server serves (sets LEDGER_FILE; without it, read tools error until a journal is configured)"
 '''
 run = '''
 #!/usr/bin/env bash
@@ -223,6 +253,11 @@ bin="$PWD/target/debug/hledger-mcp-for-cowork"
 # many `-v` args for the registered server.
 verbosity="${usage_verbose:-0}"
 
+# Journal: the --journal flag wins, else the LEDGER_FILE already in the environment. Baked
+# into the registered entry as LEDGER_FILE (the binary reads it); empty → no journal pinned
+# (the server runs but read tools error until one is configured).
+journal="${usage_journal:-${LEDGER_FILE:-}}"
+
 # Claude Desktop config path. Cowork bridges these stdio servers via the SDK layer,
 # so registering here makes the server available to both Desktop and Cowork.
 case "$(uname -s)" in
@@ -233,21 +268,33 @@ esac
 
 # Idempotent JSON merge (don't clobber other mcpServers). The config lives under
 # $HOME outside the repo, so the absolute paths here are not repo PII.
-python3 - "$cfg" "$bin" "${HLEDGER_EXECUTABLE_PATH:-}" "$verbosity" <<'PY'
+python3 - "$cfg" "$bin" "${HLEDGER_EXECUTABLE_PATH:-}" "$verbosity" "$journal" <<'PY'
 import json, pathlib, sys
-cfg, binpath, hl, verbosity = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+cfg, binpath, hl, verbosity, journal = sys.argv[1:6]
+verbosity = int(verbosity)
 p = pathlib.Path(cfg)
 data = json.loads(p.read_text()) if p.exists() else {}
 args = ["-v"] * verbosity   # 0 → [], 1 → ["-v"], 2 → ["-v","-v"] (clap counts them)
 entry = {"command": binpath, "args": args}
+# Bake the runtime env the launched server needs: which hledger, and which ledger.
+env = {}
 if hl:
-    entry["env"] = {"HLEDGER_EXECUTABLE_PATH": hl}
+    env["HLEDGER_EXECUTABLE_PATH"] = hl
+if journal:
+    env["LEDGER_FILE"] = journal
+if env:
+    entry["env"] = env
 data.setdefault("mcpServers", {})["hledger-mcp"] = entry
 p.parent.mkdir(parents=True, exist_ok=True)
 p.write_text(json.dumps(data, indent=2) + "\n")
 level = {0: "info", 1: "debug"}.get(verbosity, "trace")
 print(f"install: registered 'hledger-mcp' -> {binpath} (log level: {level})")
-print(f"  config: {cfg}")
+print(f"  config:  {cfg}")
+print(f"  hledger: {hl or '(PATH fallback — HLEDGER_EXECUTABLE_PATH not set at install)'}")
+if journal:
+    print(f"  journal: {journal}")
+else:
+    print("  journal: (none — read tools will error; re-run with --journal <path> or set LEDGER_FILE)")
 print("  restart Claude Desktop / Cowork to load it.")
 PY
 '''

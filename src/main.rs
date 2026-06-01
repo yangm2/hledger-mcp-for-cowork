@@ -6,9 +6,12 @@
 
 #![forbid(unsafe_code)]
 
+use std::path::PathBuf;
+
 use anyhow::Context as _;
 use clap::Parser;
 use hledger_mcp_for_cowork::HledgerMcp;
+use hledger_mcp_for_cowork::hledger::Hledger;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use tokio_util::sync::CancellationToken;
@@ -21,6 +24,11 @@ struct Cli {
     /// `RUST_LOG` is set (that wins).
     #[arg(long, short = 'v', action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Path to the hledger journal to serve. Defaults to the `LEDGER_FILE` environment
+    /// variable (hledger's own convention); read tools error until one is set.
+    #[arg(long, env = "LEDGER_FILE")]
+    journal: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -32,6 +40,33 @@ async fn main() -> anyhow::Result<()> {
         "starting hledger-mcp (stdio)"
     );
 
+    // Resolve the hledger adapter and check the version pin at startup. Policy (M1):
+    // warn-and-continue for reads — a mismatch is logged loudly and surfaced in `status`,
+    // not fatal. The write path (M2) hard-gates on the pin before mutating anything.
+    let hledger = Hledger::from_env(cli.journal.clone());
+    match hledger.version().await {
+        Ok(version) if version.pin_matches() => {
+            tracing::info!(hledger.version = %version.raw, "hledger detected (pin OK)");
+        }
+        Ok(version) => {
+            tracing::warn!(
+                hledger.version = %version.raw,
+                expected = ?hledger_mcp_for_cowork::hledger::PINNED_VERSION,
+                "hledger version does not match the pinned 1.52 — read output may differ; \
+                 writes (M2) will refuse to run",
+            );
+        }
+        Err(err) => {
+            tracing::warn!(%err, "could not detect hledger version at startup; read tools will \
+                                  error until a working hledger is configured");
+        }
+    }
+    if !hledger.has_journal() {
+        tracing::warn!(
+            "no journal configured (--journal or LEDGER_FILE); read tools will error until set"
+        );
+    }
+
     let ct = CancellationToken::new();
     let signal_ct = ct.clone();
     tokio::spawn(async move {
@@ -40,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
         signal_ct.cancel();
     });
 
-    let service = HledgerMcp::new()
+    let service = HledgerMcp::new(hledger)
         .serve_with_ct(stdio(), ct)
         .await
         .context("failed to start MCP stdio service")?;

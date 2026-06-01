@@ -120,7 +120,53 @@ read tools).
 
 ## Exit-criteria review
 
-> Fill in when closing M1. Run `mise run check` + `mise run cov`; confirm the 85% gate is now
-> active and met. Grep to confirm the adapter is the *only* hledger entry point — this is the
-> property M2/M4 depend on. Verify a deliberately-bumped golden fixture is caught by the tests.
-> Record the verdict (*done / done-with-deferrals / not-done*).
+**Reviewed 2026-06-01 — verdict: done-with-deferrals.**
+
+Gate (run via `mise`, hledger 1.52 from `.env.local`):
+
+- `mise run check` — **green**: `cargo fmt --check`, clippy `-D warnings` (host **and** the
+  `aarch64-unknown-linux-gnu` cross target; `x86_64` std not installed locally → skipped, still
+  covered by CI), and **62 tests** pass (unit + golden + proptest + stdio integration + e2e).
+- `mise run cov` — **89.08% lines ≥ 85%** (hard gate now active). The pure modules are at/near
+  100%: `amount.rs` 100%, `cli.rs` 100%, `json.rs` 100%, `mod.rs` 95%, `runner.rs` 92%,
+  `server.rs` 89%. (`main.rs` reads 0% — it is exercised only by the *spawned-subprocess* stdio
+  e2e, which llvm-cov cannot instrument; `logging.rs` 75% — the macOS os_log layer can't be
+  readback-tested, per the apple-log gotcha. Both are accepted; the total clears the bar.)
+- `mise run mutants` (scoped to `json.rs` + `amount.rs`) — **24 mutants: 18 caught, 6 unviable,
+  0 survived.** Zero survivors already meets the stricter M2 bar.
+
+Checklist:
+
+- [x] `mise run check` green; `mise run cov` ≥ 85% (89.08%).
+- [x] All hledger interaction goes through the single adapter module — grep confirms no
+      `process::Command` / `Command::new` outside `src/hledger/`.
+- [x] Parser ignores unknown JSON fields (`json::tests::ignores_unknown_fields` injects bogus
+      fields and still parses).
+- [x] Golden fixtures recorded from pinned 1.52 and asserted; `mise run golden` regenerates
+      (and scrubs the absolute `-f` path so fixtures stay machine-independent / PII-free).
+- [x] Startup version check detects a non-1.52 binary and surfaces it (`mod::tests`
+      pin-mismatch unit tests + `status` reports `hledger X.Y (pinned|MISMATCH)`; `main` logs
+      a warn on mismatch — warn-and-continue for reads, documented; M2 hard-gates writes).
+- [x] `get_account_balance` + `list_transactions` work e2e against real hledger
+      (`mod::tests::balance_reads_real_account`, `list_transactions_filters_by_query`) and over
+      the wire (`mcp_stdio::read_tools_work_end_to_end_against_fixture_journal`).
+- [x] Property / round-trip tests on the parser pass (`json` proptests: exact-decimal
+      losslessness + amount-JSON round-trip).
+- [x] Mutation testing introduced and wired into PR CI (`mutants-diff` job).
+- [x] No PII in fixtures or tests (synthetic accounts/vendors/amounts; absolute paths scrubbed).
+
+**Deferrals (none block M2):**
+
+- **`install` round-trip into a live Cowork — CLOSED 2026-06-01.** Verified end-to-end: `mise
+  run install --journal …/tests/fixtures/sample.journal` registered the server; a real Cowork
+  session (`client.name = local-agent-mode-hledger-mcp`) called `status`, `get_account_balance`
+  (incl. a parent-prefix `assets` → `$93.66` sum), and `list_transactions` (filtered + unfiltered)
+  — all `is_error: false` with correct values, no warn/error log lines. Captured in a
+  `mise run debug-log` os_log ndjson trace. (`install` also now bakes `LEDGER_FILE` so the
+  registered server has a journal; `--journal` flag added.)
+- **`register` parser** — only `balance` (→ `get_account_balance`) and `print` (→
+  `list_transactions`) are wired; the `register_basic.json` fixture is recorded but its parser
+  lands with the domain register/aging tools in **M4**. M1 scope said "start with one or two."
+
+> Verified the golden contract is real: deliberately editing a fixture amount makes the
+> corresponding `json::tests` assertion fail, so a future hledger output drift is caught.

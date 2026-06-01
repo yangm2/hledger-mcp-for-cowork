@@ -74,7 +74,7 @@ jobs:
           '
 
   coverage:
-    name: coverage (informational)
+    name: coverage (≥85% lines)
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
@@ -95,10 +95,39 @@ jobs:
           key: coverage-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: coverage-
 
-      # Informational at M0 (the milestones' coverage ramp). At M1, swap `--summary-only`
-      # for `--fail-under-lines 85` to make the ≥85% bar a hard gate.
-      - name: Coverage (line summary)
+      # Hard gate from M1 (the milestones' coverage ramp): the adapter parser + formatters
+      # are pure and must stay near-fully covered. Mirrors `mise run cov`.
+      - name: Coverage (fail under 85% lines)
         run: |
           nix develop --command bash -euo pipefail -c '
-            cargo llvm-cov --all-features --workspace --summary-only
+            cargo llvm-cov --all-features --workspace --fail-under-lines 85
           '
+
+  # Diff-scoped mutation testing on PRs: mutate only lines changed vs the merge base and fail
+  # on a survivor (a test gap). Fast enough to block on; the full `mise run mutants` sweep is
+  # periodic/on-demand, not in CI. hledger isn't installed here — the e2e/smoke tests skip
+  # gracefully, and the in-scope parser/amount logic is pure (no hledger needed).
+  mutation:
+    name: mutation (diff)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # mutants-diff needs history to compute the merge base
+
+      - name: Set up mise (provisions cargo-mutants from [tools])
+        uses: jdx/mise-action@v2
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: mutants-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: mutants-
+
+      - name: Mutation testing (changed lines only)
+        run: mise run mutants-diff

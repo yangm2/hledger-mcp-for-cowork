@@ -1,0 +1,50 @@
+[
+  [
+    [
+      "assets:checking",
+      "assets:checking",
+      0,
+      [
+        {
+          "acommodity": "$",
+          "acost": null,
+          "acostbasis": null,
+          "aquantity": {
+            "decimalMantissa": 4366,
+            "decimalPlaces": 2,
+            "floatingPoint": 43.66
+          },
+          "astyle": {
+            "ascommodityside": "L",
+            "ascommodityspaced": false,
+            "asdecimalmark": ".",
+            "asdigitgroups": null,
+            "asprecision": 2,
+            "asrounding": "HardRounding"
+          }
+        }
+      ]
+    ]
+  ],
+  [
+    {
+      "acommodity": "$",
+      "acost": null,
+      "acostbasis": null,
+      "aquantity": {
+        "decimalMantissa": 4366,
+        "decimalPlaces": 2,
+        "floatingPoint": 43.66
+      },
+      "astyle": {
+        "ascommodityside": "L",
+        "ascommodityspaced": false,
+        "asdecimalmark": ".",
+        "asdigitgroups": null,
+        "asprecision": 2,
+        "asrounding": "HardRounding"
+      }
+    }
+  ]
+]
+

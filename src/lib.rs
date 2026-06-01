@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod hledger;
 pub mod logging;
 pub mod protocol;
 pub mod server;

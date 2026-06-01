@@ -20,7 +20,14 @@ struct Server {
 
 impl Server {
     fn spawn() -> Self {
+        Self::spawn_args(&[])
+    }
+
+    /// Spawn the server binary with extra CLI args (e.g. `--journal <path>`), inheriting the
+    /// process env (so `HLEDGER_EXECUTABLE_PATH` from `.env.local` reaches the child).
+    fn spawn_args(args: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_hledger-mcp-for-cowork"))
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -101,7 +108,7 @@ fn full_lifecycle_lists_tools_and_echoes() {
         "server_instructions present"
     );
 
-    // tools/list advertises exactly `status` + `echo`.
+    // tools/list advertises the M0 connectivity tools plus the M1 read tools.
     server.send(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
     let listed = server.recv();
     let mut names: Vec<String> = listed["result"]["tools"]
@@ -111,7 +118,15 @@ fn full_lifecycle_lists_tools_and_echoes() {
         .map(|t| t["name"].as_str().expect("tool name").to_owned())
         .collect();
     names.sort();
-    assert_eq!(names, vec!["echo".to_string(), "status".to_string()]);
+    assert_eq!(
+        names,
+        vec![
+            "echo".to_string(),
+            "get_account_balance".to_string(),
+            "list_transactions".to_string(),
+            "status".to_string(),
+        ]
+    );
 
     // tools/call echo round-trips the message.
     server.send(&json!({
@@ -135,7 +150,7 @@ fn full_lifecycle_lists_tools_and_echoes() {
         .as_str()
         .expect("status text");
     assert!(
-        body.contains("protocol 2025-11-25"),
+        body.contains("protocol: 2025-11-25"),
         "status reports the negotiated version: {body}"
     );
 }
@@ -158,6 +173,86 @@ fn unknown_older_protocol_version_is_returned_as_requested() {
     // This is the below-range case the cap test above cannot cover.
     let result = initialize(&mut server, "2024-06-01");
     assert_eq!(result["protocolVersion"], json!("2024-06-01"));
+}
+
+/// Can we actually run hledger? Mirrors the smoke test's resolution so this e2e skips
+/// gracefully (rather than failing) when hledger is absent — e.g. outside `nix develop`.
+fn hledger_available() -> bool {
+    let runnable = |bin: &str| {
+        Command::new(bin)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    match std::env::var("HLEDGER_EXECUTABLE_PATH") {
+        Ok(p) if !p.is_empty() && runnable(&p) => true,
+        _ => runnable("hledger"),
+    }
+}
+
+/// Drive the real M1 read tools over the wire against the checked-in synthetic fixture
+/// journal — the automated proof that `get_account_balance` / `list_transactions` work
+/// end-to-end through the adapter and are invocable exactly as a Cowork client would. Skips
+/// when hledger is unavailable.
+#[test]
+fn read_tools_work_end_to_end_against_fixture_journal() {
+    if !hledger_available() {
+        eprintln!("SKIP read e2e: hledger not found (run inside `nix develop`)");
+        return;
+    }
+    let journal = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample.journal");
+    let mut server = Server::spawn_args(&["--journal", journal]);
+    initialize(&mut server, "2025-11-25");
+
+    // status reports the detected hledger version + pin match, the resolved binary, and the
+    // journal in use (the operator's "which hledger / which ledger" diagnostic).
+    server.send(&json!({
+        "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+        "params": { "name": "status", "arguments": {} }
+    }));
+    let status = server.recv();
+    let status_text = status["result"]["content"][0]["text"]
+        .as_str()
+        .expect("status text");
+    assert!(
+        status_text.contains("hledger: 1.52 (pinned)"),
+        "status reports the pinned hledger version: {status_text}"
+    );
+    assert!(
+        status_text.contains("binary:") && status_text.contains("sample.journal"),
+        "status reports the resolved binary and journal: {status_text}"
+    );
+
+    // get_account_balance returns the real computed balance ($100 − $12.34 − $44 = $43.66).
+    server.send(&json!({
+        "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+        "params": { "name": "get_account_balance", "arguments": { "account": "assets:checking" } }
+    }));
+    let bal = server.recv();
+    assert_eq!(bal["result"]["isError"], json!(false));
+    let bal_text = bal["result"]["content"][0]["text"]
+        .as_str()
+        .expect("balance text");
+    assert!(
+        bal_text.contains("assets:checking") && bal_text.contains("$43.66"),
+        "balance output: {bal_text}"
+    );
+
+    // list_transactions with a query returns the matching transaction's header + postings.
+    server.send(&json!({
+        "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+        "params": { "name": "list_transactions", "arguments": { "query": "expenses:supplies" } }
+    }));
+    let txns = server.recv();
+    assert_eq!(txns["result"]["isError"], json!(false));
+    let txns_text = txns["result"]["content"][0]["text"]
+        .as_str()
+        .expect("transactions text");
+    assert!(
+        txns_text.contains("2026-01-15 Acme") && txns_text.contains("expenses:supplies"),
+        "transactions output: {txns_text}"
+    );
 }
 
 #[test]

@@ -1,0 +1,23 @@
+; Synthetic fixture journal for the hledger adapter golden tests.
+; No PII — placeholder accounts/vendors/amounts only (CLAUDE.md). Do not put real data here.
+commodity $1000.00
+commodity 1000.00 EUR
+account assets:checking
+account assets:savings account
+account expenses:supplies
+account expenses:travel
+account equity:opening balances
+
+2026-01-01 opening balance
+    assets:checking            $100.00
+    assets:savings account      $50.00
+    equity:opening balances
+
+2026-01-15 Acme ; vendor:Acme, project:alpha
+    expenses:supplies           $12.34
+    assets:checking
+
+2026-02-02 Bourse ; vendor:Bourse
+    expenses:travel             40.00 EUR
+    assets:checking            $-44.00
+    equity:opening balances

@@ -13,3 +13,7 @@
 
 # captured unified-log streams (may contain ledger data; never commit — public repo)
 /.debug/
+
+# cargo-mutants working output (`mise run mutants` / `mutants-diff`): per-mutant diffs,
+# logs, outcomes.json — regenerable, plus the `.old` copy from the previous run.
+/mutants.out*/

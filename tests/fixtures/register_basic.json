@@ -1,0 +1,134 @@
+[
+  [
+    "2026-01-15",
+    null,
+    "Acme",
+    {
+      "paccount": "expenses:supplies",
+      "pamount": [
+        {
+          "acommodity": "$",
+          "acost": null,
+          "acostbasis": null,
+          "aquantity": {
+            "decimalMantissa": 1234,
+            "decimalPlaces": 2,
+            "floatingPoint": 12.34
+          },
+          "astyle": {
+            "ascommodityside": "L",
+            "ascommodityspaced": false,
+            "asdecimalmark": ".",
+            "asdigitgroups": null,
+            "asprecision": 2,
+            "asrounding": "HardRounding"
+          }
+        }
+      ],
+      "pbalanceassertion": null,
+      "pcomment": "",
+      "pdate": null,
+      "pdate2": null,
+      "poriginal": null,
+      "pstatus": "Unmarked",
+      "ptags": [],
+      "ptransaction_": "2",
+      "ptype": "RegularPosting"
+    },
+    [
+      {
+        "acommodity": "$",
+        "acost": null,
+        "acostbasis": null,
+        "aquantity": {
+          "decimalMantissa": 1234,
+          "decimalPlaces": 2,
+          "floatingPoint": 12.34
+        },
+        "astyle": {
+          "ascommodityside": "L",
+          "ascommodityspaced": false,
+          "asdecimalmark": ".",
+          "asdigitgroups": null,
+          "asprecision": 2,
+          "asrounding": "HardRounding"
+        }
+      }
+    ]
+  ],
+  [
+    "2026-02-02",
+    null,
+    "Bourse",
+    {
+      "paccount": "expenses:travel",
+      "pamount": [
+        {
+          "acommodity": "EUR",
+          "acost": null,
+          "acostbasis": null,
+          "aquantity": {
+            "decimalMantissa": 4000,
+            "decimalPlaces": 2,
+            "floatingPoint": 40
+          },
+          "astyle": {
+            "ascommodityside": "R",
+            "ascommodityspaced": true,
+            "asdecimalmark": ".",
+            "asdigitgroups": null,
+            "asprecision": 2,
+            "asrounding": "HardRounding"
+          }
+        }
+      ],
+      "pbalanceassertion": null,
+      "pcomment": "",
+      "pdate": null,
+      "pdate2": null,
+      "poriginal": null,
+      "pstatus": "Unmarked",
+      "ptags": [],
+      "ptransaction_": "3",
+      "ptype": "RegularPosting"
+    },
+    [
+      {
+        "acommodity": "$",
+        "acost": null,
+        "acostbasis": null,
+        "aquantity": {
+          "decimalMantissa": 1234,
+          "decimalPlaces": 2,
+          "floatingPoint": 12.34
+        },
+        "astyle": {
+          "ascommodityside": "L",
+          "ascommodityspaced": false,
+          "asdecimalmark": ".",
+          "asdigitgroups": null,
+          "asprecision": 2,
+          "asrounding": "HardRounding"
+        }
+      },
+      {
+        "acommodity": "EUR",
+        "acost": null,
+        "acostbasis": null,
+        "aquantity": {
+          "decimalMantissa": 4000,
+          "decimalPlaces": 2,
+          "floatingPoint": 40
+        },
+        "astyle": {
+          "ascommodityside": "R",
+          "ascommodityspaced": true,
+          "asdecimalmark": ".",
+          "asdigitgroups": null,
+          "asprecision": 2,
+          "asrounding": "HardRounding"
+        }
+      }
+    ]
+  ]
+]
