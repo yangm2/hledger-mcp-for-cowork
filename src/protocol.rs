@@ -1,43 +1,66 @@
 //! MCP `protocolVersion` negotiation.
 //!
-//! Kept as a **pure function** of (requested version, supported set) → negotiated
-//! version so the lifecycle rule is unit-testable in isolation, separate from the
-//! transport and the `rmcp` handler that calls it (M0).
+//! Kept as **pure functions** of the client's requested version so the lifecycle rule is
+//! unit-testable in isolation, separate from the transport and the `rmcp` handler (M0).
 //!
-//! **Lifecycle rule** (MCP spec): if the server supports the client's requested
-//! version, it responds with the *same* version; otherwise it responds with the
-//! *highest* version it supports, and the client decides whether to proceed. We do
-//! **not** blind-echo an unknown version back (the gap flagged in
-//! `docs/development/mcp-protocol-versions.md`): an unrecognized request is capped to
-//! our newest validated revision.
+//! **Lifecycle rule** (MCP spec): if the server supports the client's requested version it
+//! responds with the *same* version; otherwise it responds with a version it supports
+//! (we use the newest) and the client decides whether to proceed.
+//!
+//! **rmcp performs the final reconciliation — read this before trusting [`negotiate`].**
+//! Our handler returns a *preferred* response version, but `rmcp`'s serve loop then sets
+//! the wire version to `min(client_requested, our_response)` — a **lexicographic** compare
+//! over the date string (`rmcp` `service/server.rs`, `Ordering::Less => client`). So the
+//! value a peer actually receives is [`effective_version`], not [`negotiate`] alone:
+//!
+//! - a **known** requested version is echoed;
+//! - an **unknown newer** version (lexically `>` our newest) is capped to
+//!   [`latest_supported`];
+//! - an **unknown older** version (lexically `<` our newest) is returned **as the client
+//!   requested it** — `rmcp`'s `min` picks the client's value and the handler cannot
+//!   override it from its return value. We surface this here (and test it) rather than
+//!   pretend [`negotiate`]'s cap reaches the wire for that case.
+
+use std::cmp::Ordering;
 
 use rmcp::model::ProtocolVersion;
 
-/// Revisions this server has actually validated against, oldest → newest.
+/// Protocol revisions this server accepts — the set the `rmcp` SDK knows how to frame.
 ///
-/// For M0 this is the full set the `rmcp` SDK knows; the newest is the target
-/// (`2025-11-25`) and the oldest is the baseline (`2024-11-05`). Narrow this if a
-/// future revision changes wire framing in a way we have not validated.
+/// The **tested target** is `2025-11-25` (newest) with `2024-11-05` as the baseline; the
+/// in-between revisions (`2025-03-26`, `2025-06-18`) are accepted because their wire framing
+/// is compatible with our single-object-per-line transport, **not** because each has
+/// dedicated coverage. Narrow this set if a revision's framing ever diverges (e.g. a client
+/// that negotiates `2025-03-26` may attempt JSON-RPC batching, removed in `2025-06-18`).
 pub const SUPPORTED: &[ProtocolVersion] = ProtocolVersion::KNOWN_VERSIONS;
 
-/// The newest validated revision — what we cap an unknown request to.
+/// Our newest accepted revision — what an unknown-newer request is capped to.
+///
+/// Single source of truth is the SDK's [`ProtocolVersion::LATEST`]; a unit test asserts it
+/// equals the last entry of [`SUPPORTED`], so the two cannot silently drift.
 pub fn latest_supported() -> ProtocolVersion {
-    // `SUPPORTED` is ordered oldest → newest and is never empty.
-    SUPPORTED
-        .last()
-        .cloned()
-        .unwrap_or(ProtocolVersion::V_2025_11_25)
+    ProtocolVersion::LATEST
 }
 
-/// Negotiate the response `protocolVersion` for a client's requested version.
-///
-/// - requested ∈ supported → echo it (same version);
-/// - otherwise → the newest validated revision (cap, never blind-echo).
+/// Our **preferred** response version for a client's request, *before* rmcp's reconciliation
+/// (see the module docs): a known version is echoed; anything unknown caps to
+/// [`latest_supported`]. The value that reaches the wire is [`effective_version`].
 pub fn negotiate(requested: &ProtocolVersion) -> ProtocolVersion {
     if SUPPORTED.contains(requested) {
         requested.clone()
     } else {
         latest_supported()
+    }
+}
+
+/// The version a client will **actually** receive on the wire: `min(requested,
+/// negotiate(requested))`, mirroring rmcp's `service/server.rs` reconciliation. Use this for
+/// logging/diagnostics (and the `status` tool) so reported state matches what the peer sees.
+pub fn effective_version(requested: &ProtocolVersion) -> ProtocolVersion {
+    let preferred = negotiate(requested);
+    match requested.partial_cmp(&preferred) {
+        Some(Ordering::Less) => requested.clone(),
+        _ => preferred,
     }
 }
 
@@ -53,40 +76,58 @@ mod tests {
     }
 
     #[test]
-    fn echoes_each_supported_version() {
+    fn supported_newest_equals_latest_supported() {
+        // Guards the single-source-of-truth: `latest_supported()` (== SDK LATEST) must be
+        // the newest entry of `SUPPORTED`, else `negotiate`/`effective_version` cap wrong.
+        assert_eq!(SUPPORTED.last().cloned(), Some(latest_supported()));
+        assert_eq!(latest_supported(), ProtocolVersion::V_2025_11_25);
+    }
+
+    // --- negotiate: our preferred response (pre-reconciliation) ---
+
+    #[test]
+    fn negotiate_echoes_each_supported_version() {
         for v in SUPPORTED {
             assert_eq!(
                 &negotiate(v),
                 v,
-                "a supported version must be echoed verbatim"
+                "a supported version is the preferred response"
             );
         }
     }
 
     #[test]
-    fn newest_supported_is_2025_11_25() {
-        assert_eq!(latest_supported(), ProtocolVersion::V_2025_11_25);
+    fn negotiate_caps_unknown_versions_to_latest() {
+        // Both an unknown future RC and an unknown legacy revision *prefer* the newest.
+        assert_eq!(negotiate(&version("2026-07-28")), latest_supported());
+        assert_eq!(negotiate(&version("2024-01-01")), latest_supported());
+    }
+
+    // --- effective_version: what actually reaches the wire (rmcp's min) ---
+
+    #[test]
+    fn effective_echoes_supported_version() {
+        assert_eq!(
+            effective_version(&ProtocolVersion::V_2024_11_05),
+            ProtocolVersion::V_2024_11_05
+        );
     }
 
     #[test]
-    fn caps_unknown_future_version_to_latest() {
-        // A release-candidate / future revision we have NOT validated.
-        let negotiated = negotiate(&version("2026-07-28"));
-        assert_eq!(negotiated, latest_supported());
+    fn effective_caps_unknown_newer_to_latest() {
+        // Lexically > newest → rmcp keeps our cap.
+        assert_eq!(
+            effective_version(&version("2026-07-28")),
+            latest_supported()
+        );
     }
 
     #[test]
-    fn caps_unknown_legacy_version_to_latest() {
-        // An ancient/unrecognized revision is likewise not blind-echoed.
-        let negotiated = negotiate(&version("2024-01-01"));
-        assert_eq!(negotiated, latest_supported());
-        assert_ne!(negotiated, version("2024-01-01"));
-    }
-
-    #[test]
-    fn baseline_2024_11_05_is_supported_and_echoed() {
-        let baseline = ProtocolVersion::V_2024_11_05;
-        assert!(SUPPORTED.contains(&baseline));
-        assert_eq!(negotiate(&baseline), baseline);
+    fn effective_returns_unknown_older_as_requested() {
+        // Lexically < newest → rmcp's min picks the client's version; our cap does NOT reach
+        // the wire here. This documents the rmcp limitation rather than asserting a fiction.
+        let legacy = version("2024-01-01");
+        assert_eq!(effective_version(&legacy), legacy);
+        assert_ne!(effective_version(&legacy), latest_supported());
     }
 }

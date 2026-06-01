@@ -122,15 +122,42 @@ fn full_lifecycle_lists_tools_and_echoes() {
     let result = &called["result"];
     assert_eq!(result["isError"], json!(false));
     assert_eq!(result["content"][0]["text"], json!("ping"));
+
+    // status reports the session's negotiated protocol version (here 2025-11-25), proving it
+    // reads the live peer rather than hardcoding the server's newest.
+    server.send(&json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": { "name": "status", "arguments": {} }
+    }));
+    let status = server.recv();
+    assert_eq!(status["result"]["isError"], json!(false));
+    let body = status["result"]["content"][0]["text"]
+        .as_str()
+        .expect("status text");
+    assert!(
+        body.contains("protocol 2025-11-25"),
+        "status reports the negotiated version: {body}"
+    );
 }
 
 #[test]
-fn unknown_protocol_version_is_capped_not_echoed() {
+fn unknown_newer_protocol_version_is_capped_not_echoed() {
     let mut server = Server::spawn();
-    // A future RC the server has not validated must be capped to the newest supported,
-    // never blind-echoed.
+    // A future RC (lexically > our newest) the server has not validated must be capped to the
+    // newest supported, never blind-echoed.
     let result = initialize(&mut server, "2026-07-28");
     assert_eq!(result["protocolVersion"], json!("2025-11-25"));
+}
+
+#[test]
+fn unknown_older_protocol_version_is_returned_as_requested() {
+    let mut server = Server::spawn();
+    // Documents the real wire behavior: rmcp reconciles via min(client, our_response), so a
+    // version lexically BELOW our newest is returned as the client requested it — our
+    // negotiate() cap does not reach the wire here (see src/protocol.rs effective_version).
+    // This is the below-range case the cap test above cannot cover.
+    let result = initialize(&mut server, "2024-06-01");
+    assert_eq!(result["protocolVersion"], json!("2024-06-01"));
 }
 
 #[test]

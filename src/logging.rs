@@ -112,10 +112,16 @@ mod macos {
             event.record(&mut visitor);
             let line = format!("[{}] {}", meta.target(), visitor.line.trim());
 
+            // Preserve the level taxonomy across the bridge: os_log models Default
+            // (notice) distinctly from Error, so WARN must not collapse into Error — an
+            // operator filtering `--level error` (or alerting on it) needs to separate a
+            // recoverable warning from a genuine failure. Fault stays reserved for a future
+            // fatal tier.
             let level = match *meta.level() {
                 tracing::Level::TRACE | tracing::Level::DEBUG => Level::Debug,
                 tracing::Level::INFO => Level::Info,
-                tracing::Level::WARN | tracing::Level::ERROR => Level::Error,
+                tracing::Level::WARN => Level::Default,
+                tracing::Level::ERROR => Level::Error,
             };
 
             LOGGER.with(|cell| {

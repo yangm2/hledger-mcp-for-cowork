@@ -65,7 +65,11 @@ jobs:
 
             cargo fmt --check
             cargo clippy --all-targets --all-features -- -D warnings
-            cargo build --release        # native link on this host (proves it links, not just checks)
+            # nextest compiles + links the bin natively (the stdio integration test runs it
+            # via CARGO_BIN_EXE), so this single debug compile already proves it builds on this
+            # OS. Tests run in debug deliberately (overflow panics surface bugs a release build
+            # would silently wrap). Optimized/release artifacts + the container image are built
+            # in M6 packaging, not on every commit — avoids a second full compile per leg.
             cargo nextest run --all-features   # unit + stdio integration + real-hledger e2e
           '
 

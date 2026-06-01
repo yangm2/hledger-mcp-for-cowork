@@ -45,16 +45,14 @@ else
   run "tests" cargo test
 fi
 
-# Cross-target portability: clippy (zero-warnings) for installed Linux gnu targets.
-# Opt-in — silently skipped when a target's std isn't installed
-# (`rustup target add <triple>`), so it never blocks a machine that hasn't provisioned
-# them. Lint/check only (cannot link or run a foreign target here).
-installed_targets="$(rustup target list --installed 2>/dev/null || true)"
-for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-  if printf '%s\n' "$installed_targets" | grep -qx "$t"; then
-    run "clippy ($t)" cargo clippy --target "$t" --all-targets --all-features -- -D warnings
-  fi
-done
+# Cross-target portability: delegate to `mise run check-cross` — the SINGLE source of
+# truth for the target list + per-target skip logic (don't duplicate it here; it would
+# drift from mise.toml / CI). Only when `mise` is on the hook's PATH; otherwise skipped
+# (CI and `mise run check` still cover cross). check-cross itself no-ops for targets whose
+# std isn't installed, so this stays fast on machines that haven't provisioned them.
+if command -v mise >/dev/null 2>&1; then
+  run "cross-clippy" mise run check-cross
+fi
 
 if [ "$fail" -ne 0 ]; then
   {

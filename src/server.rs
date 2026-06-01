@@ -14,9 +14,8 @@ use rmcp::model::{
     CallToolResult, Content, InitializeRequestParams, InitializeResult, JsonObject,
     ProtocolVersion, ServerInfo,
 };
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::service::{Peer, RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
-use serde_json::Value;
 
 const SERVER_NAME: &str = "hledger-mcp";
 
@@ -58,25 +57,41 @@ impl HledgerMcp {
         }
     }
 
-    /// Report server health: name, version, active protocol version, and uptime.
+    /// Report server health: name, version, the session's **negotiated** protocol version,
+    /// and uptime. The negotiated version is read from the peer (the client's `initialize`),
+    /// reduced to what actually reached the wire (`protocol::effective_version`) — not the
+    /// server's newest. Falls back to our newest only if called with no peer (shouldn't
+    /// happen: `initialize` precedes any tool call).
     #[tool(
-        description = "Report server status: name, version, protocol version, and uptime \
-                         in seconds. Takes no arguments."
+        description = "Report server status: name, version, the session's negotiated protocol \
+                         version, and uptime in seconds. Takes no arguments."
     )]
-    async fn status(&self) -> Result<CallToolResult, McpError> {
-        let uptime = self.started.elapsed().as_secs();
-        let body = format!(
-            "{SERVER_NAME} {} — protocol {}, uptime {uptime}s",
+    async fn status(&self, peer: Peer<RoleServer>) -> Result<CallToolResult, McpError> {
+        let negotiated = peer
+            .peer_info()
+            .map(|info| crate::protocol::effective_version(&info.protocol_version))
+            .unwrap_or_else(crate::protocol::latest_supported);
+        Ok(CallToolResult::success(vec![Content::text(
+            self.status_text(&negotiated),
+        )]))
+    }
+
+    /// Pure render of the `status` body (separated from peer extraction so it is unit-testable
+    /// without constructing a live `Peer`).
+    fn status_text(&self, negotiated: &ProtocolVersion) -> String {
+        format!(
+            "{SERVER_NAME} {} — protocol {negotiated}, uptime {}s",
             env!("CARGO_PKG_VERSION"),
-            ProtocolVersion::LATEST,
-        );
-        Ok(CallToolResult::success(vec![Content::text(body)]))
+            self.started.elapsed().as_secs(),
+        )
     }
 
     /// Echo a message back unchanged — a minimal tool-invocation connectivity check.
     ///
-    /// Arguments are read leniently: a missing/non-string `message` yields an
-    /// `isError` result (self-correctable) rather than a JSON-RPC `invalid_params`.
+    /// Extracts arguments via [`crate::tools::parse_args`] so a bad call yields a
+    /// self-correctable `isError` result (with serde's accurate missing-vs-wrong-type
+    /// message) rather than a JSON-RPC `invalid_params`. The derived [`EchoArgs`] schema is
+    /// the single source of truth for both the advertised `input_schema` and validation.
     #[tool(
         description = "Echo a message back unchanged. A minimal connectivity / \
                       tool-invocation check. Requires a string field `message`.",
@@ -84,16 +99,13 @@ impl HledgerMcp {
     )]
     async fn echo(
         &self,
-        Parameters(args): Parameters<JsonObject>,
+        Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        match args.get("message").and_then(Value::as_str) {
-            Some(message) => Ok(CallToolResult::success(vec![Content::text(
-                message.to_owned(),
-            )])),
-            None => Ok(CallToolResult::error(vec![Content::text(
-                "echo: missing required string field `message`",
-            )])),
-        }
+        let args: EchoArgs = match crate::tools::parse_args(raw) {
+            Ok(args) => args,
+            Err(err) => return Ok(err),
+        };
+        Ok(CallToolResult::success(vec![Content::text(args.message)]))
     }
 }
 
@@ -123,14 +135,17 @@ impl ServerHandler for HledgerMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
         let requested = request.protocol_version.clone();
-        let negotiated = crate::protocol::negotiate(&requested);
+        // What we *return*; rmcp then reconciles to `effective` on the wire (see protocol.rs).
+        let preferred = crate::protocol::negotiate(&requested);
+        // What the client will *actually* receive — log this so the diagnostic matches reality.
+        let effective = crate::protocol::effective_version(&requested);
         let roots = request.capabilities.roots.is_some();
 
         tracing::info!(
             client.name = %request.client_info.name,
             client.version = %request.client_info.version,
             protocol.requested = %requested,
-            protocol.negotiated = %negotiated,
+            protocol.negotiated = %effective,
             roots,
             "initialize",
         );
@@ -139,7 +154,7 @@ impl ServerHandler for HledgerMcp {
             context.peer.set_peer_info(request);
         }
 
-        Ok(self.get_info().with_protocol_version(negotiated))
+        Ok(self.get_info().with_protocol_version(preferred))
     }
 }
 
@@ -173,24 +188,41 @@ mod tests {
             .await
             .expect("echo dispatch must not raise a protocol error on bad args");
         assert_eq!(result.is_error, Some(true));
+        let text = &result.content[0].as_text().expect("text content").text;
+        assert!(
+            text.contains("missing"),
+            "missing-field error says missing: {text}"
+        );
     }
 
     #[tokio::test]
-    async fn echo_wrong_type_is_iserror() {
+    async fn echo_wrong_type_is_iserror_and_says_type_not_missing() {
         let server = HledgerMcp::new();
         let result = server
             .echo(args(serde_json::json!({ "message": 42 })))
             .await
             .expect("echo dispatch");
         assert_eq!(result.is_error, Some(true));
+        let text = &result.content[0].as_text().expect("text content").text;
+        // A present-but-wrong-typed field must NOT be reported as "missing" (serde gives
+        // "invalid type: integer …, expected a string" via the shared parse_args helper).
+        assert!(
+            text.contains("invalid type"),
+            "type error names the type: {text}"
+        );
+        assert!(
+            !text.contains("missing"),
+            "type error must not say missing: {text}"
+        );
     }
 
-    #[tokio::test]
-    async fn status_reports_name_and_version() {
+    #[test]
+    fn status_text_reports_name_version_and_negotiated_protocol() {
+        // `status` itself extracts the version from the live `Peer`; the render is tested
+        // here against an explicit negotiated version (e.g. an older one) to prove the tool
+        // reports the *session's* version, not the server's newest.
         let server = HledgerMcp::new();
-        let result = server.status().await.expect("status dispatch");
-        assert_eq!(result.is_error, Some(false));
-        let text = &result.content[0].as_text().expect("text content").text;
+        let text = server.status_text(&ProtocolVersion::V_2024_11_05);
         assert!(
             text.contains(SERVER_NAME),
             "status names the server: {text}"
@@ -198,6 +230,10 @@ mod tests {
         assert!(
             text.contains(env!("CARGO_PKG_VERSION")),
             "status reports the version: {text}"
+        );
+        assert!(
+            text.contains("2024-11-05"),
+            "status reports the negotiated protocol, not the newest: {text}"
         );
     }
 
