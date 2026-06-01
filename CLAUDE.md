@@ -38,8 +38,9 @@ append-only / immutable / diffable / git-backed is hledger's native idiom.
 The environment is set up. **One-time per clone:**
 
 ```
-nix develop          # builds the pinned env (hledger 1.52, Rust, git, hledger-web)
-mise run init-env    # writes .env.local pinning the hledger store path
+mise run init-settings-local   # reconstitute the sandbox allowlist (takes effect next session)
+nix develop                    # builds the pinned env (hledger 1.52, Rust, git, hledger-web)
+mise run init-env              # writes .env.local pinning the hledger store path
 ```
 
 After that the everyday loop runs **outside nix, sandboxed** — `mise run <task>` reads
@@ -50,9 +51,16 @@ After that the everyday loop runs **outside nix, sandboxed** — `mise run <task
 - **mise `[tools]`** owns the cargo dev tools (`cargo-nextest`, `cargo-llvm-cov`), pinned exact
   so they're available in the outside-nix loop. `mise install` provisions them.
 - **`.env.local`** (gitignored) carries `HLEDGER_EXECUTABLE_PATH` → the pinned hledger binary.
+- **`.claude/settings.local.json`** (gitignored) holds machine-local **sandbox-allowlist paths**
+  under your `$HOME` (cargo/rustup/mise caches) that enable prompt-free sandboxed work. Those
+  absolute home paths are PII, so they are **never committed**; `mise run init-settings-local`
+  reconstitutes them per clone. Sandbox settings load at session start — re-open the session
+  for them to apply.
 
 **Tasks:** `build`, `fmt`, `lint`, `test`, `e2e`, `cov`, `check` (the fmt+clippy+test gate),
-`run`, `init-env`. `test`/`check` use nextest when on PATH, else fall back to `cargo test`.
+`run`, `clean` (cargo artifacts), `clean-more` (+ generated dev-env files), and the per-clone
+setup `init` (= `init-env` + `init-settings-local`). `test`/`check` use nextest when on PATH,
+else fall back to `cargo test`.
 
 **Stop-hook quality gate** (`.claude/hooks/rust-quality-gate.sh`): on any turn that changed
 `.rs`, runs fmt + clippy + tests and **blocks finishing on failure**. It sources `.env.local`,

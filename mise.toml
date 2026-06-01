@@ -53,6 +53,40 @@ echo "  HLEDGER_EXECUTABLE_PATH=$hl"
 "$hl" --version
 '''
 
+[tasks.init-settings-local]
+description = "One-time per-clone setup: reconstitute machine-local sandbox-allowlist paths in .claude/settings.local.json (enables minimal-prompt sandboxed work). Gitignored; idempotent."
+quiet = true
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+# These are PII (absolute $HOME paths) so they are NOT committed — settings.local.json
+# is gitignored. Reconstituted here per machine. Takes effect on the next Claude session.
+python3 - "$HOME" <<'PY'
+import json, pathlib, sys
+home = sys.argv[1]
+p = pathlib.Path(".claude/settings.local.json")
+data = json.loads(p.read_text()) if p.exists() else {}
+dirs = [
+    "/private/tmp/test-data",          # project scratch
+    "/var/folders",                    # macOS $TMPDIR root
+    f"{home}/.cargo/registry",         # cargo dep cache (fetch new crates)
+    f"{home}/.rustup",                 # rustup toolchain store
+    f"{home}/.local/state/mise",       # mise trust/tracking state
+    f"{home}/.local/share/mise",       # mise-installed tools (nextest, llvm-cov)
+]
+ad = data.setdefault("permissions", {}).setdefault("additionalDirectories", [])
+added = [d for d in dirs if d not in ad]
+ad.extend(added)
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps(data, indent=2) + "\n")
+print(f"init-settings-local: {p} — added {len(added)} path(s), {len(ad)} total")
+PY
+'''
+
+[tasks.init]
+description = "One-time per-clone setup: init-env + init-settings-local"
+depends = ["init-env", "init-settings-local"]
+
 [tasks.build]
 description = "Compile (debug)"
 run = "cargo build"
@@ -88,3 +122,12 @@ run = [
 [tasks.run]
 description = "Run the MCP server (stdio transport)"
 run = "cargo run"
+
+[tasks.clean]
+description = "Remove cargo build artifacts (target/, incl. coverage)"
+run = "cargo clean"
+
+[tasks.clean-more]
+description = "Deep clean: cargo artifacts + generated dev-env files (.env.local, nix result, .devenv.sh, .direnv)"
+depends = ["clean"]
+run = "rm -rf .env.local result result-* .devenv.sh .direnv"
