@@ -108,6 +108,25 @@ gnucash-mcp: initialize from <client>/<version> protocol=<X> roots=<bool>
 records it (and is mirrored to the unified log). See README "Debugging in Claude
 Cowork" for the `sudo log stream` capture workflow.
 
+### Observed on the wire (hledger MCP, Rust/`rmcp`, 2026-06-01)
+
+Captured from a live Cowork project via `mise run debug-log` (the `tracing`
+`initialize` line + `rmcp`'s `peer_info`), this is what Cowork's bridge actually
+sent against the Rust server:
+
+| Field | Value |
+|---|---|
+| `protocolVersion` | `2025-11-25` (current stable; our negotiator echoes it) |
+| `clientInfo.name` | `local-agent-mode-<connector-name>` (e.g. `local-agent-mode-hledger-mcp` — derived from the `mcpServers` key, **not** a generic `claude-*`) |
+| `clientInfo.version` | `1.0.0` |
+| capabilities | `roots` (`listChanged: true`) and the `io.modelcontextprotocol/ui` **extension** (`{"mimeTypes": ["text/html;profile=mcp-app"]}`); no `sampling`/`elicitation`/`tasks` |
+
+Takeaways: (1) Cowork is on `2025-11-25`, so capping the echo there (vs. blind-echo)
+is correct and sufficient; (2) it sends `roots` + a `notifications/roots/list_changed`
+shortly after `initialize`, so a server should tolerate that notification (we do —
+`rmcp`'s default handler); (3) don't key behavior off `clientInfo.name` matching
+`claude` — Cowork presents a connector-derived `local-agent-mode-*` name.
+
 ---
 
 ## References

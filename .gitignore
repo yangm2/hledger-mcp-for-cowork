@@ -10,3 +10,6 @@
 
 # per-clone env file (absolute path to the pinned hledger binary)
 /.env.local
+
+# captured unified-log streams (may contain ledger data; never commit — public repo)
+/.debug/

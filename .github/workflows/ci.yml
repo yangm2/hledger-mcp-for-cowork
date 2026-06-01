@@ -1,0 +1,100 @@
+name: CI
+
+# Native, per-OS matrix — each runner builds and tests its OWN target; there is no
+# cross-compilation step (CLAUDE.md "Platform targets — native, no cross-compilation").
+# The pinned hledger 1.52 + Rust toolchain + git come from the nix flake, so the
+# adapter/golden/e2e contract is identical on every runner.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: gate · ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          - name: Linux x86_64
+            runner: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
+          - name: Linux arm64
+            runner: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix (flakes)
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.runner }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ matrix.runner }}-
+
+      # One `nix develop` shell pins hledger 1.52 + the toolchain. Each step is the
+      # native target for THIS runner — no `--target`, no cross toolchain.
+      - name: Quality gate (native ${{ matrix.target }})
+        run: |
+          nix develop --command bash -euo pipefail -c '
+            echo "::group::versions"
+            rustc -vV
+            hledger --version            # must report 1.52.x (the pinned contract)
+            echo "::endgroup::"
+
+            cargo fmt --check
+            cargo clippy --all-targets --all-features -- -D warnings
+            cargo build --release        # native link on this host (proves it links, not just checks)
+            cargo nextest run --all-features   # unit + stdio integration + real-hledger e2e
+          '
+
+  coverage:
+    name: coverage (informational)
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix (flakes)
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: coverage-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: coverage-
+
+      # Informational at M0 (the milestones' coverage ramp). At M1, swap `--summary-only`
+      # for `--fail-under-lines 85` to make the ≥85% bar a hard gate.
+      - name: Coverage (line summary)
+        run: |
+          nix develop --command bash -euo pipefail -c '
+            cargo llvm-cov --all-features --workspace --summary-only
+          '

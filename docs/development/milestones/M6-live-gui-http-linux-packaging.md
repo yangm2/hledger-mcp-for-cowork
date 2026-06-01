@@ -44,6 +44,14 @@ Split into independently shippable sub-parts; do only the ones a real deployment
 - **Per-OS CI matrix** (CLAUDE.md *Platform targets*): a macOS runner builds the native macOS
   binary; a Linux runner builds the Linux binary + container image **natively**. **No
   `cross`/musl cross-build** (this supersedes §15/§17's cross→musl guidance).
+  - **Done (landed early, M0):** [`.github/workflows/ci.yml`](../../../.github/workflows/ci.yml)
+    runs the native build+test gate across `macos-latest` (aarch64-apple-darwin),
+    `ubuntu-26.04` (x86_64), and `ubuntu-26.04-arm` (aarch64) — each runner `fmt`/`clippy`/
+    `build --release`/`nextest run` on its own target, with hledger 1.52 + toolchain from the
+    nix flake. A coverage job runs informationally (flip `--summary-only` → `--fail-under-lines
+    85` at M1).
+  - **Still 6c:** the container **image build** (`mise run image`) + an in-image container
+    smoke test on the Linux leg.
 - **Slim Linux image** (debian-slim/alpine) carrying the Rust binary **+ hledger 1.52 + git**
   (+ optional `hledger-web`); a `mise run image` task. Not truly `scratch` — the image ships
   hledger/git too (§17).

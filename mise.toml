@@ -135,27 +135,93 @@ git diff --merge-base main > "$diff"
 cargo mutants --in-diff "$diff" -- --all-features
 '''
 
+[tasks.check-cross]
+description = "Cross-target portability lint: clippy (zero-warnings) for the Linux gnu targets (x86_64 + aarch64) from the host dev box. Skips any target whose std is not installed (`rustup target add <triple>`). Lint/check only — does not link or run."
+run = '''
+#!/usr/bin/env bash
+set -uo pipefail
+# Both Linux deployment arches (containers ship native per-OS — no musl cross-build;
+# see CLAUDE.md "Platform targets"). `aarch64` matches an Apple-Silicon dev box / ARM64
+# container; `x86_64` matches an amd64 host.
+targets="x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu"
+installed="$(rustup target list --installed 2>/dev/null || true)"
+fail=0
+ran=0
+for t in $targets; do
+  if printf '%s\n' "$installed" | grep -qx "$t"; then
+    echo ">>> clippy --target $t"
+    cargo clippy --target "$t" --all-targets --all-features -- -D warnings || fail=1
+    ran=1
+  else
+    echo "skip $t — std not installed (\`rustup target add $t\`)"
+  fi
+done
+[ "$ran" -eq 0 ] && echo "check-cross: no Linux gnu targets installed; nothing cross-checked."
+exit "$fail"
+'''
+
 [tasks.check]
-description = "Full quality gate: fmt + clippy + tests (mirrors the Stop hook)"
+description = "Full quality gate: fmt + clippy + tests + cross-target portability (mirrors the Stop hook)"
 run = [
   "cargo fmt --check",
   "cargo clippy --all-targets --all-features -- -D warnings",
   "if cargo nextest --version >/dev/null 2>&1; then cargo nextest run; else cargo test; fi",
+  "mise run check-cross",
 ]
 
 [tasks.run]
 description = "Run the MCP server (stdio transport)"
 run = "cargo run"
 
+[tasks.debug-log]
+description = "Stream this server's macOS unified-log output (subsystem-filtered, down to debug) to a file under .debug/ for diagnosis, while also echoing it live. Requires sudo (privileged log streaming). macOS only. Reproduce the issue, then Ctrl-C; the .ndjson file is what Claude reads."
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$(uname -s)" = "Darwin" ] || { echo "debug-log: macOS only (Linux logs go to the container runtime's stdout/stderr)."; exit 1; }
+
+subsystem="io.github.yangm2.hledger-mcp-for-cowork"
+mkdir -p .debug
+out=".debug/mcp-log-$(date +%Y%m%d-%H%M%S).ndjson"
+
+echo "Streaming os_log subsystem=$subsystem (level: debug) → $out"
+echo "Our log lines are emitted Public (no <private> redaction)."
+echo "Make sure the server runs at debug/trace verbosity (\`mise run install -v\` or -vv,"
+echo "or RUST_LOG=debug), reproduce the issue,"
+echo "then press Ctrl-C. Hand $out to Claude."
+echo
+
+# `log stream` is live (info/debug aren't persisted, so streaming is the way to see them).
+# --level debug includes debug + info + default + higher. ndjson is machine-readable.
+# sudo: privileged capture (matches the predecessor's privileged redirect); tee so you
+# see it live while it's saved. Ctrl-C stops the stream and flushes the file.
+sudo log stream \
+  --predicate "subsystem == \"$subsystem\"" \
+  --level debug \
+  --style ndjson \
+  | tee "$out"
+'''
+
 [tasks.install]
-description = "Register this MCP server in Claude Desktop config (also exposes it to Claude Cowork via Desktop's SDK bridge). Builds a debug binary, writes an absolute-path stdio entry. Idempotent; restart Claude to load it."
+description = "Register this MCP server in Claude Desktop config (also exposes it to Claude Cowork via Desktop's SDK bridge). Builds a debug binary, writes an absolute-path stdio entry. Idempotent; restart Claude to load it. Pass -v/-vv to register with debug/trace logging."
 quiet = true
+depends = ["build"]
+# `usage` spec parses task flags (mise surfaces them as `usage_*` env vars). The
+# repeatable `-v` sets how many `-v`s are baked into the registered server's args, so
+# Cowork/Desktop launches it at debug (-v) or trace (-vv) verbosity for diagnosis.
+usage = '''
+flag "-v --verbose" count=#true help="Register the server with raised log verbosity (-v = debug, -vv = trace)"
+'''
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 cargo build
 bin="$PWD/target/debug/hledger-mcp-for-cowork"
 [ -x "$bin" ] || { echo "install: built binary not found at $bin" >&2; exit 1; }
+
+# Verbosity: `usage_verbose` is the count of `-v` (unset when none) — turn it into that
+# many `-v` args for the registered server.
+verbosity="${usage_verbose:-0}"
 
 # Claude Desktop config path. Cowork bridges these stdio servers via the SDK layer,
 # so registering here makes the server available to both Desktop and Cowork.
@@ -167,18 +233,20 @@ esac
 
 # Idempotent JSON merge (don't clobber other mcpServers). The config lives under
 # $HOME outside the repo, so the absolute paths here are not repo PII.
-python3 - "$cfg" "$bin" "${HLEDGER_EXECUTABLE_PATH:-}" <<'PY'
+python3 - "$cfg" "$bin" "${HLEDGER_EXECUTABLE_PATH:-}" "$verbosity" <<'PY'
 import json, pathlib, sys
-cfg, binpath, hl = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg, binpath, hl, verbosity = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 p = pathlib.Path(cfg)
 data = json.loads(p.read_text()) if p.exists() else {}
-entry = {"command": binpath, "args": []}   # add "--debug" to args while diagnosing
+args = ["-v"] * verbosity   # 0 → [], 1 → ["-v"], 2 → ["-v","-v"] (clap counts them)
+entry = {"command": binpath, "args": args}
 if hl:
     entry["env"] = {"HLEDGER_EXECUTABLE_PATH": hl}
 data.setdefault("mcpServers", {})["hledger-mcp"] = entry
 p.parent.mkdir(parents=True, exist_ok=True)
 p.write_text(json.dumps(data, indent=2) + "\n")
-print(f"install: registered 'hledger-mcp' -> {binpath}")
+level = {0: "info", 1: "debug"}.get(verbosity, "trace")
+print(f"install: registered 'hledger-mcp' -> {binpath} (log level: {level})")
 print(f"  config: {cfg}")
 print("  restart Claude Desktop / Cowork to load it.")
 PY

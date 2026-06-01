@@ -30,7 +30,11 @@
             pkgs.hledger
             pkgs.git
             pkgs.hledger-web   # optional read-only live GUI (docs §8); enable when needed
-            # cargo-nextest / cargo-llvm-cov are owned by mise ([tools] in mise.toml).
+            # Cargo dev tools. mise [tools] pins these for the outside-nix sandboxed loop;
+            # the flake also provides them so `nix develop` (and CI) has the gate tooling
+            # without a separate `mise install`.
+            pkgs.cargo-nextest
+            pkgs.cargo-llvm-cov
           ];
 
           # Stable path to the pinned binary for the adapter / tests (iiAtlas convention).

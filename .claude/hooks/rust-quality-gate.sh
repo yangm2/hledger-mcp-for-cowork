@@ -45,6 +45,17 @@ else
   run "tests" cargo test
 fi
 
+# Cross-target portability: clippy (zero-warnings) for installed Linux gnu targets.
+# Opt-in — silently skipped when a target's std isn't installed
+# (`rustup target add <triple>`), so it never blocks a machine that hasn't provisioned
+# them. Lint/check only (cannot link or run a foreign target here).
+installed_targets="$(rustup target list --installed 2>/dev/null || true)"
+for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+  if printf '%s\n' "$installed_targets" | grep -qx "$t"; then
+    run "clippy ($t)" cargo clippy --target "$t" --all-targets --all-features -- -D warnings
+  fi
+done
+
 if [ "$fail" -ne 0 ]; then
   {
     echo "Rust quality gate FAILED — fix before finishing (strict bar, see CLAUDE.md)."

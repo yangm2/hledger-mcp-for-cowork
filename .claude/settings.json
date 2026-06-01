@@ -14,7 +14,11 @@
       "WebFetch(domain:crates.io)",
       "WebFetch(domain:claude.com)",
       "WebFetch(domain:docs.rs)",
-      "WebFetch(domain:index.crates.io)"
+      "WebFetch(domain:index.crates.io)",
+      "Bash(rustup target *)",
+      "Bash(python3 -)",
+      "Bash(echo \"exit=$?\")",
+      "WebFetch(domain:mise.en.dev)"
     ]
   },
   "hooks": {

@@ -57,15 +57,24 @@ After that the everyday loop runs **outside nix, sandboxed** — `mise run <task
   reconstitutes them per clone. Sandbox settings load at session start — re-open the session
   for them to apply.
 
-**Tasks:** `build`, `fmt`, `lint`, `test`, `e2e`, `cov`, `check` (the fmt+clippy+test gate),
-`run`, `clean` (cargo artifacts), `clean-more` (+ generated dev-env files), and the per-clone
-setup `init` (= `init-env` + `init-settings-local`). `test`/`check` use nextest when on PATH,
-else fall back to `cargo test`.
+**Tasks:** `build`, `fmt`, `lint`, `test`, `e2e`, `cov`, `check-cross` (cross-target Linux
+portability lint), `check` (the fmt+clippy+test+cross gate), `run`, `clean` (cargo artifacts),
+`clean-more` (+ generated dev-env files), and the per-clone setup `init` (= `init-env` +
+`init-settings-local`). `test`/`check` use nextest when on PATH, else fall back to `cargo test`.
+
+**Cross-target portability** (`check-cross`, also in `check` and the Stop hook): runs clippy
+(`-D warnings`) for the Linux gnu targets (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`)
+so a macOS dev box catches Linux-only breakage early — `apple-log` is macOS-scoped, so its
+absence on Linux must stay clean. **Opt-in:** any target whose std isn't installed is skipped
+(`rustup target add <triple>`); it never blocks a machine that hasn't provisioned them. Lint
+only — it does not link or run a foreign target (the runnable Linux binary is a native per-OS
+CI build; see *Platform targets*).
 
 **Stop-hook quality gate** (`.claude/hooks/rust-quality-gate.sh`): on any turn that changed
-`.rs`, runs fmt + clippy + tests and **blocks finishing on failure**. It sources `.env.local`,
-so its e2e runs against real hledger. (Runs `cargo test`, not nextest — the hook's PATH lacks
-mise's tool dir; functionally equivalent for gating.)
+`.rs`, runs fmt + clippy + tests + the cross-target clippy (for installed Linux targets) and
+**blocks finishing on failure**. It sources `.env.local`, so its e2e runs against real hledger.
+(Runs `cargo test`, not nextest — the hook's PATH lacks mise's tool dir; functionally
+equivalent for gating.)
 
 ## Platform targets — native, no cross-compilation
 
@@ -171,3 +180,11 @@ Idempotency via a write-once `; idem:<uuid>` tag. Consequential "decide" calls a
 - **Commits/PRs only when asked.** Branch off `main` first if asked to commit.
 - Match surrounding code style; reference code as `path:line`.
 - When you touch the hledger adapter, update or add a golden fixture in the same change.
+- **Large static resources live in `.md` files, compiled in via `include_str!`** — not inline
+  string literals. Authoring prose (server instructions, `ledger://` session-context + guides)
+  as real markdown keeps it diffable/lintable/reviewable, while `include_str!` reads it **at
+  compile time** into a `&'static str` baked into the binary's `.rodata`. The result is a
+  **single self-contained binary** with no runtime files to ship and no extra linked objects —
+  exactly the property the stdio/Desktop and slim-container deployments want. Keep the files in
+  a `resources/` dir beside the module (e.g. `include_str!("resources/session-context.md")`).
+  (Small one-liners may stay inline; the rule targets multi-line/large content.)
