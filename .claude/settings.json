@@ -5,13 +5,14 @@
       "Bash(gh search:*)",
       "Bash(gh issue:*)",
       "Bash(mise run:*)",
+      "Skill(hookify:hookify)",
+      "Skill(hookify:hookify:*)",
       "WebFetch(domain:developer.apple.com)",
       "WebFetch(domain:docs.developer.apple.com)",
       "WebFetch(domain:static.crates.io)",
-      "Skill(hookify:hookify)",
-      "Skill(hookify:hookify:*)",
       "WebFetch(domain:static.rust-lang.org)",
-      "WebFetch(domain:crates.io)"
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:claude.com)"
     ]
   },
   "hooks": {
@@ -31,7 +32,8 @@
     "hookify@claude-plugins-official": true,
     "security-guidance@claude-plugins-official": true,
     "mcp-server-dev@claude-plugins-official": true,
-    "finance@knowledge-work-plugins": true
+    "finance@knowledge-work-plugins": true,
+    "rust-analyzer-lsp@claude-plugins-official": true
   },
   "sandbox": {
     "enabled": true,
