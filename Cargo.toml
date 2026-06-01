@@ -5,3 +5,6 @@ edition = "2024"
 description = "An hledger MCP (model context protocol) implementation for Claude Cowork"
 
 [dependencies]
+
+[dev-dependencies]
+tempfile = "3.27.0"

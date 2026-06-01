@@ -4,8 +4,26 @@
       "Bash(gh run:*)",
       "Bash(gh search:*)",
       "Bash(gh issue:*)",
+      "Bash(mise run:*)",
       "WebFetch(domain:developer.apple.com)",
-      "WebFetch(domain:docs.developer.apple.com)"
+      "WebFetch(domain:docs.developer.apple.com)",
+      "WebFetch(domain:static.crates.io)",
+      "Skill(hookify:hookify)",
+      "Skill(hookify:hookify:*)",
+      "WebFetch(domain:static.rust-lang.org)",
+      "WebFetch(domain:crates.io)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/rust-quality-gate.sh"
+          }
+        ]
+      }
     ]
   },
   "enabledPlugins": {
@@ -20,7 +38,8 @@
     "autoAllowBashIfSandboxed": true,
     "network": {
       "allowedDomains": [
-              "claude.com"
+        "claude.com",
+        "crates.io"
       ]
     }
   }

@@ -1,0 +1,90 @@
+min_version = "2024.1.0"
+
+# mise is the outer task entrypoint; it delegates to cargo. The toolchain and the
+# pinned hledger 1.52 + git come from the nix dev shell — enter it first:
+#   nix develop          (or `direnv`/a materialized env), then `mise run <task>`
+# Inside that shell, every task below is plain cargo and runs fully sandboxed.
+
+# Dev tools for the sandboxed (outside-nix) loop. The nix flake also provides
+# these for `nix develop`; mise makes them available without entering the shell.
+# (`mise install` provisions them; built from source via the cargo backend.)
+[tools]
+# Pinned exact (reproducible, and avoids the crates.io "latest" API lookup, which
+# the sandbox blocks). Bump deliberately.
+"cargo:cargo-nextest" = "0.9.137"
+"cargo:cargo-llvm-cov" = "0.8.7"
+
+[env]
+# Per-clone env file holding the absolute path to the pinned hledger binary.
+# Written once by `mise run init-env`; missing on a fresh clone is tolerated.
+# Once present, tasks (and the e2e test) find hledger without re-entering nix.
+_.file = { path = ".env.local", optional = true }
+
+[tasks.init-env]
+description = "One-time per-clone setup: write .env.local pointing at the pinned hledger binary"
+quiet = true
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+envfile=".env.local"
+
+# Resolve the pinned hledger: the active nix dev shell first (exact pin, no extra
+# nix call), then the flake via nix, then any hledger on PATH.
+if [ -n "${HLEDGER_EXECUTABLE_PATH:-}" ]; then
+  hl="$HLEDGER_EXECUTABLE_PATH"
+elif command -v nix >/dev/null 2>&1 && [ -f flake.nix ]; then
+  hl="$(nix develop --command sh -c 'printf "%s\n" "$HLEDGER_EXECUTABLE_PATH"' 2>/dev/null \
+        | grep -E '^/.+/bin/hledger$' | tail -1)"
+elif command -v hledger >/dev/null 2>&1; then
+  hl="$(command -v hledger)"
+else
+  hl=""
+fi
+
+if [ -z "${hl:-}" ] || [ ! -x "$hl" ]; then
+  echo "init-env: could not resolve an hledger binary." >&2
+  echo "  Enter the dev shell ('nix develop') or install hledger 1.52, then re-run." >&2
+  exit 1
+fi
+
+printf 'HLEDGER_EXECUTABLE_PATH=%s\n' "$hl" > "$envfile"
+echo "init-env: wrote $envfile"
+echo "  HLEDGER_EXECUTABLE_PATH=$hl"
+"$hl" --version
+'''
+
+[tasks.build]
+description = "Compile (debug)"
+run = "cargo build"
+
+[tasks.fmt]
+description = "Format the code"
+run = "cargo fmt"
+
+[tasks.lint]
+description = "Clippy, zero-warnings bar"
+run = "cargo clippy --all-targets --all-features -- -D warnings"
+
+[tasks.test]
+description = "Run all tests (unit + e2e smoke); nextest if available, else cargo test"
+run = "if cargo nextest --version >/dev/null 2>&1; then cargo nextest run; else cargo test; fi"
+
+[tasks.e2e]
+description = "Run only the e2e smoke test against real hledger"
+run = "cargo test --test smoke -- --nocapture"
+
+[tasks.cov]
+description = "Coverage (strict bar: >=85% lines)"
+run = "cargo llvm-cov --all-features --workspace --fail-under-lines 85"
+
+[tasks.check]
+description = "Full quality gate: fmt + clippy + tests (mirrors the Stop hook)"
+run = [
+  "cargo fmt --check",
+  "cargo clippy --all-targets --all-features -- -D warnings",
+  "if cargo nextest --version >/dev/null 2>&1; then cargo nextest run; else cargo test; fi",
+]
+
+[tasks.run]
+description = "Run the MCP server (stdio transport)"
+run = "cargo run"

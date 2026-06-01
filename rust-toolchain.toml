@@ -1,0 +1,8 @@
+# Rust toolchain. Tracks the `stable` channel; rustup uses the installed stable
+# (non-nix users), while the nix flake.lock pins the exact rust-overlay revision
+# for reproducible nix dev shells. Pin an exact version here if reproducibility
+# outside nix ever matters.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy", "rust-src", "llvm-tools-preview"]
+profile = "minimal"

@@ -1,1 +1,12 @@
 /target
+
+# nix
+/result
+/result-*
+.direnv/
+
+# materialized dev env (from `nix print-dev-env`)
+/.devenv.sh
+
+# per-clone env file (absolute path to the pinned hledger binary)
+/.env.local
