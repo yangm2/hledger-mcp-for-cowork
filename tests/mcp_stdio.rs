@@ -215,13 +215,14 @@ fn read_tools_work_end_to_end_against_fixture_journal() {
     let status_text = status["result"]["content"][0]["text"]
         .as_str()
         .expect("status text");
+    // Assert status surfaced the backend (version line + binary + journal) without pinning to
+    // a specific hledger version — a dev box may have a non-1.52 hledger on PATH, and this test
+    // should exercise the wiring, not the pin (the pin is asserted in the version unit tests).
     assert!(
-        status_text.contains("hledger: 1.52 (pinned)"),
-        "status reports the pinned hledger version: {status_text}"
-    );
-    assert!(
-        status_text.contains("binary:") && status_text.contains("sample.journal"),
-        "status reports the resolved binary and journal: {status_text}"
+        status_text.contains("hledger: ")
+            && status_text.contains("binary:")
+            && status_text.contains("sample.journal"),
+        "status reports the backend version, binary, and journal: {status_text}"
     );
 
     // get_account_balance returns the real computed balance ($100 − $12.34 − $44 = $43.66).
@@ -242,7 +243,7 @@ fn read_tools_work_end_to_end_against_fixture_journal() {
     // list_transactions with a query returns the matching transaction's header + postings.
     server.send(&json!({
         "jsonrpc": "2.0", "id": 12, "method": "tools/call",
-        "params": { "name": "list_transactions", "arguments": { "query": "expenses:supplies" } }
+        "params": { "name": "list_transactions", "arguments": { "query": ["expenses:supplies"] } }
     }));
     let txns = server.recv();
     assert_eq!(txns["result"]["isError"], json!(false));

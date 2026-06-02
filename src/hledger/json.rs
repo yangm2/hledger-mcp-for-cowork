@@ -7,6 +7,7 @@
 //! surface is the domain types in [`super`], produced by the `From`/`from_*` conversions here.
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::amount::{Amount, Quantity};
 use super::{AccountBalance, BalanceReport, Posting, Transaction};
@@ -54,26 +55,59 @@ fn into_amounts(raw: Vec<JsonAmount>) -> Vec<Amount> {
 
 // ---- balance (`hledger balance -O json`) ----------------------------------------------
 //
-// Shape: a 2-tuple `[rows, totals]`. Each row is the positional tuple
+// Shape: a 2-element array `[rows, totals]`. Each row is the positional array
 // `[full_account_name, display_name, indent, [amounts]]`; `totals` is `[amounts]`.
+//
+// We navigate this as `serde_json::Value` by index rather than deserializing fixed-length
+// tuples: a tuple rejects *extra* trailing elements, which would break the moment a future
+// hledger appends a positional field — violating this module's parse-only-what-we-use /
+// ignore-unknowns invariant. Indexing reads the positions we use (0 + 3 of a row, 0 + 1 of
+// the document) and ignores anything beyond, so an additive shape change stays compatible.
 
-/// One balance row: `(full account name, display name, indent depth, amounts)`.
-type JsonBalanceRow = (String, String, i64, Vec<JsonAmount>);
-/// The whole `balance` document: `(rows, column totals)`.
-type JsonBalance = (Vec<JsonBalanceRow>, Vec<JsonAmount>);
+/// Read a JSON value expected to be an array of hledger amounts into domain [`Amount`]s.
+fn amounts_from_value(value: &Value) -> Result<Vec<Amount>, serde_json::Error> {
+    let raw: Vec<JsonAmount> = serde_json::from_value(value.clone())?;
+    Ok(into_amounts(raw))
+}
 
 /// Parse `hledger balance -O json` output into a [`BalanceReport`].
 pub fn parse_balance(stdout: &str) -> Result<BalanceReport, serde_json::Error> {
-    let (rows, totals): JsonBalance = serde_json::from_str(stdout)?;
+    use serde::de::Error as _;
+    let doc: Value = serde_json::from_str(stdout)?;
+    let top = doc
+        .as_array()
+        .ok_or_else(|| serde_json::Error::custom("balance: expected a top-level array"))?;
+    let rows_val = top
+        .first()
+        .ok_or_else(|| serde_json::Error::custom("balance: missing rows element"))?;
+    let totals_val = top
+        .get(1)
+        .ok_or_else(|| serde_json::Error::custom("balance: missing totals element"))?;
+    let rows_arr = rows_val
+        .as_array()
+        .ok_or_else(|| serde_json::Error::custom("balance: rows is not an array"))?;
+
+    let mut rows = Vec::with_capacity(rows_arr.len());
+    for row in rows_arr {
+        let cells = row
+            .as_array()
+            .ok_or_else(|| serde_json::Error::custom("balance: row is not an array"))?;
+        let account = cells
+            .first()
+            .and_then(Value::as_str)
+            .ok_or_else(|| serde_json::Error::custom("balance: row missing account name"))?
+            .to_string();
+        let amounts_val = cells
+            .get(3)
+            .ok_or_else(|| serde_json::Error::custom("balance: row missing amounts"))?;
+        rows.push(AccountBalance {
+            account,
+            amounts: amounts_from_value(amounts_val)?,
+        });
+    }
     Ok(BalanceReport {
-        rows: rows
-            .into_iter()
-            .map(|(account, _display, _indent, amounts)| AccountBalance {
-                account,
-                amounts: into_amounts(amounts),
-            })
-            .collect(),
-        totals: into_amounts(totals),
+        rows,
+        totals: amounts_from_value(totals_val)?,
     })
 }
 
@@ -188,6 +222,24 @@ mod tests {
     }
 
     #[test]
+    fn ignores_extra_balance_array_elements() {
+        // A future hledger appends positional elements to a row and to the top-level array.
+        // Indexing (not fixed-length tuples) must ignore the extras and still parse.
+        let doc = r#"[
+          [["assets:checking","assets:checking",0,
+            [{"acommodity":"$","aquantity":{"decimalMantissa":4366,"decimalPlaces":2,
+              "floatingPoint":43.66},"astyle":{"ascommodityside":"L","ascommodityspaced":false}}],
+            "FUTURE_ROW_FIELD", 99]],
+          [{"acommodity":"$","aquantity":{"decimalMantissa":4366,"decimalPlaces":2,
+            "floatingPoint":43.66},"astyle":{"ascommodityside":"L","ascommodityspaced":false}}],
+          "FUTURE_TOP_FIELD"]"#;
+        let report = parse_balance(doc).expect("extra array elements ignored");
+        assert_eq!(report.rows[0].account, "assets:checking");
+        assert_eq!(report.rows[0].amounts[0].render(), "$43.66");
+        assert_eq!(report.totals[0].render(), "$43.66");
+    }
+
+    #[test]
     fn ignores_unknown_fields() {
         // A future hledger adds a field we don't read; we must still parse. Inject a bogus
         // top-level key into an amount object and a transaction.
@@ -207,6 +259,20 @@ mod tests {
     fn parse_error_on_malformed_json() {
         assert!(parse_balance("not json").is_err());
         assert!(parse_print("{}").is_err());
+    }
+
+    #[test]
+    fn balance_rejects_wrong_shapes() {
+        // Not a top-level array.
+        assert!(parse_balance(r#"{"rows":[]}"#).is_err());
+        // Missing the totals element (only one top element).
+        assert!(parse_balance(r#"[[]]"#).is_err());
+        // Row isn't an array.
+        assert!(parse_balance(r#"[[42],[]]"#).is_err());
+        // Row missing the account-name cell (empty row).
+        assert!(parse_balance(r#"[[[]],[]]"#).is_err());
+        // Row present with account but missing the amounts cell (index 3).
+        assert!(parse_balance(r#"[[["a:b","a:b",0]],[]]"#).is_err());
     }
 
     // Round-trip property tests (the read half of the §6 round-trip contract): synthesize the

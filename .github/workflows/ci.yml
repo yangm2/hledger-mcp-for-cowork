@@ -114,7 +114,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # mutants-diff needs history to compute the merge base
+          fetch-depth: 0 # full history so the merge base with main is reachable
+
+      # A PR is checked out at a detached merge ref with no local `main` branch, so
+      # `mutants-diff` resolves the base as `origin/main`. Ensure that remote-tracking ref
+      # exists (fetch-depth:0 fetches it, but fetch it explicitly to be robust to PR merge refs).
+      - name: Ensure origin/main is available for the diff base
+        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
 
       - name: Set up mise (provisions cargo-mutants from [tools])
         uses: jdx/mise-action@v2

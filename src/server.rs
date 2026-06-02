@@ -50,10 +50,12 @@ pub struct AccountBalanceArgs {
 /// Arguments for `list_transactions`.
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub struct ListTransactionsArgs {
-    /// Optional hledger query terms (space-separated), e.g. `assets:checking date:2026`.
-    /// Omit to list every transaction.
+    /// Optional hledger query terms, **one term per array element** — e.g.
+    /// `["assets:checking", "date:2026"]`. Each element is passed to hledger verbatim, so a
+    /// multi-word value stays one term: `["desc:Acme Corp"]` queries that description, it is
+    /// not split. Omit (or pass `[]`) to list every transaction.
     #[serde(default)]
-    pub query: Option<String>,
+    pub query: Option<Vec<String>>,
 }
 
 /// The MCP server handler.
@@ -161,9 +163,9 @@ impl HledgerMcp {
     /// List transactions matching an optional hledger query via `hledger print -O json`.
     #[tool(
         description = "List transactions from the ledger, optionally filtered by an hledger \
-                      query (field `query`, space-separated terms like `assets:checking \
-                      date:2026`). Omit `query` to list all. Returns date, description, and \
-                      postings for each match.",
+                      query (field `query`: an array of terms, one per element, e.g. \
+                      [\"assets:checking\", \"date:2026\"]). Omit `query` to list all. \
+                      Returns date, description, and postings for each match.",
         input_schema = schema_for_type::<ListTransactionsArgs>()
     )]
     async fn list_transactions(
@@ -174,13 +176,7 @@ impl HledgerMcp {
             Ok(args) => args,
             Err(err) => return Ok(err),
         };
-        let terms: Vec<String> = args
-            .query
-            .as_deref()
-            .unwrap_or("")
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
+        let terms = args.query.unwrap_or_default();
         match self.hledger.list_transactions(&terms).await {
             Ok(txns) => Ok(CallToolResult::success(vec![Content::text(
                 render_transactions(&txns),
@@ -542,9 +538,9 @@ mod tests {
         let Some(server) = fixture_server().await else {
             return;
         };
-        // With a query.
+        // With a query (array of terms).
         let filtered = server
-            .list_transactions(args(serde_json::json!({ "query": "expenses:supplies" })))
+            .list_transactions(args(serde_json::json!({ "query": ["expenses:supplies"] })))
             .await
             .expect("dispatch");
         assert_eq!(filtered.is_error, Some(false));

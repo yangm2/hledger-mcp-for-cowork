@@ -143,23 +143,47 @@ echo "golden: regenerated fixtures in $dir (scrubbed). Review the diff before co
 '''
 
 [tasks.mutants]
-description = "Mutation testing on the pure, high-stakes modules (assertion strength; periodic/on-demand, not in the Stop-hook gate). Surviving mutants = test gaps."
+description = "Mutation testing on the pure, high-stakes modules (assertion strength; periodic/on-demand, not in the Stop-hook gate). Surviving mutants = test gaps. Pass file paths to scope to just those (default: the parser + amount modules)."
 # Scope to pure correctness-critical code where a surviving mutant is a real hole;
 # the subprocess/transport/logging glue is excluded (mutants there mostly time out).
-# M1 in-scope: the -O json parser + the exact-decimal amount. Extend as modules land
-# (M2 formatter, M3 CAS, M4 domain).
-run = "cargo mutants --no-shuffle -f src/hledger/json.rs -f src/hledger/amount.rs -- --all-features"
+# Default in-scope (M1): the -O json parser + the exact-decimal amount. Extend the default as
+# modules land (M2 formatter, M3 CAS, M4 domain); override per-run with file args, e.g.
+# `mise run mutants src/hledger/json.rs` to mutate only the file you just touched.
+usage = '''
+arg "<files>" var=#true help="Source files to mutate (default: src/hledger/json.rs + src/hledger/amount.rs)"
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+# Default set when no files are given. Word-splitting on the space-separated `usage_files`
+# (or the default) is intentional — each entry becomes a `-f <file>` argument.
+files="${usage_files:-src/hledger/json.rs src/hledger/amount.rs}"
+fargs=()
+for f in $files; do fargs+=( -f "$f" ); done
+cargo mutants --no-shuffle "${fargs[@]}" -- --all-features
+'''
 
 [tasks.mutants-diff]
-description = "Fast mutation testing: only mutate lines changed vs the merge base (suitable for PR CI gating)."
+description = "Fast mutation testing: only mutate lines changed vs the merge base with main (suitable for PR CI gating)."
 # Materialize the diff to a file first — `--in-diff` wants a path, and process
 # substitution isn't portable to the sh/dash used by CI.
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
+# Resolve a base ref that exists both locally and in a CI PR checkout. A PR checkout has no
+# local `main` branch (detached HEAD), so prefer the remote-tracking `origin/main`; fall back
+# to a local `main`, or an explicit override. Without this, `git diff --merge-base main` dies
+# with "unknown revision 'main'" in CI.
+base="${MUTANTS_DIFF_BASE:-}"
+if [ -z "$base" ]; then
+  for ref in origin/main main; do
+    if git rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then base="$ref"; break; fi
+  done
+fi
+[ -n "$base" ] || { echo "mutants-diff: no base ref found (set MUTANTS_DIFF_BASE)" >&2; exit 1; }
 diff="$(mktemp)"
 trap 'rm -f "$diff"' EXIT
-git diff --merge-base main > "$diff"
+git diff --merge-base "$base" > "$diff"
 cargo mutants --in-diff "$diff" -- --all-features
 '''
 
@@ -245,9 +269,10 @@ flag "-j --journal <path>" help="Journal file the registered server serves (sets
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
-cargo build
+# The binary is produced by the `build` dependency (don't re-`cargo build` here — that would
+# compile twice). Resolve its absolute path for the registered entry.
 bin="$PWD/target/debug/hledger-mcp-for-cowork"
-[ -x "$bin" ] || { echo "install: built binary not found at $bin" >&2; exit 1; }
+[ -x "$bin" ] || { echo "install: built binary not found at $bin (run \`mise run build\`)" >&2; exit 1; }
 
 # Verbosity: `usage_verbose` is the count of `-v` (unset when none) — turn it into that
 # many `-v` args for the registered server.
@@ -257,6 +282,20 @@ verbosity="${usage_verbose:-0}"
 # into the registered entry as LEDGER_FILE (the binary reads it); empty → no journal pinned
 # (the server runs but read tools error until one is configured).
 journal="${usage_journal:-${LEDGER_FILE:-}}"
+
+# Desktop launches the server with an unspecified CWD, so a relative journal would resolve
+# wrong. Make it absolute (without requiring the file to exist yet — hledger needs the file,
+# but its containing directory must exist so we can resolve the path).
+if [ -n "$journal" ]; then
+  case "$journal" in
+    /*) : ;;  # already absolute
+    *)
+      jdir="$(cd "$(dirname "$journal")" 2>/dev/null && pwd)" \
+        || { echo "install: --journal directory does not exist: $(dirname "$journal")" >&2; exit 1; }
+      journal="$jdir/$(basename "$journal")"
+      ;;
+  esac
+fi
 
 # Claude Desktop config path. Cowork bridges these stdio servers via the SDK layer,
 # so registering here makes the server available to both Desktop and Cowork.
@@ -331,3 +370,4 @@ run = "cargo clean"
 description = "Deep clean: cargo artifacts + generated dev-env files (.env.local, nix result, .devenv.sh, .direnv)"
 depends = ["clean"]
 run = "rm -rf .env.local result result-* .devenv.sh .direnv"
+
