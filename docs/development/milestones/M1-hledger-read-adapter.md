@@ -124,9 +124,10 @@ read tools).
 
 Gate (run via `mise`, hledger 1.52 from `.env.local`):
 
-- `mise run check` — **green**: `cargo fmt --check`, clippy `-D warnings` (host **and** the
-  `aarch64-unknown-linux-gnu` cross target; `x86_64` std not installed locally → skipped, still
-  covered by CI), and **62 tests** pass (unit + golden + proptest + stdio integration + e2e).
+- `mise run check` — **green**: `cargo fmt --check`, clippy `-D warnings` (host), and **62 tests**
+  pass (unit + golden + proptest + stdio integration + e2e). (At M1 close this also ran a
+  macOS→Linux cross-clippy; that local `check-cross` was since retired — Linux portability is
+  covered by the native CI matrix.)
 - `mise run cov` — **89.08% lines ≥ 85%** (hard gate now active). The pure modules are at/near
   100%: `amount.rs` 100%, `cli.rs` 100%, `json.rs` 100%, `mod.rs` 95%, `runner.rs` 92%,
   `server.rs` 89%. (`main.rs` reads 0% — it is exercised only by the *spawned-subprocess* stdio

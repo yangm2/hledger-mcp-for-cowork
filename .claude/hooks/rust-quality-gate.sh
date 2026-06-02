@@ -45,14 +45,8 @@ else
   run "tests" cargo test
 fi
 
-# Cross-target portability: delegate to `mise run check-cross` — the SINGLE source of
-# truth for the target list + per-target skip logic (don't duplicate it here; it would
-# drift from mise.toml / CI). Only when `mise` is on the hook's PATH; otherwise skipped
-# (CI and `mise run check` still cover cross). check-cross itself no-ops for targets whose
-# std isn't installed, so this stays fast on machines that haven't provisioned them.
-if command -v mise >/dev/null 2>&1; then
-  run "cross-clippy" mise run check-cross
-fi
+# Linux portability is covered by the native per-OS CI matrix (see CLAUDE.md "Platform
+# targets"), not a local cross-target clippy.
 
 if [ "$fail" -ne 0 ]; then
   {
