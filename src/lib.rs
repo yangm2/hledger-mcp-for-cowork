@@ -6,10 +6,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod git;
 pub mod hledger;
 pub mod logging;
 pub mod protocol;
 pub mod server;
 pub mod tools;
+pub mod write;
 
 pub use server::HledgerMcp;

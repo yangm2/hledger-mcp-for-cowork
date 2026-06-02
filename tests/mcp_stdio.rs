@@ -121,10 +121,15 @@ fn full_lifecycle_lists_tools_and_echoes() {
     assert_eq!(
         names,
         vec![
+            "declare_account".to_string(),
+            "declare_commodity".to_string(),
             "echo".to_string(),
             "get_account_balance".to_string(),
             "list_transactions".to_string(),
+            "post_transaction".to_string(),
             "status".to_string(),
+            "update_transaction".to_string(),
+            "void_transaction".to_string(),
         ]
     );
 

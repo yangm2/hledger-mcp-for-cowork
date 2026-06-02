@@ -67,6 +67,14 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Crash reconciliation: if a previous run left the journal replaced-but-uncommitted, make
+    // HEAD a check-valid journal again (commit if it passes, else restore) before serving.
+    match hledger_mcp_for_cowork::write::reconcile(&hledger).await {
+        Ok(Some(commit)) => tracing::warn!(%commit, "startup reconciled an uncommitted journal"),
+        Ok(None) => {}
+        Err(err) => tracing::error!(%err, "startup reconciliation failed"),
+    }
+
     let ct = CancellationToken::new();
     let signal_ct = ct.clone();
     tokio::spawn(async move {

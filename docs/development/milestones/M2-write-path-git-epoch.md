@@ -216,8 +216,67 @@ Decided before building M2; they tighten the scope below.
 
 ## Exit-criteria review
 
-> Fill in when closing M2. Beyond `mise run check`/`cov`, explicitly demonstrate the
-> **fail-closed** property (the journal-untouched-on-failure test) and the **exactly-one-
-> commit-per-write** property — these are the load-bearing safety claims. Confirm corrections
-> never line-edit. Record the verdict; if the reconciliation `Crash` handling is only partially
-> tested, defer the remainder explicitly to M3's TLA+ work.
+**Reviewed 2026-06-02 — verdict: done-with-deferrals.**
+
+Gate (via `mise`, hledger 1.52 from `.env.local`):
+
+- `mise run check` — **green**: `cargo fmt --check`, clippy `-D warnings` (host), **102 tests**
+  (unit + golden + proptest + stdio integration + write e2e).
+- `mise run cov` — **88.04% lines ≥ 85%**. Pure write modules are high: `write/format.rs` 100%,
+  `write/validate.rs` 91%, `hledger/amount.rs` 99.6%, `git.rs` 93%. (`main.rs` 0% — spawned-
+  subprocess only; `logging.rs` 73% — os_log layer; both accepted, total clears the bar.)
+- `mise run mutants` on the pure core (`amount.rs` + `format.rs` + `validate.rs`; `json.rs`
+  unchanged from M1's 0) — **0 surviving mutants** (69 tested: 64 caught, 5 unviable). A first
+  pass found 9 survivors; closed by removing a redundant digit-check in `Quantity::parse` and
+  adding `Add`-scaling + isolated `validate_date`/`validate_tag_key` boundary tests.
+
+Checklist:
+
+- [x] `mise run check` green; `mise run cov` ≥ 85% (88.04%).
+- [x] format → `check --strict` → atomic-replace → `git2` commit, exactly one commit per write
+      (`smoke::write_path_declare_post_void_round_trip`: declare/post/void each a distinct oid).
+- [x] **Fail-closed:** on `check` failure the live journal is **byte-identical** and **no commit**
+      (`write::tests::append_and_commit_fails_closed_on_invalid_text` asserts both + temp cleanup;
+      `smoke` also asserts byte-identity on the undeclared-account input error).
+- [x] Internal vs input errors are distinct, both tested (validate → `Input`; post-format `check`
+      rejection → loud `Internal` with attached output, logged verbatim).
+- [x] **Require-pre-declare** end-to-end: `declare_*` add directives through the pipeline; posting
+      to a declared account succeeds, to an undeclared one returns a correctable `Input` error.
+- [x] Idempotency (**C-2**): duplicate `idem:` → exactly one transaction; dedup runs inside the
+      write mutex (no TOCTOU — mutex held across dedup→commit).
+- [x] Every post carries a stable `id:<uuid>`; `void` references it (not `tindex`/file+line); the
+      round-trip e2e confirms the `id` tag survives. **No in-place edits** — grep shows the write
+      path only ever appends + atomically replaces; corrections are reversing entries.
+- [x] git via **`git2`** (`vendored-libgit2`; no `git` subprocess in the write path);
+      `#![forbid(unsafe_code)]` holds. Fresh-ledger **bootstrap** + startup **reconcile** of a
+      valid uncommitted journal both tested.
+- [x] **§6 round-trip safety net:** `smoke::posted_transactions_round_trip_through_hledger` posts
+      representative txns (negatives, a second commodity, a user tag); each passes `check --strict`
+      (post only commits if it does) and `print -O json` parses back to the same account+amount+id.
+- [x] Version pin is a **hard gate** (`gate()` refuses non-1.52); `status` reports git/write-
+      readiness (repo, HEAD short oid, dirty/clean, writes enabled/blocked).
+- [x] **Mutation: zero surviving mutants** in the pure core; formatter added to the `mutants`
+      default set.
+- [x] No PII: commit messages are synthetic (`post id:<uuid>`, `void reverses:…`, `declare …`);
+      fixtures/tests use placeholder accounts/amounts.
+
+**Deferrals (none block M3):**
+
+- **Generative (`proptest`) versions of the round-trip & adversarial properties.** Both are
+  covered by enumerated representative cases + the mutation-tight pure formatter/validator, but
+  not a generator that shells to hledger per case (one subprocess/case is slow/flaky). Hardening
+  candidate for later; the pure formatter already has a structural proptest.
+- **C-3 epoch monotonicity** is *demonstrated* (distinct oids per write; reads never commit) but
+  not a dedicated long-run monotonicity test — **M3** formalizes epoch behavior under the TLA+
+  model and CAS.
+- **C-4 ref-integrity / tombstoned accounts** — out of scope here (soft-delete is **M4**), as the
+  plan allowed.
+- **reconcile "restore an *invalid* uncommitted journal to HEAD"** branch: the restore mechanism
+  is unit-tested (`git::tests::restore_to_head_…`) and the valid→commit branch is e2e-tested, but
+  the invalid→restore path isn't yet exercised end-to-end. Carry into **M3** (the `Crash` action).
+- **Pin-mismatch refusal** is implemented + unit-reachable via the `Refused` path, but not e2e-
+  tested against a real non-1.52 binary (we only have 1.52 pinned). Low risk.
+
+> Confirmed the two load-bearing safety claims directly: the journal is byte-identical after a
+> forced `check` failure (no commit), and each validated write produces exactly one commit. No
+> code path edits a posted line in place.

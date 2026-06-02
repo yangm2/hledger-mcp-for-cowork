@@ -27,6 +27,39 @@ impl Quantity {
         Self { mantissa, places }
     }
 
+    /// Parse an exact decimal string (e.g. `"100.00"`, `"-44.00"`, `"0.05"`, `"100"`) into a
+    /// [`Quantity`] by integer math only — no float. Accepts an optional leading `+`/`-`. Returns
+    /// `None` for anything not a plain decimal (empty, a bare `-`, `1.2.3`, `5.`, letters, …).
+    pub fn parse(s: &str) -> Option<Quantity> {
+        let s = s.trim();
+        let (neg, rest) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s.strip_prefix('+').unwrap_or(s)),
+        };
+        if rest.is_empty() {
+            return None;
+        }
+        let (int_part, frac_part) = match rest.split_once('.') {
+            Some((int_part, frac_part)) => (int_part, frac_part),
+            None => (rest, ""),
+        };
+        // A dot must be followed by digits (reject `5.`); `.5` (empty int) is allowed.
+        if rest.contains('.') && frac_part.is_empty() {
+            return None;
+        }
+        // Any non-digit (or overflow, or emptiness) is rejected by this parse — so no separate
+        // digit-validation pass is needed (it would be dead: `parse::<i128>` already covers it).
+        let digits = format!("{int_part}{frac_part}");
+        let magnitude: i128 = digits.parse().ok()?;
+        let mantissa = if neg { -magnitude } else { magnitude };
+        Some(Quantity::new(mantissa, frac_part.len() as u32))
+    }
+
+    /// Whether this quantity is exactly zero.
+    pub fn is_zero(&self) -> bool {
+        self.mantissa == 0
+    }
+
     /// Render the exact decimal as a string, by integer math only (no float).
     ///
     /// Examples: `(8766, 2) → "87.66"`, `(-15000, 2) → "-150.00"`, `(5, 2) → "0.05"`,
@@ -56,6 +89,18 @@ impl Quantity {
 impl fmt::Display for Quantity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.render())
+    }
+}
+
+impl std::ops::Add for Quantity {
+    type Output = Quantity;
+
+    /// Exact sum, aligning to the greater scale. Integer math only — no float.
+    fn add(self, other: Quantity) -> Quantity {
+        let places = self.places.max(other.places);
+        let lhs = self.mantissa * 10i128.pow(places - self.places);
+        let rhs = other.mantissa * 10i128.pow(places - other.places);
+        Quantity::new(lhs + rhs, places)
     }
 }
 
@@ -152,6 +197,48 @@ mod tests {
             spaced: true,
         };
         assert_eq!(right.render(), "40.00 EUR");
+    }
+
+    #[test]
+    fn parse_accepts_plain_decimals() {
+        assert_eq!(Quantity::parse("100.00"), Some(Quantity::new(10000, 2)));
+        assert_eq!(Quantity::parse("-44.00"), Some(Quantity::new(-4400, 2)));
+        assert_eq!(Quantity::parse("0.05"), Some(Quantity::new(5, 2)));
+        assert_eq!(Quantity::parse(".5"), Some(Quantity::new(5, 1)));
+        assert_eq!(Quantity::parse("100"), Some(Quantity::new(100, 0)));
+        assert_eq!(Quantity::parse("+7"), Some(Quantity::new(7, 0)));
+        assert_eq!(Quantity::parse("  12.34 "), Some(Quantity::new(1234, 2)));
+    }
+
+    #[test]
+    fn parse_rejects_non_decimals() {
+        for bad in [
+            "", "-", "+", ".", "5.", "1.2.3", "abc", "1,000", "$5", "1e3",
+        ] {
+            assert_eq!(Quantity::parse(bad), None, "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn parse_render_round_trips() {
+        for s in ["100.00", "-44.00", "0.05", "0.00", "12.34"] {
+            assert_eq!(Quantity::parse(s).unwrap().render(), s);
+        }
+    }
+
+    #[test]
+    fn add_aligns_scales_and_detects_zero() {
+        // 100.00 + (-44.0) = 56.00
+        let sum = Quantity::new(10000, 2) + Quantity::new(-440, 1);
+        assert_eq!(sum.render(), "56.00");
+        // Left operand has FEWER places than the right → its mantissa must be scaled up
+        // (5 + 0.00 = 5.00); guards the lhs scaling specifically.
+        assert_eq!((Quantity::new(5, 0) + Quantity::new(0, 2)).render(), "5.00");
+        // Right operand scaled up: 0.00 + 5 = 5.00.
+        assert_eq!((Quantity::new(0, 2) + Quantity::new(5, 0)).render(), "5.00");
+        // 12.34 + (-12.34) = 0
+        assert!((Quantity::new(1234, 2) + Quantity::new(-1234, 2)).is_zero());
+        assert!(!Quantity::new(1, 2).is_zero());
     }
 
     #[test]

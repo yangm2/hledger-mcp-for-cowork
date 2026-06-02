@@ -11,6 +11,38 @@ pub fn version_argv() -> Vec<String> {
     vec!["--version".to_string()]
 }
 
+/// `hledger check --strict -f <journal>` — the write-path validator (parse + balanced +
+/// declared accounts/commodities). Exit 0 = valid; non-zero stderr carries the diagnostic.
+pub fn check_strict_argv(journal: &Path) -> Vec<String> {
+    vec![
+        "check".to_string(),
+        "--strict".to_string(),
+        "-f".to_string(),
+        journal.display().to_string(),
+    ]
+}
+
+/// `hledger accounts --declared -f <journal>` — the declared account set (plain text, one per
+/// line; `accounts` does **not** support `-O json` in 1.52).
+pub fn accounts_declared_argv(journal: &Path) -> Vec<String> {
+    vec![
+        "accounts".to_string(),
+        "--declared".to_string(),
+        "-f".to_string(),
+        journal.display().to_string(),
+    ]
+}
+
+/// `hledger commodities -f <journal>` — the declared commodity set (plain text, one per line;
+/// no `-O json` in 1.52).
+pub fn commodities_argv(journal: &Path) -> Vec<String> {
+    vec![
+        "commodities".to_string(),
+        "-f".to_string(),
+        journal.display().to_string(),
+    ]
+}
+
 /// `hledger balance [account] -O json -f <journal>`.
 ///
 /// `account` is an optional account-name query; `None` reports all accounts.
@@ -101,6 +133,26 @@ mod tests {
         assert_eq!(
             print_argv(&journal(), &[]),
             vec!["print", "-O", "json", "-f", "/x/main.journal"]
+        );
+    }
+
+    #[test]
+    fn check_strict_argv_shape() {
+        assert_eq!(
+            check_strict_argv(&journal()),
+            vec!["check", "--strict", "-f", "/x/main.journal"]
+        );
+    }
+
+    #[test]
+    fn declared_set_argv_shapes() {
+        assert_eq!(
+            accounts_declared_argv(&journal()),
+            vec!["accounts", "--declared", "-f", "/x/main.journal"]
+        );
+        assert_eq!(
+            commodities_argv(&journal()),
+            vec!["commodities", "-f", "/x/main.journal"]
         );
     }
 }

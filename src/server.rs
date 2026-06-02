@@ -6,6 +6,7 @@
 //! `initialize` override emits the handshake wire-log and negotiates the protocol
 //! version via [`crate::protocol`].
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use rmcp::handler::server::common::schema_for_type;
@@ -19,6 +20,7 @@ use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router
 
 use crate::hledger::amount::render_amounts;
 use crate::hledger::{BalanceReport, Hledger, HledgerError, PINNED_VERSION, Transaction};
+use crate::write::{self, WriteError, WriteOutcome, input::TransactionInput};
 
 const SERVER_NAME: &str = "hledger-mcp";
 
@@ -58,11 +60,48 @@ pub struct ListTransactionsArgs {
     pub query: Option<Vec<String>>,
 }
 
+/// Arguments for `declare_account`.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct DeclareAccountArgs {
+    /// The account name to declare, e.g. `assets:checking` (colon-separated).
+    pub account: String,
+}
+
+/// Arguments for `declare_commodity`.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct DeclareCommodityArgs {
+    /// The commodity symbol to declare, e.g. `$` or `EUR`.
+    pub commodity: String,
+    /// Decimal places for the display style (default 2).
+    #[serde(default)]
+    pub decimal_places: Option<u32>,
+}
+
+/// Arguments for `void_transaction`.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct VoidTransactionArgs {
+    /// The `id:` tag of the transaction to void (from a prior `post_transaction`).
+    pub id: String,
+}
+
+/// Arguments for `update_transaction` (= void the target + post a replacement).
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct UpdateTransactionArgs {
+    /// The `id:` tag of the transaction to replace.
+    pub id: String,
+    /// The replacement transaction (posted fresh; the original is reversed, not edited).
+    pub transaction: TransactionInput,
+}
+
 /// The MCP server handler.
 #[derive(Clone)]
 pub struct HledgerMcp {
     started: Instant,
     hledger: Hledger,
+    /// Serializes the write path (single-writer invariant): every write op holds this for the
+    /// whole dedup → validate → format → check → swap → commit sequence, so concurrent writes
+    /// don't interleave and idempotency has no TOCTOU window.
+    write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for HledgerMcp {
@@ -78,6 +117,7 @@ impl HledgerMcp {
         Self {
             started: Instant::now(),
             hledger,
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -108,7 +148,9 @@ impl HledgerMcp {
     /// here (and logged at startup) so a wrong binary or journal is immediately visible. The
     /// M1 policy is warn-and-continue for reads, hard-gate before M2 writes.
     async fn backend_block(&self) -> String {
-        let version = match self.hledger.version().await {
+        let detected = self.hledger.version().await; // one subprocess; reused below
+        let pinned = matches!(&detected, Ok(v) if v.pin_matches());
+        let version = match &detected {
             Ok(v) if v.pin_matches() => {
                 format!("hledger: {}.{} (pinned) — {:?}", v.major, v.minor, v.raw)
             }
@@ -119,11 +161,27 @@ impl HledgerMcp {
             Err(err) => format!("hledger: unavailable ({err})"),
         };
         let binary = format!("binary: {}", self.hledger.bin().display());
-        let journal = match self.hledger.journal_path() {
-            Some(path) => format!("journal: {}", path.display()),
-            None => "journal: (none configured — set --journal or LEDGER_FILE)".to_string(),
+        let (journal, git) = match self.hledger.journal_path() {
+            Some(path) => (
+                format!("journal: {}", path.display()),
+                crate::write::git_status_line(path),
+            ),
+            None => (
+                "journal: (none configured — set --journal or LEDGER_FILE)".to_string(),
+                "git: (no journal configured)".to_string(),
+            ),
         };
-        format!("{version}\n{binary}\n{journal}")
+        // Writes need both the pinned hledger and a journal.
+        let writes = if detected.is_err() {
+            "writes: blocked (hledger unavailable)"
+        } else if !pinned {
+            "writes: BLOCKED (hledger not pinned 1.52)"
+        } else if self.hledger.has_journal() {
+            "writes: enabled"
+        } else {
+            "writes: blocked (no journal configured)"
+        };
+        format!("{version}\n{binary}\n{journal}\n{git}\n{writes}")
     }
 
     /// Pure render of the `status` body (separated from peer/subprocess access so it is
@@ -185,6 +243,139 @@ impl HledgerMcp {
         }
     }
 
+    /// Declare an account so transactions may post to it (require-pre-declare).
+    #[tool(
+        description = "Declare an account so transactions can post to it. The ledger requires \
+                      accounts to be declared before use. Requires a string field `account` \
+                      (e.g. `assets:checking`).",
+        input_schema = schema_for_type::<DeclareAccountArgs>()
+    )]
+    async fn declare_account(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: DeclareAccountArgs = match crate::tools::parse_args(raw) {
+            Ok(args) => args,
+            Err(err) => return Ok(err),
+        };
+        let _guard = self.write_lock.lock().await;
+        match write::declare_account(&self.hledger, &args.account).await {
+            Ok(commit) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "declared account '{}' (commit {})",
+                args.account,
+                short(&commit)
+            ))])),
+            Err(err) => Ok(write_error_result(err)),
+        }
+    }
+
+    /// Declare a commodity so amounts may use it (require-pre-declare).
+    #[tool(
+        description = "Declare a commodity so amounts can use it. Requires a string field \
+                      `commodity` (e.g. `$` or `EUR`); optional `decimal_places` (default 2).",
+        input_schema = schema_for_type::<DeclareCommodityArgs>()
+    )]
+    async fn declare_commodity(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: DeclareCommodityArgs = match crate::tools::parse_args(raw) {
+            Ok(args) => args,
+            Err(err) => return Ok(err),
+        };
+        let places = args.decimal_places.unwrap_or(2);
+        let _guard = self.write_lock.lock().await;
+        match write::declare_commodity(&self.hledger, &args.commodity, places).await {
+            Ok(commit) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "declared commodity '{}' ({} dp, commit {})",
+                args.commodity,
+                places,
+                short(&commit)
+            ))])),
+            Err(err) => Ok(write_error_result(err)),
+        }
+    }
+
+    /// Post a balanced transaction (validate → check --strict → atomic write → git commit).
+    #[tool(
+        description = "Post a transaction to the ledger. Provide `date` (YYYY-MM-DD), \
+                      `description`, and `postings` (>=2; at most one may omit `amount` to \
+                      balance). Accounts and commodities must be declared first. Optional \
+                      `idem` (idempotency key — reuse it on a retry to avoid a duplicate). \
+                      One validated write = one git commit.",
+        input_schema = schema_for_type::<TransactionInput>()
+    )]
+    async fn post_transaction(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let input: TransactionInput = match crate::tools::parse_args(raw) {
+            Ok(input) => input,
+            Err(err) => return Ok(err),
+        };
+        let _guard = self.write_lock.lock().await;
+        match write::post_transaction(&self.hledger, input).await {
+            Ok(outcome) => Ok(CallToolResult::success(vec![Content::text(
+                post_outcome_text(&outcome),
+            )])),
+            Err(err) => Ok(write_error_result(err)),
+        }
+    }
+
+    /// Void a transaction by posting a reversing entry (append-only correction).
+    #[tool(
+        description = "Void a transaction by posting a reversing entry that negates it (the \
+                      original is never edited or removed — append-only). Requires the `id` tag \
+                      of the transaction to void.",
+        input_schema = schema_for_type::<VoidTransactionArgs>()
+    )]
+    async fn void_transaction(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: VoidTransactionArgs = match crate::tools::parse_args(raw) {
+            Ok(args) => args,
+            Err(err) => return Ok(err),
+        };
+        let _guard = self.write_lock.lock().await;
+        match write::void_transaction(&self.hledger, &args.id).await {
+            Ok(outcome) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "voided '{}' with reversing entry id:{} (commit {})",
+                args.id,
+                outcome.id,
+                short(&outcome.commit)
+            ))])),
+            Err(err) => Ok(write_error_result(err)),
+        }
+    }
+
+    /// Replace a transaction: void the original and post a replacement (two entries, no edit).
+    #[tool(
+        description = "Replace a transaction: void the original (reversing entry) and post a \
+                      replacement. This is two appended transactions, not an in-place edit. \
+                      Requires `id` (the target's id tag) and `transaction` (the replacement).",
+        input_schema = schema_for_type::<UpdateTransactionArgs>()
+    )]
+    async fn update_transaction(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: UpdateTransactionArgs = match crate::tools::parse_args(raw) {
+            Ok(args) => args,
+            Err(err) => return Ok(err),
+        };
+        let _guard = self.write_lock.lock().await;
+        match write::update_transaction(&self.hledger, &args.id, args.transaction).await {
+            Ok(outcome) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "updated: voided '{}', posted replacement id:{} (commit {})",
+                args.id,
+                outcome.id,
+                short(&outcome.commit)
+            ))])),
+            Err(err) => Ok(write_error_result(err)),
+        }
+    }
+
     /// Echo a message back unchanged — a minimal tool-invocation connectivity check.
     ///
     /// Extracts arguments via [`crate::tools::parse_args`] so a bad call yields a
@@ -214,6 +405,38 @@ impl HledgerMcp {
 /// message; it never includes journal contents.
 fn adapter_error(err: &HledgerError) -> CallToolResult {
     CallToolResult::error(vec![Content::text(format!("hledger error: {err}"))])
+}
+
+/// Short (12-char) commit oid for human-facing messages.
+fn short(oid: &str) -> &str {
+    &oid[..oid.len().min(12)]
+}
+
+/// Human-facing result text for a `post_transaction` outcome (handles the deduped case).
+fn post_outcome_text(outcome: &WriteOutcome) -> String {
+    if outcome.deduped {
+        format!(
+            "already posted (idempotent): transaction id:{} — no new commit (HEAD {})",
+            outcome.id,
+            short(&outcome.commit)
+        )
+    } else {
+        format!(
+            "posted transaction id:{} (commit {})",
+            outcome.id,
+            short(&outcome.commit)
+        )
+    }
+}
+
+/// Map a [`WriteError`] to a tool-level `isError` result. Internal (our-bug) errors are logged
+/// loudly here too; the `Display` text already carries the `input:`/`refused:`/`internal:`
+/// prefix the model can act on.
+fn write_error_result(err: WriteError) -> CallToolResult {
+    if matches!(err, WriteError::Internal(_)) {
+        tracing::error!(%err, "write path returned an internal error");
+    }
+    CallToolResult::error(vec![Content::text(err.to_string())])
 }
 
 /// Render a [`BalanceReport`] as a compact text table: one `account  amount` line per row,
@@ -581,5 +804,97 @@ mod tests {
         assert!(block.contains("unavailable"), "{block}");
         assert!(block.contains("binary: /nonexistent/hledger"), "{block}");
         assert!(block.contains("none configured"), "{block}");
+    }
+
+    #[test]
+    fn short_truncates_oid() {
+        assert_eq!(short("0123456789abcdef0123"), "0123456789ab");
+        assert_eq!(short("abc"), "abc");
+    }
+
+    #[test]
+    fn post_outcome_text_distinguishes_deduped() {
+        let fresh = WriteOutcome {
+            id: "i1".into(),
+            commit: "deadbeefcafe0000".into(),
+            deduped: false,
+        };
+        assert!(post_outcome_text(&fresh).starts_with("posted transaction id:i1"));
+        let dup = WriteOutcome {
+            deduped: true,
+            ..fresh
+        };
+        assert!(post_outcome_text(&dup).contains("already posted (idempotent)"));
+    }
+
+    #[test]
+    fn write_error_result_is_iserror_with_prefix() {
+        let r = write_error_result(WriteError::Input("bad".into()));
+        assert_eq!(r.is_error, Some(true));
+        assert!(
+            r.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("input error: bad")
+        );
+        // Internal variant also flagged isError (and logged loudly).
+        let r2 = write_error_result(WriteError::Internal("boom".into()));
+        assert_eq!(r2.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn write_tools_refuse_without_journal() {
+        // No journal configured → the write path refuses before touching anything.
+        let server = test_server();
+        for result in [
+            server
+                .declare_account(args(serde_json::json!({ "account": "assets:checking" })))
+                .await
+                .expect("dispatch"),
+            server
+                .declare_commodity(args(serde_json::json!({ "commodity": "$" })))
+                .await
+                .expect("dispatch"),
+            server
+                .void_transaction(args(serde_json::json!({ "id": "abc" })))
+                .await
+                .expect("dispatch"),
+            server
+                .post_transaction(args(serde_json::json!({
+                    "date": "2026-01-01",
+                    "description": "x",
+                    "postings": [
+                        { "account": "a:b", "amount": { "quantity": "1.00", "commodity": "$" } },
+                        { "account": "c:d" }
+                    ]
+                })))
+                .await
+                .expect("dispatch"),
+        ] {
+            assert_eq!(result.is_error, Some(true));
+            let text = &result.content[0].as_text().expect("text").text;
+            assert!(text.contains("refused"), "expected refusal: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_transaction_bad_args_is_iserror_before_dispatch() {
+        let server = test_server();
+        // Missing required fields → parse-level input error (not a protocol error).
+        let result = server
+            .post_transaction(args(serde_json::json!({ "description": "x" })))
+            .await
+            .expect("dispatch");
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("invalid arguments"),
+            "{:?}",
+            result.content[0]
+        );
     }
 }

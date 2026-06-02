@@ -157,7 +157,7 @@ run = '''
 set -euo pipefail
 # Default set when no files are given. Word-splitting on the space-separated `usage_files`
 # (or the default) is intentional — each entry becomes a `-f <file>` argument.
-files="${usage_files:-src/hledger/json.rs src/hledger/amount.rs}"
+files="${usage_files:-src/hledger/json.rs src/hledger/amount.rs src/write/format.rs src/write/validate.rs}"
 fargs=()
 for f in $files; do fargs+=( -f "$f" ); done
 cargo mutants --no-shuffle "${fargs[@]}" -- --all-features

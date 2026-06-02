@@ -188,6 +188,45 @@ impl Hledger {
         let out = runner::run(&self.bin, &cli::print_argv(self.journal()?, query)).await?;
         json::parse_print(&out).map_err(HledgerError::from)
     }
+
+    /// `hledger print` against an **explicit** journal path (used on the write candidate, which
+    /// is not the configured live journal).
+    pub async fn print_file(
+        &self,
+        journal: &Path,
+        query: &[String],
+    ) -> Result<Vec<Transaction>, HledgerError> {
+        let out = runner::run(&self.bin, &cli::print_argv(journal, query)).await?;
+        json::parse_print(&out).map_err(HledgerError::from)
+    }
+
+    /// Run `hledger check --strict` on an explicit journal path (the write candidate). `Ok(())`
+    /// = valid; a [`HledgerError::NonZero`] carries hledger's diagnostic in `stderr`.
+    pub async fn check_strict(&self, journal: &Path) -> Result<(), HledgerError> {
+        runner::run(&self.bin, &cli::check_strict_argv(journal)).await?;
+        Ok(())
+    }
+
+    /// The set of **declared** account names in the live journal (`accounts --declared`).
+    pub async fn declared_accounts(&self) -> Result<Vec<String>, HledgerError> {
+        let out = runner::run(&self.bin, &cli::accounts_declared_argv(self.journal()?)).await?;
+        Ok(nonempty_lines(&out))
+    }
+
+    /// The set of **declared** commodity symbols in the live journal (`commodities`).
+    pub async fn declared_commodities(&self) -> Result<Vec<String>, HledgerError> {
+        let out = runner::run(&self.bin, &cli::commodities_argv(self.journal()?)).await?;
+        Ok(nonempty_lines(&out))
+    }
+}
+
+/// Split plain hledger list output into trimmed, non-empty lines.
+fn nonempty_lines(out: &str) -> Vec<String> {
+    out.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
@@ -230,6 +269,15 @@ mod tests {
         let hl = Hledger::new("hledger", None);
         assert_eq!(hl.bin(), Path::new("hledger"));
         assert!(!hl.has_journal());
+    }
+
+    #[test]
+    fn nonempty_lines_trims_and_drops_blanks() {
+        assert_eq!(
+            nonempty_lines("$\n  EUR \n\n\tGBP\n"),
+            vec!["$".to_string(), "EUR".to_string(), "GBP".to_string()]
+        );
+        assert!(nonempty_lines("   \n\n").is_empty());
     }
 
     #[tokio::test]
