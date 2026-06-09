@@ -72,6 +72,19 @@ impl GitRepo {
         Ok(!statuses.is_empty())
     }
 
+    /// Whether **one specific path** (relative to the workdir) differs from `HEAD` — new,
+    /// modified, or staged. Unlike [`is_dirty`](Self::is_dirty) this ignores every other file,
+    /// so an unrelated untracked file (e.g. an abandoned candidate temp) does not register.
+    pub fn is_path_dirty(&self, relpath: &Path) -> Result<bool, GitError> {
+        match self.repo.status_file(relpath) {
+            // `CURRENT` (clean) is the empty status set.
+            Ok(status) => Ok(!status.is_empty()),
+            // The path isn't tracked and isn't in the worktree → nothing to commit.
+            Err(err) if err.code() == ErrorCode::NotFound => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     /// Stage `relpath` (relative to the repo workdir) and commit it onto `HEAD`, returning the
     /// new commit oid. Handles the unborn-HEAD (first commit) case.
     pub fn commit_path(&self, relpath: &Path, message: &str) -> Result<String, GitError> {
@@ -173,5 +186,32 @@ mod tests {
     fn restore_on_unborn_head_is_noop() {
         let (_dir, repo) = temp_repo();
         repo.restore_to_head().expect("no-op on unborn HEAD");
+    }
+
+    #[test]
+    fn is_path_dirty_tracks_one_file_and_ignores_others() {
+        let (dir, repo) = temp_repo();
+        let journal = Path::new("main.journal");
+        std::fs::write(dir.path().join(journal), "; one\n").unwrap();
+        // Untracked, present in worktree → dirty.
+        assert!(repo.is_path_dirty(journal).unwrap(), "new file is dirty");
+        repo.commit_path(journal, "c").unwrap();
+        assert!(!repo.is_path_dirty(journal).unwrap(), "clean after commit");
+
+        // An unrelated untracked file must NOT make the journal look dirty.
+        std::fs::write(
+            dir.path().join(".hledger-mcp-candidate-x.journal"),
+            "junk\n",
+        )
+        .unwrap();
+        assert!(
+            !repo.is_path_dirty(journal).unwrap(),
+            "stray file does not dirty the journal path"
+        );
+        assert!(repo.is_dirty().unwrap(), "but repo-wide status sees it");
+
+        // Editing the journal itself does register.
+        std::fs::write(dir.path().join(journal), "; two\n").unwrap();
+        assert!(repo.is_path_dirty(journal).unwrap(), "edit is dirty");
     }
 }

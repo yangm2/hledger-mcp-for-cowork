@@ -139,7 +139,7 @@ async fn append_and_commit(
 
     // Same-directory temp so the rename is atomic (a cross-device rename fails).
     let dir = repo_dir(journal);
-    let tmp = dir.join(format!(".hledger-mcp-candidate-{}.journal", Uuid::new_v4()));
+    let tmp = dir.join(format!("{CANDIDATE_PREFIX}{}.journal", Uuid::new_v4()));
     std::fs::write(&tmp, &candidate).map_err(WriteError::io("write candidate"))?;
 
     if let Err(err) = hledger.check_strict(&tmp).await {
@@ -173,6 +173,61 @@ fn tag_value(txn: &Transaction, key: &str) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
+/// Backslash-escape regex metacharacters so a literal string matches only itself inside an
+/// hledger query. hledger's `tag:NAME=VALUE` value is an **unanchored regex**, so an unescaped
+/// value would match by substring (`idem=txn-1` also matches `txn-10`) or error on a stray
+/// metachar (`a(b`). Used with `^…$` anchoring by [`find_by_exact_tag`].
+fn regex_escape(s: &str) -> String {
+    const META: &[char] = &[
+        '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '\\',
+    ];
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if META.contains(&c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Find transactions whose tag `name` equals `value` **exactly**. Anchors + escapes the hledger
+/// query (whose tag-value match is an unanchored regex) and then re-checks exact equality in
+/// Rust — belt-and-suspenders against any remaining regex surprise. `name` is always a literal
+/// system tag (`id`/`idem`), so only the value needs escaping.
+async fn find_by_exact_tag(
+    hledger: &Hledger,
+    name: &str,
+    value: &str,
+) -> Result<Vec<Transaction>, HledgerError> {
+    let query = format!("tag:{name}=^{}$", regex_escape(value));
+    let txns = hledger.list_transactions(&[query]).await?;
+    Ok(txns
+        .into_iter()
+        .filter(|t| tag_value(t, name).as_deref() == Some(value))
+        .collect())
+}
+
+/// Read the journal's declared account + commodity sets (require-pre-declare inputs to
+/// [`validate::validate`]). A read failure is internal (the journal exists by this point).
+async fn declared_sets(
+    hledger: &Hledger,
+) -> Result<(HashSet<String>, HashSet<String>), WriteError> {
+    let accounts = hledger
+        .declared_accounts()
+        .await
+        .map_err(|e| WriteError::Internal(format!("read declared accounts: {e}")))?
+        .into_iter()
+        .collect();
+    let commodities = hledger
+        .declared_commodities()
+        .await
+        .map_err(|e| WriteError::Internal(format!("read declared commodities: {e}")))?
+        .into_iter()
+        .collect();
+    Ok((accounts, commodities))
+}
+
 /// `post_transaction`: validate → format (stamping `id:`/`idem:`) → candidate → check → swap →
 /// commit. Idempotent on the `idem` key (dedup runs here, under the caller's write mutex).
 pub async fn post_transaction(
@@ -187,9 +242,8 @@ pub async fn post_transaction(
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    // Idempotency: a prior write with this idem tag means "already done".
-    let existing = hledger
-        .list_transactions(&[format!("tag:idem={idem}")])
+    // Idempotency: a prior write with this *exact* idem tag means "already done".
+    let existing = find_by_exact_tag(hledger, "idem", &idem)
         .await
         .map_err(|e| WriteError::Internal(format!("idempotency query: {e}")))?;
     if let Some(prior) = existing.first() {
@@ -202,19 +256,7 @@ pub async fn post_transaction(
         });
     }
 
-    let accounts: HashSet<String> = hledger
-        .declared_accounts()
-        .await
-        .map_err(|e| WriteError::Internal(format!("read declared accounts: {e}")))?
-        .into_iter()
-        .collect();
-    let commodities: HashSet<String> = hledger
-        .declared_commodities()
-        .await
-        .map_err(|e| WriteError::Internal(format!("read declared commodities: {e}")))?
-        .into_iter()
-        .collect();
-
+    let (accounts, commodities) = declared_sets(hledger).await?;
     let validated =
         validate::validate(&input, &accounts, &commodities).map_err(WriteError::Input)?;
 
@@ -261,8 +303,7 @@ pub async fn void_transaction(
     let journal = gate(hledger).await?;
     ensure_journal_exists(&journal)?;
 
-    let matches = hledger
-        .list_transactions(&[format!("tag:id={target_id}")])
+    let matches = find_by_exact_tag(hledger, "id", target_id)
         .await
         .map_err(|e| WriteError::Internal(format!("lookup by id: {e}")))?;
     let target = matches
@@ -308,11 +349,21 @@ pub async fn void_transaction(
 
 /// `update_transaction`: void the target, then post a replacement — **two** transactions (the
 /// append-only audit trail), not an in-place edit. Returns the new post's outcome.
+///
+/// The replacement is **validated before the void commits**, so a bad replacement (undeclared
+/// account, unbalanced, malformed date) aborts with nothing changed — never leaving the target
+/// voided-with-no-replacement. (A post-format `check` failure would still be an internal bug,
+/// but validation rules out every *correctable* input error up front.)
 pub async fn update_transaction(
     hledger: &Hledger,
     target_id: &str,
     replacement: TransactionInput,
 ) -> Result<WriteOutcome, WriteError> {
+    let journal = gate(hledger).await?;
+    ensure_journal_exists(&journal)?;
+    let (accounts, commodities) = declared_sets(hledger).await?;
+    validate::validate(&replacement, &accounts, &commodities).map_err(WriteError::Input)?;
+
     void_transaction(hledger, target_id).await?;
     post_transaction(hledger, replacement).await
 }
@@ -393,9 +444,29 @@ pub fn git_status_line(journal: &Path) -> String {
     }
 }
 
-/// Startup crash reconciliation: if the working tree journal is uncommitted (a crash between the
-/// atomic swap and the commit), **commit it if `check --strict` passes, else restore to HEAD** —
-/// so `HEAD` is always a `check`-valid journal. Returns the new commit oid if it committed.
+/// Prefix of the same-directory candidate temp files [`append_and_commit`] writes.
+const CANDIDATE_PREFIX: &str = ".hledger-mcp-candidate-";
+
+/// Remove abandoned candidate temp files (left by a crash between writing the candidate and the
+/// atomic rename). Best-effort: failures are ignored. Safe at startup — no writer is running yet.
+fn sweep_candidate_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(CANDIDATE_PREFIX) && name.ends_with(".journal") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Startup crash reconciliation: if the working tree **journal** is uncommitted (a crash between
+/// the atomic swap and the commit), **commit it if `check --strict` passes, else restore to
+/// HEAD** — so `HEAD` is always a `check`-valid journal. Returns the new commit oid if it
+/// committed. Scoped to the journal path so an unrelated untracked file (e.g. a swept-too-late
+/// candidate temp) never triggers a spurious empty reconcile commit.
 pub async fn reconcile(hledger: &Hledger) -> Result<Option<String>, WriteError> {
     let Some(journal) = hledger.journal_path() else {
         return Ok(None);
@@ -403,8 +474,10 @@ pub async fn reconcile(hledger: &Hledger) -> Result<Option<String>, WriteError> 
     if !journal.exists() {
         return Ok(None);
     }
-    let repo = GitRepo::open_or_init(&repo_dir(journal))?;
-    if !repo.is_dirty()? {
+    let dir = repo_dir(journal);
+    sweep_candidate_temps(&dir);
+    let repo = GitRepo::open_or_init(&dir)?;
+    if !repo.is_path_dirty(&journal_relpath(journal)?)? {
         return Ok(None);
     }
     match hledger.check_strict(journal).await {
@@ -512,6 +585,17 @@ mod tests {
         assert_eq!(c, "$");
         // second was -12.34 → +12.34
         assert_eq!(rev[1].1.as_ref().unwrap().0.render(), "12.34");
+    }
+
+    #[test]
+    fn regex_escape_escapes_metacharacters() {
+        assert_eq!(regex_escape("txn-1"), "txn-1"); // hyphen is not a metachar
+        assert_eq!(regex_escape("a.b"), "a\\.b");
+        assert_eq!(regex_escape("a(b)c"), "a\\(b\\)c");
+        assert_eq!(regex_escape("x+y*z?"), "x\\+y\\*z\\?");
+        // A UUID is left intact (no metachars).
+        let uuid = "1b4e28ba-2fa1-11d2-883f-0016d3cca427";
+        assert_eq!(regex_escape(uuid), uuid);
     }
 
     #[test]
@@ -627,5 +711,150 @@ mod tests {
                 .unwrap(),
             "clean after reconcile"
         );
+    }
+
+    #[tokio::test]
+    async fn dedup_distinguishes_regex_substring_idem_keys() {
+        // Regression for the unanchored-regex dedup bug: idem `txn-1` is a regex substring of
+        // `txn-10`. Both posts must be recorded as distinct transactions — the second must NOT
+        // be silently deduped away.
+        let Some(bin) = hledger_bin() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("main.journal");
+        let hl = Hledger::new(bin, Some(journal.clone()));
+        declare_commodity(&hl, "$", 2).await.unwrap();
+        declare_account(&hl, "assets:checking").await.unwrap();
+        declare_account(&hl, "equity:opening").await.unwrap();
+
+        let entry = |idem: &str| TransactionInput {
+            date: "2026-01-01".into(),
+            description: "x".into(),
+            postings: vec![
+                ("assets:checking".to_string(), Some(("10.00", "$"))),
+                ("equity:opening".to_string(), None),
+            ]
+            .into_iter()
+            .map(|(account, amt)| input::PostingInput {
+                account,
+                amount: amt.map(|(q, c)| input::PostingAmount {
+                    quantity: q.to_string(),
+                    commodity: c.to_string(),
+                }),
+            })
+            .collect(),
+            tags: vec![],
+            idem: Some(idem.to_string()),
+        };
+
+        let first = post_transaction(&hl, entry("txn-1")).await.unwrap();
+        assert!(!first.deduped);
+        let second = post_transaction(&hl, entry("txn-10")).await.unwrap();
+        assert!(!second.deduped, "txn-10 must not dedup against txn-1");
+
+        // And an exact retry of txn-1 *does* dedup.
+        let retry = post_transaction(&hl, entry("txn-1")).await.unwrap();
+        assert!(retry.deduped, "exact idem retry deduplicates");
+
+        let all = hl.list_transactions(&[]).await.unwrap();
+        assert_eq!(all.len(), 2, "two distinct posts recorded");
+    }
+
+    #[tokio::test]
+    async fn update_with_invalid_replacement_does_not_void() {
+        // Atomicity regression: a bad replacement must abort *before* the void commits, leaving
+        // the original intact (not voided-with-no-replacement).
+        let Some(bin) = hledger_bin() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("main.journal");
+        let hl = Hledger::new(bin, Some(journal.clone()));
+        declare_commodity(&hl, "$", 2).await.unwrap();
+        declare_account(&hl, "assets:checking").await.unwrap();
+        declare_account(&hl, "equity:opening").await.unwrap();
+
+        let mk = |postings: Vec<(&str, Option<&str>)>| TransactionInput {
+            date: "2026-01-01".into(),
+            description: "x".into(),
+            postings: postings
+                .into_iter()
+                .map(|(account, amt)| input::PostingInput {
+                    account: account.to_string(),
+                    amount: amt.map(|q| input::PostingAmount {
+                        quantity: q.to_string(),
+                        commodity: "$".to_string(),
+                    }),
+                })
+                .collect(),
+            tags: vec![],
+            idem: None,
+        };
+
+        let posted = post_transaction(
+            &hl,
+            mk(vec![
+                ("assets:checking", Some("10.00")),
+                ("equity:opening", None),
+            ]),
+        )
+        .await
+        .unwrap();
+
+        // Replacement references an UNDECLARED account → correctable input error.
+        let bad = mk(vec![
+            ("assets:savings", Some("10.00")),
+            ("equity:opening", None),
+        ]);
+        let err = update_transaction(&hl, &posted.id, bad)
+            .await
+            .expect_err("invalid replacement must fail");
+        assert!(matches!(err, WriteError::Input(_)), "{err:?}");
+
+        // The original is still the only transaction — nothing was voided.
+        let all = hl.list_transactions(&[]).await.unwrap();
+        assert_eq!(all.len(), 1, "no reversal posted on a failed update");
+        assert!(
+            !all[0].tags.iter().any(|(k, _)| k == "reverses"),
+            "original not voided"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_ignores_stray_temp_and_sweeps_it() {
+        // A leftover candidate temp must neither trigger a spurious reconcile commit nor linger.
+        let Some(bin) = hledger_bin() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("main.journal");
+        let hl = Hledger::new(bin, Some(journal.clone()));
+        declare_commodity(&hl, "$", 2).await.unwrap();
+        let head_before = GitRepo::open(dir.path())
+            .unwrap()
+            .unwrap()
+            .head_oid()
+            .unwrap();
+
+        // Drop an abandoned candidate temp (simulating a crash mid-check). The journal itself is
+        // committed and clean.
+        let stray = dir
+            .path()
+            .join(format!("{CANDIDATE_PREFIX}abandoned.journal"));
+        std::fs::write(&stray, "garbage\n").unwrap();
+
+        let committed = reconcile(&hl).await.unwrap();
+        assert_eq!(committed, None, "no reconcile commit for a clean journal");
+        assert_eq!(
+            GitRepo::open(dir.path())
+                .unwrap()
+                .unwrap()
+                .head_oid()
+                .unwrap(),
+            head_before,
+            "HEAD did not advance"
+        );
+        assert!(!stray.exists(), "stray candidate temp was swept");
     }
 }

@@ -14,6 +14,9 @@ mod runner;
 pub mod amount;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use tokio::sync::OnceCell;
 
 pub use amount::{Amount, Quantity};
 pub use runner::HledgerError;
@@ -127,6 +130,9 @@ pub struct Transaction {
 pub struct Hledger {
     bin: PathBuf,
     journal: Option<PathBuf>,
+    /// Process-lifetime cache of the detected version. The binary doesn't change under us, and
+    /// the write path gates on it per call, so we resolve it once via one subprocess and reuse.
+    version: Arc<OnceCell<Version>>,
 }
 
 impl Hledger {
@@ -135,6 +141,7 @@ impl Hledger {
         Self {
             bin: bin.into(),
             journal,
+            version: Arc::new(OnceCell::new()),
         }
     }
 
@@ -169,9 +176,17 @@ impl Hledger {
     }
 
     /// Run `hledger --version` and parse the detected [`Version`]. Needs no journal.
+    ///
+    /// Cached for the process lifetime: the first call spawns the subprocess, later calls (e.g.
+    /// the write path's per-op version gate) reuse it. A failure is not cached — it retries.
     pub async fn version(&self) -> Result<Version, HledgerError> {
-        let out = runner::run(&self.bin, &cli::version_argv()).await?;
-        parse_version(&out)
+        self.version
+            .get_or_try_init(|| async {
+                let out = runner::run(&self.bin, &cli::version_argv()).await?;
+                parse_version(&out)
+            })
+            .await
+            .cloned()
     }
 
     /// `hledger balance [account] -O json` → a [`BalanceReport`].
