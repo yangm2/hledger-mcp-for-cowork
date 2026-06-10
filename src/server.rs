@@ -1,6 +1,6 @@
-//! The M0 walking-skeleton MCP server: a stdio `rmcp` handler advertising two
-//! synthetic, backend-free tools (`status`, `echo`) — enough to prove Claude Cowork
-//! can discover and invoke tools this server registers.
+//! The stdio `rmcp` MCP server: read tools (M1), write tools (M2), and the epoch-CAS
+//! concurrency layer (M3 — per-connection last-seen `HEAD`, record-vs-decide via
+//! [`write::guarded_write`], soft-invariant flags).
 //!
 //! Capabilities declared: **`tools` only** (no `resources`/`prompts` yet — M5). The
 //! `initialize` override emits the handshake wire-log and negotiates the protocol
@@ -18,6 +18,7 @@ use rmcp::model::{
 use rmcp::service::{Peer, RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
+use crate::epoch::{Epoch, ToolClass};
 use crate::hledger::amount::render_amounts;
 use crate::hledger::{BalanceReport, Hledger, HledgerError, PINNED_VERSION, Transaction};
 use crate::write::{self, WriteError, WriteOutcome, input::TransactionInput};
@@ -93,15 +94,29 @@ pub struct UpdateTransactionArgs {
     pub transaction: TransactionInput,
 }
 
+/// Arguments for `close_account` (soft-delete / tombstone).
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct CloseAccountArgs {
+    /// The declared account to close (tombstone), e.g. `liabilities:ap:oldvendor`.
+    pub account: String,
+}
+
 /// The MCP server handler.
 #[derive(Clone)]
 pub struct HledgerMcp {
     started: Instant,
     hledger: Hledger,
-    /// Serializes the write path (single-writer invariant): every write op holds this for the
-    /// whole dedup → validate → format → check → swap → commit sequence, so concurrent writes
-    /// don't interleave and idempotency has no TOCTOU window.
+    /// Serializes the write path **within this process** (single-writer invariant): every write
+    /// op holds this for the whole dedup → validate → format → check → swap → commit sequence,
+    /// so concurrent writes don't interleave and idempotency has no TOCTOU window. The matching
+    /// **cross-process** lock (stdio multi-client = multi-process) is the flock inside
+    /// [`write::guarded_write`].
     write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The epoch CAS directory (M3): the `HEAD` this connection last **read**. Over stdio there
+    /// is exactly one connection per server instance, so a single slot is per-connection by
+    /// construction (the multi-connection directory arrives with HTTP, M6). Read tools bump it
+    /// (sampling HEAD *before* the hledger read); decide calls are checked against it.
+    last_seen: Arc<tokio::sync::Mutex<Option<Epoch>>>,
 }
 
 impl Default for HledgerMcp {
@@ -118,6 +133,25 @@ impl HledgerMcp {
             started: Instant::now(),
             hledger,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            last_seen: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Sample the current epoch (journal repo `HEAD`) — `None` when no journal is configured or
+    /// the repo can't be read. Read tools call this **before** invoking hledger: bumping
+    /// last-seen to a *post*-read HEAD could record an epoch newer than the data actually seen
+    /// (the unsafe direction for the CAS); sampling before is conservative — worst case a
+    /// spurious `STALE` re-read.
+    fn sample_epoch(&self) -> Option<Epoch> {
+        let journal = self.hledger.journal_path()?;
+        write::current_epoch(journal).ok()
+    }
+
+    /// Record a successful read: the connection has now observed `epoch` (the HEAD sampled
+    /// before the read).
+    async fn bump_last_seen(&self, epoch: Option<Epoch>) {
+        if let Some(epoch) = epoch {
+            *self.last_seen.lock().await = Some(epoch);
         }
     }
 
@@ -171,6 +205,19 @@ impl HledgerMcp {
                 "git: (no journal configured)".to_string(),
             ),
         };
+        // The epoch story (M3): current HEAD vs what this connection last read.
+        let epoch = match self.sample_epoch() {
+            Some(head) => {
+                let seen = self.last_seen.lock().await.clone();
+                let connection = match &seen {
+                    Some(seen) if *seen == head => format!("last-seen {} (fresh)", seen.short()),
+                    Some(seen) => format!("last-seen {} (STALE — re-read)", seen.short()),
+                    None => "no read yet this connection".to_string(),
+                };
+                format!("epoch: {} — {connection}", head.short())
+            }
+            None => "epoch: (no journal configured)".to_string(),
+        };
         // Writes need both the pinned hledger and a journal.
         let writes = if detected.is_err() {
             "writes: blocked (hledger unavailable)"
@@ -181,7 +228,7 @@ impl HledgerMcp {
         } else {
             "writes: blocked (no journal configured)"
         };
-        format!("{version}\n{binary}\n{journal}\n{git}\n{writes}")
+        format!("{version}\n{binary}\n{journal}\n{git}\n{epoch}\n{writes}")
     }
 
     /// Pure render of the `status` body (separated from peer/subprocess access so it is
@@ -195,11 +242,14 @@ impl HledgerMcp {
         )
     }
 
-    /// Report an account's balance via `hledger balance <account> -O json`.
+    /// Report an account's balance via `hledger balance <account> -O json`. **Read** — bumps
+    /// this connection's last-seen epoch; soft-invariant flags (overdraft) are surfaced in the
+    /// output, never enforced (C-6).
     #[tool(
         description = "Get the balance of an account from the ledger. Requires a string field \
                       `account` (e.g. `assets:checking`); a parent account sums its \
-                      sub-accounts. Returns each matched account and the total.",
+                      sub-accounts. Returns each matched account and the total, plus any \
+                      soft-invariant flags (e.g. an overdrawn asset account).",
         input_schema = schema_for_type::<AccountBalanceArgs>()
     )]
     async fn get_account_balance(
@@ -210,15 +260,24 @@ impl HledgerMcp {
             Ok(args) => args,
             Err(err) => return Ok(err),
         };
+        let epoch = self.sample_epoch(); // before the read — see `sample_epoch`
         match self.hledger.balance(Some(&args.account)).await {
-            Ok(report) => Ok(CallToolResult::success(vec![Content::text(
-                render_balance(&report),
-            )])),
+            Ok(report) => {
+                self.bump_last_seen(epoch).await;
+                let mut text = render_balance(&report);
+                let flags = crate::flags::overdraft_flags(&report);
+                if !flags.is_empty() {
+                    text.push('\n');
+                    text.push_str(&crate::flags::render_flags(&flags));
+                }
+                Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
             Err(err) => Ok(adapter_error(&err)),
         }
     }
 
     /// List transactions matching an optional hledger query via `hledger print -O json`.
+    /// **Read** — bumps this connection's last-seen epoch.
     #[tool(
         description = "List transactions from the ledger, optionally filtered by an hledger \
                       query (field `query`: an array of terms, one per element, e.g. \
@@ -235,15 +294,30 @@ impl HledgerMcp {
             Err(err) => return Ok(err),
         };
         let terms = args.query.unwrap_or_default();
+        let epoch = self.sample_epoch(); // before the read — see `sample_epoch`
         match self.hledger.list_transactions(&terms).await {
-            Ok(txns) => Ok(CallToolResult::success(vec![Content::text(
-                render_transactions(&txns),
-            )])),
+            Ok(txns) => {
+                self.bump_last_seen(epoch).await;
+                Ok(CallToolResult::success(vec![Content::text(
+                    render_transactions(&txns),
+                )]))
+            }
             Err(err) => Ok(adapter_error(&err)),
         }
     }
 
-    /// Declare an account so transactions may post to it (require-pre-declare).
+    /// Run a write op through [`write::guarded_write`] with this connection's locks and
+    /// last-seen slot — the single dispatch point where a tool's [`ToolClass`] takes effect.
+    async fn guarded<T, F, Fut>(&self, class: ToolClass, op: F) -> Result<T, WriteError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, WriteError>>,
+    {
+        write::guarded_write(&self.hledger, &self.write_lock, &self.last_seen, class, op).await
+    }
+
+    /// Declare an account so transactions may post to it (require-pre-declare). **Record** —
+    /// append-only directive, no epoch check.
     #[tool(
         description = "Declare an account so transactions can post to it. The ledger requires \
                       accounts to be declared before use. Requires a string field `account` \
@@ -258,8 +332,12 @@ impl HledgerMcp {
             Ok(args) => args,
             Err(err) => return Ok(err),
         };
-        let _guard = self.write_lock.lock().await;
-        match write::declare_account(&self.hledger, &args.account).await {
+        let result = self
+            .guarded(ToolClass::Record, || {
+                write::declare_account(&self.hledger, &args.account)
+            })
+            .await;
+        match result {
             Ok(commit) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "declared account '{}' (commit {})",
                 args.account,
@@ -269,7 +347,40 @@ impl HledgerMcp {
         }
     }
 
-    /// Declare a commodity so amounts may use it (require-pre-declare).
+    /// Close (tombstone) an account — **soft-delete**: the account stays declared, history and
+    /// even new postings to it still resolve; nothing is ever hard-deleted. **Record** —
+    /// append-only directive, no epoch check.
+    #[tool(
+        description = "Close (tombstone) an account — a soft delete. The account stays declared \
+                      and its history remains valid; it is marked closed rather than removed. \
+                      Requires a string field `account`.",
+        input_schema = schema_for_type::<CloseAccountArgs>()
+    )]
+    async fn close_account(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: CloseAccountArgs = match crate::tools::parse_args(raw) {
+            Ok(args) => args,
+            Err(err) => return Ok(err),
+        };
+        let result = self
+            .guarded(ToolClass::Record, || {
+                write::tombstone_account(&self.hledger, &args.account)
+            })
+            .await;
+        match result {
+            Ok(commit) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "closed (tombstoned) account '{}' (commit {})",
+                args.account,
+                short(&commit)
+            ))])),
+            Err(err) => Ok(write_error_result(err)),
+        }
+    }
+
+    /// Declare a commodity so amounts may use it (require-pre-declare). **Record** —
+    /// append-only directive, no epoch check.
     #[tool(
         description = "Declare a commodity so amounts can use it. Requires a string field \
                       `commodity` (e.g. `$` or `EUR`); optional `decimal_places` (default 2).",
@@ -284,8 +395,12 @@ impl HledgerMcp {
             Err(err) => return Ok(err),
         };
         let places = args.decimal_places.unwrap_or(2);
-        let _guard = self.write_lock.lock().await;
-        match write::declare_commodity(&self.hledger, &args.commodity, places).await {
+        let result = self
+            .guarded(ToolClass::Record, || {
+                write::declare_commodity(&self.hledger, &args.commodity, places)
+            })
+            .await;
+        match result {
             Ok(commit) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "declared commodity '{}' ({} dp, commit {})",
                 args.commodity,
@@ -297,6 +412,8 @@ impl HledgerMcp {
     }
 
     /// Post a balanced transaction (validate → check --strict → atomic write → git commit).
+    /// **Record** — append-only with a transaction-local balance invariant and an idempotency
+    /// key, safe at any epoch; never epoch-checked (C-2/C-6).
     #[tool(
         description = "Post a transaction to the ledger. Provide `date` (YYYY-MM-DD), \
                       `description`, and `postings` (>=2; at most one may omit `amount` to \
@@ -313,8 +430,12 @@ impl HledgerMcp {
             Ok(input) => input,
             Err(err) => return Ok(err),
         };
-        let _guard = self.write_lock.lock().await;
-        match write::post_transaction(&self.hledger, input).await {
+        let result = self
+            .guarded(ToolClass::Record, || {
+                write::post_transaction(&self.hledger, input)
+            })
+            .await;
+        match result {
             Ok(outcome) => Ok(CallToolResult::success(vec![Content::text(
                 post_outcome_text(&outcome),
             )])),
@@ -322,7 +443,8 @@ impl HledgerMcp {
         }
     }
 
-    /// Void a transaction by posting a reversing entry (append-only correction).
+    /// Void a transaction by posting a reversing entry (append-only correction). **Record** —
+    /// corrections are reversal posts, not decisions; never epoch-checked.
     #[tool(
         description = "Void a transaction by posting a reversing entry that negates it (the \
                       original is never edited or removed — append-only). Requires the `id` tag \
@@ -337,8 +459,12 @@ impl HledgerMcp {
             Ok(args) => args,
             Err(err) => return Ok(err),
         };
-        let _guard = self.write_lock.lock().await;
-        match write::void_transaction(&self.hledger, &args.id).await {
+        let result = self
+            .guarded(ToolClass::Record, || {
+                write::void_transaction(&self.hledger, &args.id)
+            })
+            .await;
+        match result {
             Ok(outcome) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "voided '{}' with reversing entry id:{} (commit {})",
                 args.id,
@@ -350,6 +476,9 @@ impl HledgerMcp {
     }
 
     /// Replace a transaction: void the original and post a replacement (two entries, no edit).
+    /// **Record** — a correction (void + re-post), not a decision; never epoch-checked. (The
+    /// first *decide*-classified tool arrives with the M4/M5 domain surface, e.g.
+    /// `eco_approve`; the CAS mechanism it will use is [`Self::guarded`].)
     #[tool(
         description = "Replace a transaction: void the original (reversing entry) and post a \
                       replacement. This is two appended transactions, not an in-place edit. \
@@ -364,8 +493,12 @@ impl HledgerMcp {
             Ok(args) => args,
             Err(err) => return Ok(err),
         };
-        let _guard = self.write_lock.lock().await;
-        match write::update_transaction(&self.hledger, &args.id, args.transaction).await {
+        let result = self
+            .guarded(ToolClass::Record, || {
+                write::update_transaction(&self.hledger, &args.id, args.transaction)
+            })
+            .await;
+        match result {
             Ok(outcome) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "updated: voided '{}', posted replacement id:{} (commit {})",
                 args.id,

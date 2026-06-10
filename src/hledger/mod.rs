@@ -233,6 +233,14 @@ impl Hledger {
         let out = runner::run(&self.bin, &cli::commodities_argv(self.journal()?)).await?;
         Ok(nonempty_lines(&out))
     }
+
+    /// The **tombstoned** (soft-deleted) subset of the declared accounts: those whose account
+    /// directive carries a `tombstoned:` tag (M3 soft-delete — accounts are never hard-deleted,
+    /// and postings to tombstoned accounts still resolve; C-4).
+    pub async fn tombstoned_accounts(&self) -> Result<Vec<String>, HledgerError> {
+        let out = runner::run(&self.bin, &cli::accounts_tombstoned_argv(self.journal()?)).await?;
+        Ok(nonempty_lines(&out))
+    }
 }
 
 /// Split plain hledger list output into trimmed, non-empty lines.

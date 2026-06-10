@@ -33,6 +33,20 @@ pub fn accounts_declared_argv(journal: &Path) -> Vec<String> {
     ]
 }
 
+/// `hledger accounts --declared tag:^tombstoned$ -f <journal>` — the **tombstoned** subset of
+/// the declared accounts (M3 soft-delete). The tag query is anchored: hledger's `tag:` name
+/// match is an unanchored regex (verified on 1.52 — `tag:tomb` also matches), so `^…$` pins it
+/// to the exact tag name. Empty value (`; tombstoned:`) matches — presence is the flag.
+pub fn accounts_tombstoned_argv(journal: &Path) -> Vec<String> {
+    vec![
+        "accounts".to_string(),
+        "--declared".to_string(),
+        "tag:^tombstoned$".to_string(),
+        "-f".to_string(),
+        journal.display().to_string(),
+    ]
+}
+
 /// `hledger commodities -f <journal>` — the declared commodity set (plain text, one per line;
 /// no `-O json` in 1.52).
 pub fn commodities_argv(journal: &Path) -> Vec<String> {
@@ -153,6 +167,21 @@ mod tests {
         assert_eq!(
             commodities_argv(&journal()),
             vec!["commodities", "-f", "/x/main.journal"]
+        );
+    }
+
+    #[test]
+    fn tombstoned_query_is_anchored() {
+        // The anchor is load-bearing: hledger tag-name matching is an unanchored regex.
+        assert_eq!(
+            accounts_tombstoned_argv(&journal()),
+            vec![
+                "accounts",
+                "--declared",
+                "tag:^tombstoned$",
+                "-f",
+                "/x/main.journal"
+            ]
         );
     }
 }

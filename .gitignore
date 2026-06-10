@@ -17,3 +17,7 @@
 # cargo-mutants working output (`mise run mutants` / `mutants-diff`): per-mutant diffs,
 # logs, outcomes.json — regenerable, plus the `.old` copy from the previous run.
 /mutants.out*/
+
+# cross-process write lockfile (M3): created beside any journal a server/e2e touches;
+# kernel lock state, never tracked (the fixtures journal picks one up from the stdio e2e)
+.hledger-mcp.lock

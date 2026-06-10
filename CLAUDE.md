@@ -5,11 +5,11 @@ plain-text ledger to Claude, designed to run inside a **Claude Cowork** project.
 **Rust** rewrite of the GnuCash-backed predecessor; hledger replaces GnuCash because
 append-only / immutable / diffable / git-backed is hledger's native idiom.
 
-> **Current phase: foundations in place, server not yet built.** The dev environment
-> (nix + mise + quality gate) is set up — see *Dev environment & workflow*. The architecture
-> below (concurrency, epoch CAS, domain tools, TLA+) is the design north star captured in
-> `docs/development/`, **not yet implemented**. Don't let unbuilt architecture gate work —
-> build foundations so it slots in cleanly.
+> **Current phase: foundations complete (M0–M3).** The server runs: read tools (M1), the
+> fail-closed write path with git-commit epochs (M2), and the concurrency layer (M3 — epoch
+> CAS, record/decide partition, cross-process flock, tombstones, soft-invariant flags, the
+> TLA+ model). Next up: **M4 domain tools** (chart of accounts, invoice/pay/vendor surface) —
+> see `docs/development/milestones/`.
 
 > ⚠️ **This is a PUBLIC repository — never leak PII.** No real names, emails, account
 > numbers, addresses, vendor identities, balances, or other personal/financial data in
@@ -172,8 +172,9 @@ This is a money-adjacent ledger; craftsmanship is the point.
 - `cargo fmt --check` — formatted, no drift.
 - `cargo clippy --all-targets --all-features -- -D warnings` — **zero** warnings.
 - `cargo nextest run` (or `cargo test`) — all tests green.
-- **Coverage ≥ 85% lines** via `cargo llvm-cov` (`mise run cov`). Informational until real
-  code exists (today coverage is ~0%: only a stub `main`, e2e exercises hledger via subprocess).
+- **Coverage ≥ 85% lines** via `cargo llvm-cov` (`mise run cov`) — a hard gate (CI enforces
+  it). `main.rs` legitimately reads ~0% (exercised only as a spawned subprocess, which
+  llvm-cov can't see); the total clears the bar regardless.
 - **Property tests** (`proptest`) on anything parsing/formatting — especially the hledger
   text formatter and the `-O json` parser (round-trip + golden-file contract tests).
 - **`#![forbid(unsafe_code)]`** at the crate root unless a documented, reviewed exception.
@@ -200,21 +201,36 @@ touches one place. This seam is covered by golden-file tests against recorded re
 - Keep balance assertions **out of routine postings** — reserve them for explicit
   reconciliation tools where a failure is meaningful signal.
 
-## Concurrency model (planned — see docs, not yet built)
+## Concurrency model (implemented in M3)
 
-Single serializing writer — two layers, since stdio multi-client = multi-*process* (in-process
-async mutex + cross-process `flock` beside the journal); **the git commit IS the epoch** (one
-validated write = one commit). Idempotency via a write-once `; idem:<uuid>` tag. Consequential
-"decide" calls are epoch-checked (reject `STALE` if a client's last-seen HEAD ≠ current HEAD →
-re-read → retry, checked *inside* the write locks); append-only "record" calls are not. To be
-formally checked with a TLA+ model via the Rust `tla-checker` (`mise tla`; spec kept
-TLC-compatible).
+Single serializing writer — two layers, since stdio multi-client = multi-*process*: the
+in-process async mutex + a cross-process advisory file lock (`.hledger-mcp.lock` beside the
+journal), both held across the whole dedup → validate → format → check → swap → commit
+sequence. Every write tool dispatches through **`write::guarded_write`** with a declared
+`ToolClass`; **the git commit IS the epoch** (one validated write = one commit). Idempotency
+via a write-once `; idem:<uuid>` tag. Consequential **decide** calls are epoch-checked *inside
+the locks* (reject `STALE` if the connection's last-seen HEAD ≠ current HEAD → re-read →
+retry); append-only **record** calls never are — today the whole surface is record; the first
+decide tool arrives with M4/M5 (`eco_approve`). Reads bump the connection's last-seen,
+sampling HEAD **before** the hledger read (conservative: a mid-read write leaves you stale,
+never falsely fresh). Accounts soft-delete by appending a tombstone-tagged directive
+(`account <name>  ; tombstoned:`); postings to tombstoned accounts still resolve (C-4). Soft
+invariants (overdraft) surface as report **flags**, never write rejections (C-6). Formally
+checked: `proofs/tla/Ledger.tla` via the Rust `tla-checker` — `mise run tla` runs the model
+check **plus spec-mutation sanity checks** (broken-spec variants must be caught); the spec is
+TLC-compatible (`tla2tools.jar` is a drop-in fallback). The C-1…C-6 suite lives in
+`tests/concurrency.rs`; the two-process flock contention e2e in `tests/mcp_stdio.rs`.
 
 ## Repository map
 
-- `src/` — the Rust crate (currently a stub `main.rs`).
-- `tests/smoke.rs` — real-hledger e2e (write → `check --strict` → read → `git commit`); skips
-  gracefully when hledger is absent.
+- `src/` — the Rust crate: `hledger/` (the adapter seam), `write/` (the fail-closed pipeline +
+  `guarded_write`), `epoch.rs` (the pure CAS), `flags.rs` (soft invariants), `git.rs`,
+  `server.rs` (MCP tools), `protocol.rs`, `logging.rs`.
+- `tests/smoke.rs` — real-hledger e2e (write → `check --strict` → read → `git commit`);
+  `tests/concurrency.rs` — the C-1…C-6 suite; `tests/mcp_stdio.rs` — wire-level e2e incl. the
+  two-process contention test. All skip gracefully when hledger is absent.
+- `proofs/tla/` — `Ledger.tla` + `Ledger.cfg` (the M3 model) + `mutate.py` (spec-mutation
+  checks); run with `mise run tla`.
 - Dev env: `flake.nix`/`flake.lock`, `rust-toolchain.toml`, `mise.toml`, `.env.local`
   (gitignored), `.claude/hooks/rust-quality-gate.sh` (Stop-hook gate).
 - `docs/development/` — the design corpus. Start here for depth:

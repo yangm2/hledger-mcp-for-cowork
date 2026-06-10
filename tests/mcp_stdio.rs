@@ -121,6 +121,7 @@ fn full_lifecycle_lists_tools_and_echoes() {
     assert_eq!(
         names,
         vec![
+            "close_account".to_string(),
             "declare_account".to_string(),
             "declare_commodity".to_string(),
             "echo".to_string(),
@@ -258,6 +259,123 @@ fn read_tools_work_end_to_end_against_fixture_journal() {
     assert!(
         txns_text.contains("2026-01-15 Acme") && txns_text.contains("expenses:supplies"),
         "transactions output: {txns_text}"
+    );
+}
+
+/// **M3 cross-process contention (flock):** two *separate server processes* on the same
+/// journal — the real stdio multi-client shape (Desktop / Cowork / Claude Code each spawn
+/// their own server) — write concurrently. The advisory file lock beside the journal must
+/// serialize them: every write lands, every commit is distinct (one write = one epoch), and
+/// the final journal is `check --strict`-valid. Requests are pipelined to both processes
+/// *before* any response is read, so the writes genuinely contend.
+#[test]
+fn concurrent_writers_from_two_processes_serialize() {
+    if !hledger_available() {
+        eprintln!("SKIP contention e2e: hledger not found (run inside `nix develop`)");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let journal = dir.path().join("main.journal");
+    let journal_arg = journal.display().to_string();
+
+    let mut a = Server::spawn_args(&["--journal", &journal_arg]);
+    let mut b = Server::spawn_args(&["--journal", &journal_arg]);
+    initialize(&mut a, "2025-11-25");
+    initialize(&mut b, "2025-11-25");
+
+    // Bootstrap declarations through server A (serial, awaited calls).
+    let mut id = 100;
+    let mut call_ok = |server: &mut Server, name: &str, args: Value| -> String {
+        id += 1;
+        server.send(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": name, "arguments": args }
+        }));
+        let resp = server.recv();
+        assert_eq!(
+            resp["result"]["isError"],
+            json!(false),
+            "{name} failed: {resp}"
+        );
+        resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .to_owned()
+    };
+    call_ok(&mut a, "declare_commodity", json!({ "commodity": "$" }));
+    call_ok(
+        &mut a,
+        "declare_account",
+        json!({ "account": "expenses:misc" }),
+    );
+    call_ok(
+        &mut a,
+        "declare_account",
+        json!({ "account": "equity:opening" }),
+    );
+
+    // Contention: pipeline N posts into BOTH processes before reading any response.
+    const N: usize = 4;
+    let post = |tag: &str, i: usize, req_id: usize| {
+        json!({
+            "jsonrpc": "2.0", "id": req_id, "method": "tools/call",
+            "params": { "name": "post_transaction", "arguments": {
+                "date": "2026-01-01",
+                "description": format!("contend-{tag}-{i}"),
+                "postings": [
+                    { "account": "expenses:misc",
+                      "amount": { "quantity": "1.00", "commodity": "$" } },
+                    { "account": "equity:opening" }
+                ]
+            }}
+        })
+    };
+    for i in 0..N {
+        a.send(&post("a", i, 200 + i));
+        b.send(&post("b", i, 300 + i));
+    }
+
+    // Collect all 2N responses; every one must have succeeded with its own commit.
+    let mut commits = std::collections::HashSet::new();
+    for server in [&mut a, &mut b] {
+        for _ in 0..N {
+            let resp = server.recv();
+            assert_eq!(
+                resp["result"]["isError"],
+                json!(false),
+                "contended post failed: {resp}"
+            );
+            let text = resp["result"]["content"][0]["text"].as_str().expect("text");
+            let commit = text
+                .rsplit("(commit ")
+                .next()
+                .and_then(|s| s.strip_suffix(')'))
+                .expect("commit oid in response")
+                .to_owned();
+            assert!(commits.insert(commit), "duplicate epoch across processes");
+        }
+    }
+    assert_eq!(commits.len(), 2 * N, "one fresh epoch per write");
+
+    // Every write landed (no lost update), and the final journal is check-valid.
+    let listed = call_ok(&mut a, "list_transactions", json!({}));
+    for tag in ["a", "b"] {
+        for i in 0..N {
+            assert!(
+                listed.contains(&format!("contend-{tag}-{i}")),
+                "missing contend-{tag}-{i} in:\n{listed}"
+            );
+        }
+    }
+    let hledger = std::env::var("HLEDGER_EXECUTABLE_PATH").unwrap_or("hledger".into());
+    let check = Command::new(hledger)
+        .args(["check", "--strict", "-f", &journal_arg])
+        .output()
+        .expect("run hledger check");
+    assert!(
+        check.status.success(),
+        "final journal must be check --strict valid: {}",
+        String::from_utf8_lossy(&check.stderr)
     );
 }
 

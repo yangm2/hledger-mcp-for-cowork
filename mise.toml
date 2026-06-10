@@ -17,6 +17,10 @@ min_version = "2024.1.0"
 # strength), complementing llvm-cov's line execution. Periodic / on-demand, not in
 # the Stop-hook gate (too slow). See `mutants` + `mutants-diff` tasks.
 "cargo:cargo-mutants" = "27.0.0"
+# NOTE: tla-checker (the M3 model checker) is deliberately NOT a [tools] entry: mise's own
+# HTTP client cannot reach crates.io under the Claude Code sandbox (TLS OSStatus -26276),
+# and a single failing [tools] entry hard-fails every sandboxed `mise exec`. The `tla` task
+# self-provisions it via `cargo install` (cargo's fetch works sandboxed) into target/.
 
 [env]
 # Per-clone env file holding the absolute path to the pinned hledger binary.
@@ -173,7 +177,7 @@ run = '''
 set -euo pipefail
 # Default set when no files are given. Word-splitting on the space-separated `usage_files`
 # (or the default) is intentional — each entry becomes a `-f <file>` argument.
-files="${usage_files:-src/hledger/json.rs src/hledger/amount.rs src/write/format.rs src/write/validate.rs}"
+files="${usage_files:-src/hledger/json.rs src/hledger/amount.rs src/write/format.rs src/write/validate.rs src/epoch.rs src/flags.rs}"
 fargs=()
 for f in $files; do fargs+=( -f "$f" ); done
 cargo mutants --no-shuffle "${fargs[@]}" -- --all-features
@@ -201,6 +205,34 @@ diff="$(mktemp)"
 trap 'rm -f "$diff"' EXIT
 git diff --merge-base "$base" > "$diff"
 cargo mutants --in-diff "$diff" -- --all-features
+'''
+
+[tasks.tla]
+description = "Model-check the M3 concurrency spec (proofs/tla/Ledger.tla) with tla-checker: all safety invariants over all interleavings within the Ledger.cfg bounds, then the spec-mutation sanity checks (each deliberately broken spec variant must be caught — proves the gate is load-bearing and validates the checker). Self-provisions tla-checker via cargo on first run. The spec is TLC-compatible; tla2tools.jar is a drop-in fallback (and the only way to check the Progress liveness property — see Ledger_live.cfg)."
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+# Resolve the checker: $TLA_BIN > `tla` on PATH > self-provision via cargo into target/
+# (a [tools] entry would hard-fail sandboxed `mise exec`; cargo's fetch works sandboxed).
+tla_version="0.6.3"
+tla="${TLA_BIN:-}"
+if [ -z "$tla" ]; then
+  if command -v tla >/dev/null 2>&1; then
+    tla="tla"
+  else
+    root="target/tla-tools"
+    if [ ! -x "$root/bin/tla" ]; then
+      echo "tla: installing tla-checker $tla_version via cargo (one-time)"
+      cargo install tla-checker --version "$tla_version" --locked --root "$root"
+    fi
+    tla="$root/bin/tla"
+  fi
+fi
+echo "== model-checking proofs/tla/Ledger.tla =="
+"$tla" proofs/tla/Ledger.tla --config proofs/tla/Ledger.cfg
+echo
+echo "== spec-mutation sanity checks =="
+TLA_BIN="$tla" python3 proofs/tla/mutate.py
 '''
 
 [tasks.check]

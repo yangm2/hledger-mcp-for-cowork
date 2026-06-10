@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod epoch;
+pub mod flags;
 pub mod git;
 pub mod hledger;
 pub mod logging;

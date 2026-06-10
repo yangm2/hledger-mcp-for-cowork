@@ -230,12 +230,58 @@ Plus:
 
 ## Exit-criteria review
 
-> Fill in when closing M3. The distinctive check here is the **model-check gate**: confirm
-> `mise run tla` actually exhausts the bounded state space and that every invariant (esp.
-> `NoLostDecision` and the `Crash` HEAD-validity) holds — a spec that passes because it's
-> under-constrained is worse than none, which is what the **spec-mutation checks** exist to
-> rule out: confirm each broken-spec variant was reported as a violation (this also validates
-> `tla-checker` itself; if any doubt remains, cross-check once against `tla2tools.jar` — the
-> spec is TLC-compatible by construction). Confirm C-1…C-6 map 1:1 to passing tests and the
-> two-process flock contention test ran as *separate processes*, not tasks. Record the
-> verdict; TLAPS, if not attempted, is noted as an accepted stretch deferral (not a gap).
+> The standing instruction was: confirm `mise run tla` actually exhausts the bounded state
+> space and every invariant holds — a spec that passes because it's under-constrained is
+> worse than none, which the **spec-mutation checks** exist to rule out; confirm C-1…C-6 map
+> 1:1 to passing tests and the contention test ran as *separate processes*.
+
+**Reviewed 2026-06-10 — verdict: done (one documented liveness-tooling deferral).**
+
+Gate (via `mise`, hledger 1.52 from `.env.local`):
+
+- `mise run check` — **green**: fmt, clippy `-D warnings`, **129 tests** (was 107 entering M3).
+- `mise run cov` — **90.3% lines ≥ 85%**; `epoch.rs` and `flags.rs` both **100%**.
+- `mise run tla` — **green**: tla-checker exhausts **28,352 reachable states / 94,749
+  transitions** (bounds: 2 connections × 2 accounts × 3 keys, epoch ≤ 4); all 7 invariants
+  hold (`EpochMonotonic`, `NoLostDecision`, `FullyInformedDecisions`, `IdempotentPosts`,
+  `AppendOnly`, `RefIntegrity`, `HeadAlwaysValid`). All **5 spec mutations** are caught
+  (drop the decide guard / drop key dedup / allow txn removal / commit an invalid reconcile /
+  unconditional last-seen bump) — the gate is load-bearing and the young checker demonstrably
+  sees violations. Gated in CI (`tla` job).
+
+Checklist notes:
+
+- [x] C-1…C-6 map 1:1 to named tests in `tests/concurrency.rs` (plus the partition half of
+      C-1, the read-ordering test, and the masking regression below). All run against real
+      hledger through the production `guarded_write` path.
+- [x] The contention test (`tests/mcp_stdio.rs::concurrent_writers_from_two_processes_serialize`)
+      spawns **two real server processes** on one journal and pipelines writes into both
+      before reading responses: 8/8 writes land, 8 distinct epochs, final journal
+      `check --strict`-valid.
+- [x] **The pre-sign-off code review caught a real design bug** (the M2 standing rule paying
+      off): the first implementation bumped `last_seen` to the new HEAD after *every*
+      successful write — but a record write teaches the writer nothing about commits that
+      interleaved since its last read, so the bump let a later decide pass the CAS
+      uninformed. Fixed to a **conditional bump** (only when `last_seen == HEAD-before-op`);
+      the spec gained the `behind`/`informed` ground truth and the **`FullyInformedDecisions`**
+      invariant, whose `bump` mutation reproduces exactly this bug and fails — the model now
+      *proves* the fix. Pinned by
+      `tests/concurrency.rs::record_write_does_not_mask_interleaved_commits`.
+- [x] Tombstone contract recorded empirically before coding (1.52: a later duplicate
+      `account` directive's tag registers; `tag:` queries are unanchored → the adapter query
+      is `tag:^tombstoned$`; `accounts` has no `-O json` — line output).
+- [x] Lockfile lesson re-applied: the write lockfile made repo-wide `is_dirty()` report the
+      ledger dirty forever — `git_status_line` switched to the journal-scoped
+      `is_path_dirty` (the M2 granularity lesson, second occurrence).
+
+**Deferrals (accepted, none block M4):**
+
+- **`Progress` liveness is not machine-checked by the gate.** tla-checker 0.6.3 cannot verify
+  quantified weak fairness (it reports a fairness-violating trace as a property violation).
+  The property + `LiveSpec` + `Ledger_live.cfg` are in the spec, TLC-compatible — checkable
+  with `tla2tools.jar` on demand; operationally C-5 is pinned by
+  `c5_stale_connection_always_progresses_after_reread`. Revisit on a tla-checker upgrade.
+- **TLAPS** not attempted (accepted stretch deferral, per plan).
+- The flock has **no acquisition timeout** — a hung writer process blocks others until it
+  dies (the lock dies with the fd). Contention is rare by design; revisit if M6's daemon
+  deployment changes the exposure.

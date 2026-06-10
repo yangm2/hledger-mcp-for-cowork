@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
+use crate::epoch::{Epoch, Stale, ToolClass};
 use crate::git::{GitError, GitRepo};
 use crate::hledger::{Hledger, HledgerError, Transaction};
 
@@ -53,6 +54,10 @@ pub enum WriteError {
     /// not fixable by rephrasing the call.
     #[error("refused: {0}")]
     Refused(String),
+    /// A **decide** call built on a stale read (epoch CAS, M3). Always recoverable: re-read,
+    /// then retry — nothing is held, so progress is guaranteed (C-5).
+    #[error("{0}")]
+    StaleEpoch(Stale),
     /// Our bug / unexpected failure (post-format `check` rejection, git/IO). Logged loudly.
     #[error("internal error: {0}")]
     Internal(String),
@@ -103,6 +108,91 @@ async fn gate(hledger: &Hledger) -> Result<PathBuf, WriteError> {
         )));
     }
     Ok(journal)
+}
+
+/// Name of the cross-process write lockfile, beside the journal. Lock state lives in the kernel
+/// (advisory `flock`), not the file contents — the file itself is just an anchor and is never
+/// removed (deleting a lockfile is racy).
+const LOCK_FILE: &str = ".hledger-mcp.lock";
+
+/// Acquire the **cross-process** write lock for the journal's directory (advisory exclusive
+/// file lock via std's `File::lock`, blocking until free). stdio multi-client =
+/// multi-*process* — Desktop, Cowork, and Claude Code each spawn their own server on the same
+/// journal — so the in-process mutex alone cannot serialize writers. Released when the returned
+/// handle drops (file close releases the lock).
+///
+/// The blocking acquisition runs on the blocking pool so a contended lock never stalls the
+/// async runtime.
+async fn acquire_write_flock(dir: &Path) -> Result<std::fs::File, WriteError> {
+    let path = dir.join(LOCK_FILE);
+    tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        let file = std::fs::File::create(&path)?;
+        // std file locking (stable since 1.89): advisory, exclusive, released on drop/close.
+        file.lock()?;
+        Ok(file)
+    })
+    .await
+    .map_err(|e| WriteError::Internal(format!("flock task: {e}")))?
+    .map_err(|e| WriteError::Internal(format!("acquire write lock: {e}")))
+}
+
+/// The current epoch: `HEAD` of the journal's repo (`Epoch(None)` when the repo or its first
+/// commit doesn't exist yet). Sampled fresh on every call — the epoch changes with every write,
+/// so it must never be cached process-wide (unlike the hledger *version*, which is
+/// process-constant).
+pub fn current_epoch(journal: &Path) -> Result<Epoch, WriteError> {
+    match GitRepo::open(&repo_dir(journal))? {
+        Some(repo) => Ok(Epoch::new(repo.head_oid()?)),
+        None => Ok(Epoch::new(None)),
+    }
+}
+
+/// The single write entry point (M3): every mutating tool call goes through here, declaring its
+/// [`ToolClass`]. Runs `op` with **both** write locks held — the in-process mutex (tasks within
+/// this server) and the cross-process flock (other server processes on the same journal) — and
+/// applies the epoch CAS for [`ToolClass::Decide`] calls **inside** those locks, so there is no
+/// check-to-commit gap (a TOCTOU would break `NoLostDecision`; see `proofs/tla/Ledger.tla`).
+///
+/// On success the connection's `last_seen` is bumped to the new `HEAD` **only when the write
+/// landed on top of what the connection had already seen** (`last_seen == HEAD` before the
+/// op). A writer learns nothing about *other* connections' commits from its own append
+/// succeeding — an unconditional bump would mask any write that interleaved since this
+/// connection's last read, letting a later decide pass the CAS on a belief that never saw it.
+/// (`FullyInformedDecisions` in `proofs/tla/Ledger.tla` is the formal version; the `bump`
+/// spec-mutation demonstrates the unconditional variant is unsound.)
+pub async fn guarded_write<T, F, Fut>(
+    hledger: &Hledger,
+    write_lock: &tokio::sync::Mutex<()>,
+    last_seen: &tokio::sync::Mutex<Option<Epoch>>,
+    class: ToolClass,
+    op: F,
+) -> Result<T, WriteError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, WriteError>>,
+{
+    let journal = gate(hledger).await?;
+    ensure_journal_exists(&journal)?;
+    let dir = repo_dir(&journal);
+
+    let _guard = write_lock.lock().await;
+    let _flock = acquire_write_flock(&dir).await?;
+
+    let head_before = current_epoch(&journal)?;
+    if class == ToolClass::Decide {
+        let seen = last_seen.lock().await.clone();
+        crate::epoch::check(class, seen.as_ref(), &head_before).map_err(WriteError::StaleEpoch)?;
+    }
+
+    let out = op().await?;
+
+    // Conditional bump, still inside the locks: only a write on top of an up-to-date view
+    // keeps the view up to date. (For a decide the guard above guarantees this branch.)
+    let mut seen = last_seen.lock().await;
+    if *seen == Some(head_before) {
+        *seen = Some(current_epoch(&journal)?);
+    }
+    Ok(out)
 }
 
 /// Create the journal (and its directory) if missing, so reads/declared-set queries work and the
@@ -424,14 +514,60 @@ pub async fn declare_commodity(
     append_and_commit(hledger, &journal, &directive, "declare commodity").await
 }
 
+/// `tombstone_account`: **soft-delete** an account by appending a duplicate `account` directive
+/// carrying a `tombstoned:` tag (verified on 1.52: a later duplicate directive's tag registers,
+/// and `accounts --declared tag:^tombstoned$` filters on it). The account stays declared, so
+/// existing references and even new postings still resolve (C-4) — nothing is ever hard-deleted.
+/// Idempotent: re-tombstoning an already-tombstoned account is a no-op returning current `HEAD`.
+pub async fn tombstone_account(hledger: &Hledger, name: &str) -> Result<String, WriteError> {
+    let journal = gate(hledger).await?;
+    ensure_journal_exists(&journal)?;
+    let name = name.trim();
+    let declared: HashSet<String> = hledger
+        .declared_accounts()
+        .await
+        .map_err(|e| WriteError::Internal(format!("read declared accounts: {e}")))?
+        .into_iter()
+        .collect();
+    if !declared.contains(name) {
+        return Err(WriteError::Input(format!(
+            "cannot tombstone undeclared account '{name}'"
+        )));
+    }
+    let tombstoned = hledger
+        .tombstoned_accounts()
+        .await
+        .map_err(|e| WriteError::Internal(format!("read tombstoned accounts: {e}")))?;
+    if tombstoned.iter().any(|a| a == name) {
+        // Already tombstoned — idempotent no-op at the current epoch.
+        return Ok(current_epoch(&journal)?
+            .oid()
+            .unwrap_or_default()
+            .to_string());
+    }
+    append_and_commit(
+        hledger,
+        &journal,
+        &format!("account {name}  ; tombstoned:\n"),
+        &format!("tombstone account {name}"),
+    )
+    .await
+}
+
 /// A one-line git/write-readiness summary for `status` (read-only — never inits a repo).
+/// Dirty means **the journal itself** is uncommitted — the narrowest check that matches the
+/// invariant (the M2 lesson): unrelated untracked files (the write lockfile, editor litter)
+/// must not report the ledger as dirty.
 pub fn git_status_line(journal: &Path) -> String {
     if !journal.exists() {
         return "git: (no journal yet — first write bootstraps it)".to_string();
     }
     match GitRepo::open(&repo_dir(journal)) {
         Ok(Some(repo)) => {
-            let dirty = repo.is_dirty().unwrap_or(false);
+            let dirty = journal_relpath(journal)
+                .ok()
+                .and_then(|rel| repo.is_path_dirty(&rel).ok())
+                .unwrap_or(false);
             let state = if dirty { "dirty" } else { "clean" };
             match repo.head_oid() {
                 Ok(Some(oid)) => format!("git: {} ({state})", &oid[..oid.len().min(12)]),
@@ -475,6 +611,9 @@ pub async fn reconcile(hledger: &Hledger) -> Result<Option<String>, WriteError> 
         return Ok(None);
     }
     let dir = repo_dir(journal);
+    // Cross-process lock: another server process may be mid-write while this one starts up; a
+    // reconcile racing that write would see (and sweep/commit) its in-flight state.
+    let _flock = acquire_write_flock(&dir).await?;
     sweep_candidate_temps(&dir);
     let repo = GitRepo::open_or_init(&dir)?;
     if !repo.is_path_dirty(&journal_relpath(journal)?)? {
@@ -687,14 +826,17 @@ mod tests {
             .unwrap();
 
         // Simulate a crash after the atomic swap but before the commit: a valid, uncommitted edit.
+        // Dirtiness is checked journal-scoped (`is_path_dirty`): the write lockfile beside the
+        // journal is untracked by design and must not register.
         let mut text = std::fs::read_to_string(&journal).unwrap();
         text.push_str("account assets:checking\n");
         std::fs::write(&journal, &text).unwrap();
+        let relpath = Path::new("main.journal");
         assert!(
             GitRepo::open(dir.path())
                 .unwrap()
                 .unwrap()
-                .is_dirty()
+                .is_path_dirty(relpath)
                 .unwrap()
         );
 
@@ -707,9 +849,9 @@ mod tests {
             !GitRepo::open(dir.path())
                 .unwrap()
                 .unwrap()
-                .is_dirty()
+                .is_path_dirty(relpath)
                 .unwrap(),
-            "clean after reconcile"
+            "journal clean after reconcile"
         );
     }
 

@@ -103,6 +103,31 @@ jobs:
             cargo llvm-cov --all-features --workspace --fail-under-lines 85
           '
 
+  # The M3 formal gate: model-check proofs/tla/Ledger.tla (all safety invariants over all
+  # interleavings within the cfg bounds) plus the spec-mutation sanity checks. Runs on one
+  # leg only — the spec is platform-independent. The task self-provisions tla-checker via
+  # `cargo install` (cached below, keyed on the version pinned in the task).
+  tla:
+    name: tla (model check + spec mutations)
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up mise (task runner)
+        uses: jdx/mise-action@v2
+
+      - name: Cache the tla-checker build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target/tla-tools
+          key: tla-${{ hashFiles('mise.toml') }}
+          restore-keys: tla-
+
+      - name: Model check + spec-mutation sanity checks
+        run: mise run tla
+
   # Diff-scoped mutation testing on PRs: mutate only lines changed vs the merge base and fail
   # on a survivor (a test gap). Fast enough to block on; the full `mise run mutants` sweep is
   # periodic/on-demand, not in CI. hledger isn't installed here — the e2e/smoke tests skip
