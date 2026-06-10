@@ -1085,6 +1085,123 @@ mod tests {
         }
     }
 
+    /// Build a server backed by a fresh tempdir journal (commodity + two accounts declared),
+    /// returning it alongside the tempdir guard (dropped → journal deleted). Skips when
+    /// hledger is absent.
+    async fn write_server(bin: &str) -> (HledgerMcp, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = dir.path().join("main.journal");
+        let server = HledgerMcp::new(Hledger::new(bin, Some(journal)));
+        server
+            .declare_commodity(args(serde_json::json!({ "commodity": "$" })))
+            .await
+            .expect("declare $");
+        server
+            .declare_account(args(serde_json::json!({ "account": "assets:checking" })))
+            .await
+            .expect("declare assets:checking");
+        server
+            .declare_account(args(serde_json::json!({ "account": "equity:opening" })))
+            .await
+            .expect("declare equity:opening");
+        (server, dir)
+    }
+
+    #[tokio::test]
+    async fn close_account_tombstones_declared_account() {
+        let Some(bin) = hledger_bin() else { return };
+        let (server, _dir) = write_server(&bin).await;
+        let result = server
+            .close_account(args(serde_json::json!({ "account": "assets:checking" })))
+            .await
+            .expect("dispatch");
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("tombstoned") && text.contains("assets:checking"),
+            "close_account must report the tombstoned account: {text}"
+        );
+        assert!(
+            text.contains("commit "),
+            "result carries a commit oid: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_transaction_posts_replacement_and_voids_original() {
+        let Some(bin) = hledger_bin() else { return };
+        let (server, _dir) = write_server(&bin).await;
+        // Post the original.
+        let posted = server
+            .post_transaction(args(serde_json::json!({
+                "date": "2026-01-01",
+                "description": "original",
+                "postings": [
+                    { "account": "assets:checking", "amount": { "quantity": "10.00", "commodity": "$" } },
+                    { "account": "equity:opening" }
+                ]
+            })))
+            .await
+            .expect("post");
+        assert_eq!(posted.is_error, Some(false), "{posted:?}");
+        let posted_text = &posted.content[0].as_text().expect("text").text;
+        // Extract the id from "posted transaction id:<id> …".
+        let id = posted_text
+            .split("id:")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .expect("id in post result");
+
+        // Update: void + replacement.
+        let result = server
+            .update_transaction(args(serde_json::json!({
+                "id": id,
+                "transaction": {
+                    "date": "2026-01-02",
+                    "description": "replacement",
+                    "postings": [
+                        { "account": "assets:checking", "amount": { "quantity": "20.00", "commodity": "$" } },
+                        { "account": "equity:opening" }
+                    ]
+                }
+            })))
+            .await
+            .expect("update dispatch");
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("updated:") && text.contains("voided"),
+            "update_transaction must report void + replacement: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grounded_read_updates_last_seen_visible_in_backend_block() {
+        let Some(server) = fixture_server().await else {
+            return;
+        };
+        // Before any read the epoch line shows "no read yet".
+        let before = server.backend_block().await;
+        assert!(
+            before.contains("no read yet this connection"),
+            "pre-read: {before}"
+        );
+        // A grounded read (via get_account_balance) bumps last_seen.
+        server
+            .get_account_balance(args(serde_json::json!({ "account": "assets:checking" })))
+            .await
+            .expect("dispatch");
+        let after = server.backend_block().await;
+        assert!(
+            after.contains("(fresh)"),
+            "after a read the epoch must show fresh: {after}"
+        );
+        assert!(
+            !after.contains("no read yet"),
+            "after a read there must be a last-seen: {after}"
+        );
+    }
+
     #[tokio::test]
     async fn post_transaction_bad_args_is_iserror_before_dispatch() {
         let server = test_server();
