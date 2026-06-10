@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Wrapper: inject --disable-sandbox into `swift build` so apple-log's build
+# script compiles within the Claude Code sandbox (which blocks sandbox-exec,
+# the syscall Swift PM uses to sandbox its own subprocesses).
+_real="$(xcrun --find swift 2>/dev/null || command -v swift)"
+if [[ "${1:-}" == "build" ]]; then
+    exec "$_real" build --disable-sandbox "${@:2}"
+else
+    exec "$_real" "$@"
+fi

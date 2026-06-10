@@ -280,3 +280,73 @@ Checklist:
 > Confirmed the two load-bearing safety claims directly: the journal is byte-identical after a
 > forced `check` failure (no commit), and each validated write produces exactly one commit. No
 > code path edits a posted line in place.
+
+## Post-code-review retrospective
+
+**Reviewed 2026-06-09.** A structured code review of `16e29ab` (7 finder angles × 6 candidates
+→ 1-vote empirical verify) found **5 confirmed correctness bugs** and 1 cleanup finding in the
+freshly-shipped write path. All were fixed in `60badce`. Final state: 107 tests, 90.57% coverage,
+0 surviving mutants on `regex_escape`.
+
+### What the review found
+
+1. **Unanchored-regex dedup (critical).** `tag:idem=<value>` is an unanchored POSIX regex in
+   hledger 1.52 — `txn-1` matches `txn-10` (substring), `.` matches any character, metacharacters
+   like `(` cause a non-zero exit. Empirically verified against the real binary. All tag-based
+   lookups now use `regex_escape` + `^…$` anchoring, plus a Rust-level post-filter as a
+   belt-and-suspenders exact-match check. **This was the most dangerous bug:** idempotency silently
+   deduplicating the wrong transactions.
+
+2. **`update_transaction` validated after the void (critical).** The original called
+   `void_transaction` before validating the replacement. A bad replacement left the original voided
+   with nothing posted in its place. Fixed: validate the full replacement first; if it fails, return
+   an `Input` error before touching the journal.
+
+3. **`reconcile` used repo-wide dirty check (medium).** `is_dirty()` returns true for any untracked
+   file in the repo — including the candidate temp files the write path itself produces. Fixed:
+   `is_path_dirty(relpath)` (via `git2::Repository::status_file`) checks only the journal path;
+   `sweep_candidate_temps` removes stray temps at startup. A spurious reconcile commit is a
+   correctness violation: it advances HEAD without a corresponding validated write.
+
+4. **`void_transaction` used unanchored tag lookup (same root cause as #1).** The `id:` lookup
+   for the target transaction had the same regex bug — an id like `abc-1` would match `abc-10`.
+   Fixed alongside #1 with `find_by_exact_tag`.
+
+5. **`version()` spawned a subprocess per write op (performance/reliability).** The version pin
+   gate is called in every `post_transaction`, `void_transaction`, and `declare_*` call. Fixed:
+   `Arc<OnceCell<Version>>` caches the result for the process lifetime; failures are not cached
+   (retries). The binary doesn't change under a running process.
+
+6. **Duplicated `declared_sets` query (cleanup).** Both `post_transaction` and `void_transaction`
+   called `declared_accounts` + `declared_commodities` inline. Extracted to `declared_sets()` helper.
+
+### Lessons
+
+**hledger query semantics require empirical verification.** The documentation describes
+`tag:NAME=VALUE` as a regex match but doesn't flag its POSIX-unanchored-substring behavior, the
+wildcard meaning of `.`, or metacharacter error cases. For any query feature that will be used
+defensively (dedup, id lookup), **test with real hledger against tricky values** (substring
+prefixes, dots, parens) before shipping. The same applies to any hledger query predicate — assume
+unanchored until proven otherwise.
+
+**Multi-step operations: validate all prerequisites before executing any side effect.** The
+`update_transaction` bug is an instance of a general principle: if an operation has two or more
+irreversible side effects (void + post), validate that all later side effects are feasible before
+executing the first. The fix (validate replacement before void) follows from this directly.
+
+**Dirty-check granularity must match the invariant.** Using a repo-wide `is_dirty()` for a
+single-path invariant (the live journal has uncommitted changes) is wrong by construction — the
+repo directory contains other files. Use the narrowest check available (`status_file(relpath)`)
+and reason about exactly which state it measures.
+
+**The review-round yield on fresh write-path code was high (5 bugs / ~600 lines).** M1's lesson
+("fix latent bugs before wiring into CI") was only partially absorbed. The write path carries the
+highest correctness stakes in the system — money-adjacent, append-only, no undo — and benefited
+from a dedicated review pass before proceeding to M3. **Standing rule: run a code review on each
+milestone's primary module before the exit-criteria sign-off.**
+
+**Mutation testing validates the _verifier_, not just coverage.** The original `find_by_exact_tag`
+had no Rust-level post-filter; a mutation that broke the regex would have still passed if hledger
+returned a superset. The Rust-level filter closes this gap and is itself mutation-tested. A 0-
+survivor result on pure logic (like `regex_escape`) means the test suite is sensitive to every
+behavioral nuance of the function — that's the signal mutation testing is trying to give.

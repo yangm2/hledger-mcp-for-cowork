@@ -23,6 +23,10 @@ min_version = "2024.1.0"
 # Written once by `mise run init-env`; missing on a fresh clone is tolerated.
 # Once present, tasks (and the e2e test) find hledger without re-entering nix.
 _.file = { path = ".env.local", optional = true }
+# scripts/bin/swift is a thin wrapper that injects --disable-sandbox into
+# `swift build`, preventing apple-log's build script from calling sandbox-exec
+# (which the Claude Code sandbox blocks). Prepended so it shadows the real swift.
+_.path = ["scripts/bin"]
 
 [tasks.init-env]
 description = "One-time per-clone setup: write .env.local pointing at the pinned hledger binary"
@@ -66,18 +70,30 @@ set -euo pipefail
 # These are PII (absolute $HOME paths) so they are NOT committed — settings.local.json
 # is gitignored. Reconstituted here per machine. Takes effect on the next Claude session.
 python3 - "$HOME" <<'PY'
-import json, pathlib, sys
+import json, os, pathlib, sys
 home = sys.argv[1]
 p = pathlib.Path(".claude/settings.local.json")
 data = json.loads(p.read_text()) if p.exists() else {}
 dirs = [
-    "/private/tmp/test-data",          # project scratch
-    "/var/folders",                    # macOS $TMPDIR root
-    f"{home}/.cargo/registry",         # cargo dep cache (fetch new crates)
-    f"{home}/.rustup",                 # rustup toolchain store
-    f"{home}/.local/state/mise",       # mise trust/tracking state
-    f"{home}/.local/share/mise",       # mise-installed tools (nextest, llvm-cov)
+    "/private/tmp/test-data",                        # project scratch
+    "/var/folders",                                  # macOS $TMPDIR root
+    f"{home}/.cargo/registry",                       # cargo dep cache (fetch new crates)
+    f"{home}/.rustup",                               # rustup toolchain store
+    f"{home}/.local/state/mise",                     # mise trust/tracking state
+    f"{home}/.local/share/mise",                     # mise-installed tools (nextest, llvm-cov)
+    f"{home}/Library/Caches/org.swift.swiftpm",      # Swift PM package cache (apple-log build)
+    f"{home}/Library/org.swift.swiftpm",             # Swift PM config + security DB (apple-log build)
 ]
+# Foundation atomic writes (used by swift-driver for output-file-map.json) stage the
+# temp file in the destination volume's item-replacement dir (<volume>/.TemporaryItems).
+# On the root volume that's /var/folders (already covered); on any other volume the
+# sandbox must allow it or apple-log's `swift build` fails mid-plan with EPERM.
+vol = os.path.abspath(".")
+dev = os.stat(vol).st_dev
+while os.path.dirname(vol) != vol and os.stat(os.path.dirname(vol)).st_dev == dev:
+    vol = os.path.dirname(vol)
+if vol != "/":
+    dirs.append(f"{vol}/.TemporaryItems")
 ad = data.setdefault("permissions", {}).setdefault("additionalDirectories", [])
 added = [d for d in dirs if d not in ad]
 ad.extend(added)

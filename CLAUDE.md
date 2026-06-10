@@ -77,6 +77,53 @@ libgit2 for the foreign target.
 so its e2e runs against real hledger. (Runs `cargo test`, not nextest — the hook's PATH lacks
 mise's tool dir; functionally equivalent for gating.)
 
+**Subagent delegation — all mise tasks run fully sandboxed (verified 2026-06-09):**
+
+A Haiku subagent clean-compiled `apple-log` (the `swift build` bridge) sandboxed with no
+permission prompt, and the full `check` gate (fmt + clippy + 107 tests incl. real-hledger e2e)
+passes sandboxed. Compiling tasks **may be delegated to subagents**. Historical context: the
+sandbox blockers and their fixes (all three allowlist/wrapper pieces are required):
+- **Swift PM's own subprocess sandbox** (`sandbox-exec: sandbox_apply: Operation not
+  permitted` — nested sandboxing is blocked): fixed by `scripts/bin/swift` (prepended to PATH
+  by mise), which injects `--disable-sandbox` into `swift build`.
+- **Foundation atomic writes** (swift-driver writes `output-file-map.json` atomically; the
+  temp file stages in the destination *volume's* item-replacement dir, `<volume
+  root>/.TemporaryItems` — kernel log: `deny(1) file-read-data /Volumes/Work/.TemporaryItems`):
+  fixed by allowlisting `<volume root>/.TemporaryItems` (added by `init-settings-local`; on a
+  root-volume clone staging goes to `/var/folders`, already covered).
+- **Swift PM caches**: `~/Library/Caches/org.swift.swiftpm` and `~/Library/org.swift.swiftpm`
+  are in the allowlist.
+
+If a sandboxed compile regresses, check the kernel sandbox-violation log:
+`sudo /usr/bin/log show --last 5m --predicate 'sender == "Sandbox"'` (requires sudo, so the
+user must run it — and note plain `log` is shadowed by a zsh builtin).
+
+**Delegation rules (apply to every subagent prompt):**
+- mise auto-loads `.env.local` — never tell a subagent to `source` it; `mise run <task>` is
+  the complete command.
+- **No deletion in subagents**: `clean`/`clean-more` (or any `rm`) triggers a top-level
+  permission prompt that stalls the subagent. Run cleans in the parent first.
+- A subagent's `run_in_background` process is killed when its turn ends — long jobs must be
+  blocking calls inside the subagent.
+
+**Delegatable task prompt** (build / lint / test / e2e / check / fmt / init-*):
+```
+Working directory: /Volumes/Work/prj/hledger-mcp-for-cowork
+Run sandboxed (do NOT use dangerouslyDisableSandbox): mise run <task>
+mise auto-loads .env.local — no need to source it. Allow up to 5 minutes (a cold build
+compiles a Swift bridge). Do not run any clean/delete commands.
+Report: PASS or FAIL, plus the last ~15 lines of output.
+```
+
+**Keep in the parent, foreground:**
+- `cov` — llvm-cov only instruments spawned subprocesses when run foreground; run as a
+  blocking tool call in the parent (sandbox status in a subagent untested).
+- `mutants` — runtime, not sandbox: scope with
+  `mise exec -- cargo mutants -f <file> --re <fn_name>` (a full-file run is 30+ min).
+
+**Explore-agent subagents** (pure grep/read/search) remain the best choice for any code search
+taking more than 3 direct queries — no compilation involved.
+
 ## Platform targets — native, no cross-compilation
 
 Both **macOS and Linux are first-class**. Deployment is **native (or native in a
