@@ -118,11 +118,46 @@ fn hledger_check_read_and_commit_roundtrip() {
 // ---- M2: the production write path end-to-end (declare → post → check → commit → read-back
 // → void), driving the real library code (not raw Command). Skips when hledger is absent.
 
+use hledger_mcp_for_cowork::epoch::ToolClass;
 use hledger_mcp_for_cowork::hledger::Hledger;
 use hledger_mcp_for_cowork::write::{
-    self,
+    self, WriteError, WriteOutcome,
     input::{PostingAmount, PostingInput, TransactionInput},
 };
+
+// The write ops demand a `WriteGuard` proof that only the gate mints (the M3 type-level
+// invariant), so the e2e drives them through `guarded_once` — the production locking path.
+
+async fn declare_commodity(hl: &Hledger, symbol: &str, places: u32) -> Result<String, WriteError> {
+    write::guarded_once(hl, ToolClass::Record, |proof| async move {
+        write::declare_commodity(&proof, hl, symbol, places).await
+    })
+    .await
+}
+
+async fn declare_account(hl: &Hledger, name: &str) -> Result<String, WriteError> {
+    write::guarded_once(hl, ToolClass::Record, |proof| async move {
+        write::declare_account(&proof, hl, name).await
+    })
+    .await
+}
+
+async fn post_transaction(
+    hl: &Hledger,
+    input: TransactionInput,
+) -> Result<WriteOutcome, WriteError> {
+    write::guarded_once(hl, ToolClass::Record, |proof| async move {
+        write::post_transaction(&proof, hl, input).await
+    })
+    .await
+}
+
+async fn void_transaction(hl: &Hledger, id: &str) -> Result<WriteOutcome, WriteError> {
+    write::guarded_once(hl, ToolClass::Record, |proof| async move {
+        write::void_transaction(&proof, hl, id).await
+    })
+    .await
+}
 
 fn posting(account: &str, qty: Option<&str>, commodity: &str) -> PostingInput {
     PostingInput {
@@ -145,16 +180,14 @@ async fn write_path_declare_post_void_round_trip() {
     let hl = Hledger::new(bin, Some(journal.clone()));
 
     // Declare prerequisites (require-pre-declare). Each is one commit.
-    let c0 = write::declare_commodity(&hl, "$", 2)
-        .await
-        .expect("declare $");
-    write::declare_account(&hl, "assets:checking")
+    let c0 = declare_commodity(&hl, "$", 2).await.expect("declare $");
+    declare_account(&hl, "assets:checking")
         .await
         .expect("declare checking");
-    write::declare_account(&hl, "equity:opening balances")
+    declare_account(&hl, "equity:opening balances")
         .await
         .expect("declare equity");
-    write::declare_account(&hl, "expenses:supplies")
+    declare_account(&hl, "expenses:supplies")
         .await
         .expect("declare supplies");
 
@@ -171,7 +204,7 @@ async fn write_path_declare_post_void_round_trip() {
         tags: vec![],
         idem: None,
     };
-    let err = write::post_transaction(&hl, bad)
+    let err = post_transaction(&hl, bad)
         .await
         .expect_err("undeclared must fail");
     assert!(matches!(err, write::WriteError::Input(_)), "{err:?}");
@@ -192,14 +225,12 @@ async fn write_path_declare_post_void_round_trip() {
         tags: vec![],
         idem: Some("opening-1".into()),
     };
-    let posted = write::post_transaction(&hl, input.clone())
-        .await
-        .expect("post");
+    let posted = post_transaction(&hl, input.clone()).await.expect("post");
     assert!(!posted.deduped);
     assert_ne!(posted.commit, c0, "post is a new commit/epoch");
 
     // Idempotent retry with the same idem key → no new transaction.
-    let retry = write::post_transaction(&hl, input).await.expect("retry");
+    let retry = post_transaction(&hl, input).await.expect("retry");
     assert!(retry.deduped, "retry deduped");
 
     // Read back through the adapter: the balance is what we posted.
@@ -213,9 +244,7 @@ async fn write_path_declare_post_void_round_trip() {
     );
 
     // Void it → append-only reversing entry; nets the account to zero.
-    let voided = write::void_transaction(&hl, &posted.id)
-        .await
-        .expect("void");
+    let voided = void_transaction(&hl, &posted.id).await.expect("void");
     assert_ne!(voided.commit, posted.commit, "void is its own commit");
     let after_void = hl.list_transactions(&[]).await.expect("list2");
     assert_eq!(after_void.len(), 2, "original + reversal");
@@ -242,17 +271,11 @@ async fn posted_transactions_round_trip_through_hledger() {
     let dir = tempfile::tempdir().expect("tempdir");
     let journal = dir.path().join("main.journal");
     let hl = Hledger::new(bin, Some(journal.clone()));
-    write::declare_commodity(&hl, "$", 2).await.unwrap();
-    write::declare_commodity(&hl, "EUR", 2).await.unwrap();
-    write::declare_account(&hl, "assets:checking")
-        .await
-        .unwrap();
-    write::declare_account(&hl, "expenses:supplies")
-        .await
-        .unwrap();
-    write::declare_account(&hl, "expenses:travel")
-        .await
-        .unwrap();
+    declare_commodity(&hl, "$", 2).await.unwrap();
+    declare_commodity(&hl, "EUR", 2).await.unwrap();
+    declare_account(&hl, "assets:checking").await.unwrap();
+    declare_account(&hl, "expenses:supplies").await.unwrap();
+    declare_account(&hl, "expenses:travel").await.unwrap();
 
     // (id, input, expected (account, rendered-amount) postings)
     let cases = vec![
@@ -290,7 +313,7 @@ async fn posted_transactions_round_trip_through_hledger() {
     ];
 
     for (idem, input, expected) in cases {
-        let out = write::post_transaction(&hl, input).await.expect("post");
+        let out = post_transaction(&hl, input).await.expect("post");
         let found = hl
             .list_transactions(&[format!("tag:idem={idem}")])
             .await

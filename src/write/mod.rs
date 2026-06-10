@@ -147,11 +147,19 @@ pub fn current_epoch(journal: &Path) -> Result<Epoch, WriteError> {
     }
 }
 
+/// Proof that the write locks are held and the epoch CAS ran: every write op demands one, and
+/// the **only** way to mint one is [`guarded_write`] / [`guarded_once`] (the private unit field
+/// makes outside construction a compile error). This turns "every write goes through the gate"
+/// from a convention into a type-level invariant — a future tool calling
+/// `write::post_transaction` directly simply does not compile without the gate.
+pub struct WriteGuard(());
+
 /// The single write entry point (M3): every mutating tool call goes through here, declaring its
 /// [`ToolClass`]. Runs `op` with **both** write locks held — the in-process mutex (tasks within
 /// this server) and the cross-process flock (other server processes on the same journal) — and
 /// applies the epoch CAS for [`ToolClass::Decide`] calls **inside** those locks, so there is no
 /// check-to-commit gap (a TOCTOU would break `NoLostDecision`; see `proofs/tla/Ledger.tla`).
+/// `op` receives the [`WriteGuard`] proof the write ops require.
 ///
 /// On success the connection's `last_seen` is bumped to the new `HEAD` **only when the write
 /// landed on top of what the connection had already seen** (`last_seen == HEAD` before the
@@ -168,7 +176,7 @@ pub async fn guarded_write<T, F, Fut>(
     op: F,
 ) -> Result<T, WriteError>
 where
-    F: FnOnce() -> Fut,
+    F: FnOnce(WriteGuard) -> Fut,
     Fut: Future<Output = Result<T, WriteError>>,
 {
     let journal = gate(hledger).await?;
@@ -184,15 +192,41 @@ where
         crate::epoch::check(class, seen.as_ref(), &head_before).map_err(WriteError::StaleEpoch)?;
     }
 
-    let out = op().await?;
+    let out = op(WriteGuard(())).await?;
 
     // Conditional bump, still inside the locks: only a write on top of an up-to-date view
     // keeps the view up to date. (For a decide the guard above guarantees this branch.)
+    // A failed re-sample must NOT fail the already-committed write: clear the view instead
+    // (conservative — the connection re-reads before its next decide).
     let mut seen = last_seen.lock().await;
     if *seen == Some(head_before) {
-        *seen = Some(current_epoch(&journal)?);
+        match current_epoch(&journal) {
+            Ok(now) => *seen = Some(now),
+            Err(err) => {
+                tracing::warn!(%err, "post-write epoch sample failed; clearing last-seen");
+                *seen = None;
+            }
+        }
     }
     Ok(out)
+}
+
+/// One-shot [`guarded_write`] with fresh in-process state — for tests and single-shot callers
+/// that don't hold a server's mutex/last-seen. Still fully serialized: the cross-process flock
+/// contends even between two handles in one process, and a fresh (never-read) last-seen makes
+/// any [`ToolClass::Decide`] call conservatively `STALE`.
+pub async fn guarded_once<T, F, Fut>(
+    hledger: &Hledger,
+    class: ToolClass,
+    op: F,
+) -> Result<T, WriteError>
+where
+    F: FnOnce(WriteGuard) -> Fut,
+    Fut: Future<Output = Result<T, WriteError>>,
+{
+    let write_lock = tokio::sync::Mutex::new(());
+    let last_seen = tokio::sync::Mutex::new(None);
+    guarded_write(hledger, &write_lock, &last_seen, class, op).await
 }
 
 /// Create the journal (and its directory) if missing, so reads/declared-set queries work and the
@@ -319,8 +353,10 @@ async fn declared_sets(
 }
 
 /// `post_transaction`: validate → format (stamping `id:`/`idem:`) → candidate → check → swap →
-/// commit. Idempotent on the `idem` key (dedup runs here, under the caller's write mutex).
+/// commit. Idempotent on the `idem` key (dedup runs here, under the locks the [`WriteGuard`]
+/// proves are held).
 pub async fn post_transaction(
+    _proof: &WriteGuard,
     hledger: &Hledger,
     input: TransactionInput,
 ) -> Result<WriteOutcome, WriteError> {
@@ -387,6 +423,7 @@ fn reversal_postings(target: &Transaction) -> Vec<EntryPosting> {
 /// `void_transaction`: post a **reversing** entry (tagged `reverses:<id>`) that negates every
 /// posting of the target. Append-only — the original line is never touched.
 pub async fn void_transaction(
+    _proof: &WriteGuard,
     hledger: &Hledger,
     target_id: &str,
 ) -> Result<WriteOutcome, WriteError> {
@@ -445,6 +482,7 @@ pub async fn void_transaction(
 /// voided-with-no-replacement. (A post-format `check` failure would still be an internal bug,
 /// but validation rules out every *correctable* input error up front.)
 pub async fn update_transaction(
+    proof: &WriteGuard,
     hledger: &Hledger,
     target_id: &str,
     replacement: TransactionInput,
@@ -454,8 +492,8 @@ pub async fn update_transaction(
     let (accounts, commodities) = declared_sets(hledger).await?;
     validate::validate(&replacement, &accounts, &commodities).map_err(WriteError::Input)?;
 
-    void_transaction(hledger, target_id).await?;
-    post_transaction(hledger, replacement).await
+    void_transaction(proof, hledger, target_id).await?;
+    post_transaction(proof, hledger, replacement).await
 }
 
 /// Strip newlines / `;` from text destined for a description (defensive — target text could
@@ -466,7 +504,11 @@ fn sanitize(text: &str) -> String {
 
 /// `declare_account`: append an `account <name>` directive (the require-pre-declare prerequisite
 /// of posting). Idempotent at the journal level (a duplicate directive is harmless).
-pub async fn declare_account(hledger: &Hledger, name: &str) -> Result<String, WriteError> {
+pub async fn declare_account(
+    _proof: &WriteGuard,
+    hledger: &Hledger,
+    name: &str,
+) -> Result<String, WriteError> {
     let journal = gate(hledger).await?;
     let name = name.trim();
     if name.is_empty() || name.contains(['\n', ';']) || name.starts_with(':') || name.ends_with(':')
@@ -486,6 +528,7 @@ pub async fn declare_account(hledger: &Hledger, name: &str) -> Result<String, Wr
 /// `places` decimals. Symbols starting with a non-alphanumeric char (e.g. `$`) render on the
 /// left; alphabetic codes (e.g. `USD`) on the right — matching hledger conventions.
 pub async fn declare_commodity(
+    _proof: &WriteGuard,
     hledger: &Hledger,
     symbol: &str,
     places: u32,
@@ -519,7 +562,11 @@ pub async fn declare_commodity(
 /// and `accounts --declared tag:^tombstoned$` filters on it). The account stays declared, so
 /// existing references and even new postings still resolve (C-4) — nothing is ever hard-deleted.
 /// Idempotent: re-tombstoning an already-tombstoned account is a no-op returning current `HEAD`.
-pub async fn tombstone_account(hledger: &Hledger, name: &str) -> Result<String, WriteError> {
+pub async fn tombstone_account(
+    _proof: &WriteGuard,
+    hledger: &Hledger,
+    name: &str,
+) -> Result<String, WriteError> {
     let journal = gate(hledger).await?;
     ensure_journal_exists(&journal)?;
     let name = name.trim();
@@ -539,11 +586,10 @@ pub async fn tombstone_account(hledger: &Hledger, name: &str) -> Result<String, 
         .await
         .map_err(|e| WriteError::Internal(format!("read tombstoned accounts: {e}")))?;
     if tombstoned.iter().any(|a| a == name) {
-        // Already tombstoned — idempotent no-op at the current epoch.
-        return Ok(current_epoch(&journal)?
-            .oid()
-            .unwrap_or_default()
-            .to_string());
+        // Already tombstoned — idempotent no-op at the current epoch. A hand-authored journal
+        // can carry the tag with no repo/commit yet; render that as "(unborn)", never "".
+        let epoch = current_epoch(&journal)?;
+        return Ok(epoch.oid().map_or_else(|| epoch.short(), str::to_string));
     }
     append_and_commit(
         hledger,
@@ -666,6 +712,12 @@ mod tests {
         }
     }
 
+    /// Mint a [`WriteGuard`] without the locks — unit tests only (a child module can reach the
+    /// private constructor; integration tests must go through `guarded_once`/`guarded_write`).
+    fn proof() -> WriteGuard {
+        WriteGuard(())
+    }
+
     fn posting(account: &str, mantissa: i128, commodity: &str) -> Posting {
         Posting {
             account: account.into(),
@@ -785,8 +837,10 @@ mod tests {
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
         // Bootstrap a committed, valid journal.
-        declare_commodity(&hl, "$", 2).await.unwrap();
-        declare_account(&hl, "assets:checking").await.unwrap();
+        declare_commodity(&proof(), &hl, "$", 2).await.unwrap();
+        declare_account(&proof(), &hl, "assets:checking")
+            .await
+            .unwrap();
         let before = std::fs::read_to_string(&journal).unwrap();
 
         // Deliberately malformed (unbalanced single posting) — simulates a formatter bug. The
@@ -818,7 +872,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
-        declare_commodity(&hl, "$", 2).await.unwrap();
+        declare_commodity(&proof(), &hl, "$", 2).await.unwrap();
         let committed = GitRepo::open(dir.path())
             .unwrap()
             .unwrap()
@@ -866,9 +920,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
-        declare_commodity(&hl, "$", 2).await.unwrap();
-        declare_account(&hl, "assets:checking").await.unwrap();
-        declare_account(&hl, "equity:opening").await.unwrap();
+        declare_commodity(&proof(), &hl, "$", 2).await.unwrap();
+        declare_account(&proof(), &hl, "assets:checking")
+            .await
+            .unwrap();
+        declare_account(&proof(), &hl, "equity:opening")
+            .await
+            .unwrap();
 
         let entry = |idem: &str| TransactionInput {
             date: "2026-01-01".into(),
@@ -890,13 +948,19 @@ mod tests {
             idem: Some(idem.to_string()),
         };
 
-        let first = post_transaction(&hl, entry("txn-1")).await.unwrap();
+        let first = post_transaction(&proof(), &hl, entry("txn-1"))
+            .await
+            .unwrap();
         assert!(!first.deduped);
-        let second = post_transaction(&hl, entry("txn-10")).await.unwrap();
+        let second = post_transaction(&proof(), &hl, entry("txn-10"))
+            .await
+            .unwrap();
         assert!(!second.deduped, "txn-10 must not dedup against txn-1");
 
         // And an exact retry of txn-1 *does* dedup.
-        let retry = post_transaction(&hl, entry("txn-1")).await.unwrap();
+        let retry = post_transaction(&proof(), &hl, entry("txn-1"))
+            .await
+            .unwrap();
         assert!(retry.deduped, "exact idem retry deduplicates");
 
         let all = hl.list_transactions(&[]).await.unwrap();
@@ -913,9 +977,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
-        declare_commodity(&hl, "$", 2).await.unwrap();
-        declare_account(&hl, "assets:checking").await.unwrap();
-        declare_account(&hl, "equity:opening").await.unwrap();
+        declare_commodity(&proof(), &hl, "$", 2).await.unwrap();
+        declare_account(&proof(), &hl, "assets:checking")
+            .await
+            .unwrap();
+        declare_account(&proof(), &hl, "equity:opening")
+            .await
+            .unwrap();
 
         let mk = |postings: Vec<(&str, Option<&str>)>| TransactionInput {
             date: "2026-01-01".into(),
@@ -935,6 +1003,7 @@ mod tests {
         };
 
         let posted = post_transaction(
+            &proof(),
             &hl,
             mk(vec![
                 ("assets:checking", Some("10.00")),
@@ -949,7 +1018,7 @@ mod tests {
             ("assets:savings", Some("10.00")),
             ("equity:opening", None),
         ]);
-        let err = update_transaction(&hl, &posted.id, bad)
+        let err = update_transaction(&proof(), &hl, &posted.id, bad)
             .await
             .expect_err("invalid replacement must fail");
         assert!(matches!(err, WriteError::Input(_)), "{err:?}");
@@ -972,7 +1041,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
-        declare_commodity(&hl, "$", 2).await.unwrap();
+        declare_commodity(&proof(), &hl, "$", 2).await.unwrap();
         let head_before = GitRepo::open(dir.path())
             .unwrap()
             .unwrap()

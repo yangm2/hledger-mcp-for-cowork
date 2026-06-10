@@ -274,6 +274,24 @@ Checklist notes:
       ledger dirty forever — `git_status_line` switched to the journal-scoped
       `is_path_dirty` (the M2 granularity lesson, second occurrence).
 
+**Structured review round (2026-06-10, post-sign-off `/code-review`) — 7 findings, all fixed:**
+
+1. **The write gate is now structural, not conventional:** every write op takes a
+   `&WriteGuard` proof token whose only mints are `guarded_write` / `guarded_once` (private
+   unit field) — an M4 tool bypassing the flock+CAS is a compile error, not a review catch.
+2. **The read discipline is now structural:** `grounded_read` on the server owns the
+   sample-HEAD-before-hledger ordering and the success-only bump; read tools (and M4's
+   additions) cannot get the ordering wrong.
+3. **A failed startup reconcile now blocks writes** (`write_block`, surfaced in `status`),
+   self-healing: each write attempt retries the reconcile and unblocks on success — a write
+   can no longer silently absorb unreconciled foreign content into its commit.
+4. `tombstone_account`'s idempotent path renders `(unborn)` instead of an empty oid.
+5. A post-op epoch-sample failure no longer fails an already-committed write — it clears
+   last-seen (conservative) and warns.
+6. The six near-identical write-tool bodies collapsed into one `guarded_tool` helper
+   (class + op + render closure).
+7. One oid-shortening implementation (`epoch::short_oid`); the server duplicate is gone.
+
 **Deferrals (accepted, none block M4):**
 
 - **`Progress` liveness is not machine-checked by the gate.** tla-checker 0.6.3 cannot verify

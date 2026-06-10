@@ -69,11 +69,20 @@ async fn main() -> anyhow::Result<()> {
 
     // Crash reconciliation: if a previous run left the journal replaced-but-uncommitted, make
     // HEAD a check-valid journal again (commit if it passes, else restore) before serving.
-    match hledger_mcp_for_cowork::write::reconcile(&hledger).await {
-        Ok(Some(commit)) => tracing::warn!(%commit, "startup reconciled an uncommitted journal"),
-        Ok(None) => {}
-        Err(err) => tracing::error!(%err, "startup reconciliation failed"),
-    }
+    // A FAILED reconcile blocks writes (reads still work): the tree may hold unreconciled
+    // content a write would silently absorb into its commit. Each write attempt retries the
+    // reconcile and unblocks itself on success.
+    let write_block = match hledger_mcp_for_cowork::write::reconcile(&hledger).await {
+        Ok(Some(commit)) => {
+            tracing::warn!(%commit, "startup reconciled an uncommitted journal");
+            None
+        }
+        Ok(None) => None,
+        Err(err) => {
+            tracing::error!(%err, "startup reconciliation failed; writes blocked until a retry succeeds");
+            Some(format!("startup reconciliation failed: {err}"))
+        }
+    };
 
     let ct = CancellationToken::new();
     let signal_ct = ct.clone();
@@ -84,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let service = HledgerMcp::new(hledger)
+        .with_write_block(write_block)
         .serve_with_ct(stdio(), ct)
         .await
         .context("failed to start MCP stdio service")?;

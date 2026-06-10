@@ -46,10 +46,16 @@ impl Epoch {
     /// Short (12-char) form for human-facing messages.
     pub fn short(&self) -> String {
         match &self.0 {
-            Some(oid) => oid[..oid.len().min(12)].to_string(),
+            Some(oid) => short_oid(oid).to_string(),
             None => "(unborn)".to_string(),
         }
     }
+}
+
+/// Short (12-char) form of a commit oid for human-facing messages — the one shortening
+/// implementation (tool responses and `status` use it too).
+pub fn short_oid(oid: &str) -> &str {
+    &oid[..oid.len().min(12)]
 }
 
 /// A decide call was built on a stale read: the connection's last-seen epoch (if it

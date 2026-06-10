@@ -18,10 +18,10 @@ use rmcp::model::{
 use rmcp::service::{Peer, RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
-use crate::epoch::{Epoch, ToolClass};
+use crate::epoch::{Epoch, ToolClass, short_oid};
 use crate::hledger::amount::render_amounts;
 use crate::hledger::{BalanceReport, Hledger, HledgerError, PINNED_VERSION, Transaction};
-use crate::write::{self, WriteError, WriteOutcome, input::TransactionInput};
+use crate::write::{self, WriteError, WriteGuard, WriteOutcome, input::TransactionInput};
 
 const SERVER_NAME: &str = "hledger-mcp";
 
@@ -115,8 +115,14 @@ pub struct HledgerMcp {
     /// The epoch CAS directory (M3): the `HEAD` this connection last **read**. Over stdio there
     /// is exactly one connection per server instance, so a single slot is per-connection by
     /// construction (the multi-connection directory arrives with HTTP, M6). Read tools bump it
-    /// (sampling HEAD *before* the hledger read); decide calls are checked against it.
+    /// (via [`Self::grounded_read`], which owns the sample-before-read ordering); decide calls
+    /// are checked against it.
     last_seen: Arc<tokio::sync::Mutex<Option<Epoch>>>,
+    /// When `Some`, writes are refused (with the reason) — set when startup reconciliation
+    /// failed, so the working tree may hold unreconciled content a write would silently absorb
+    /// into its commit. Self-healing: the next write attempt retries `reconcile` and clears
+    /// this on success.
+    write_block: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 impl Default for HledgerMcp {
@@ -134,25 +140,45 @@ impl HledgerMcp {
             hledger,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_seen: Arc::new(tokio::sync::Mutex::new(None)),
+            write_block: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Block writes with `reason` until a reconcile retry succeeds (builder, for startup:
+    /// `main` sets this when crash reconciliation fails — see `write_block`).
+    pub fn with_write_block(self, reason: Option<String>) -> Self {
+        Self {
+            write_block: Arc::new(tokio::sync::Mutex::new(reason)),
+            ..self
         }
     }
 
     /// Sample the current epoch (journal repo `HEAD`) — `None` when no journal is configured or
-    /// the repo can't be read. Read tools call this **before** invoking hledger: bumping
-    /// last-seen to a *post*-read HEAD could record an epoch newer than the data actually seen
-    /// (the unsafe direction for the CAS); sampling before is conservative — worst case a
-    /// spurious `STALE` re-read.
+    /// the repo can't be read.
     fn sample_epoch(&self) -> Option<Epoch> {
         let journal = self.hledger.journal_path()?;
         write::current_epoch(journal).ok()
     }
 
-    /// Record a successful read: the connection has now observed `epoch` (the HEAD sampled
-    /// before the read).
-    async fn bump_last_seen(&self, epoch: Option<Epoch>) {
-        if let Some(epoch) = epoch {
+    /// Run a ledger read with the grounding discipline built in: sample `HEAD` **before**
+    /// invoking hledger, and bump this connection's last-seen to that pre-read sample only on
+    /// success. Owning the ordering here makes it impossible for a (future) read tool to get
+    /// wrong — bumping to a *post*-read `HEAD` could record an epoch newer than the data
+    /// actually seen (the unsafe direction for the CAS); sampling before is conservative
+    /// (worst case a spurious `STALE` re-read). Every ledger-reading tool goes through this.
+    async fn grounded_read<T, E, F, Fut>(&self, op: F) -> Result<T, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        let epoch = self.sample_epoch();
+        let out = op().await;
+        if out.is_ok()
+            && let Some(epoch) = epoch
+        {
             *self.last_seen.lock().await = Some(epoch);
         }
+        out
     }
 
     /// Report server health: name, version, the session's **negotiated** protocol version,
@@ -218,15 +244,17 @@ impl HledgerMcp {
             }
             None => "epoch: (no journal configured)".to_string(),
         };
-        // Writes need both the pinned hledger and a journal.
+        // Writes need the pinned hledger, a journal, and a reconciled tree.
         let writes = if detected.is_err() {
-            "writes: blocked (hledger unavailable)"
+            "writes: blocked (hledger unavailable)".to_string()
         } else if !pinned {
-            "writes: BLOCKED (hledger not pinned 1.52)"
+            "writes: BLOCKED (hledger not pinned 1.52)".to_string()
+        } else if let Some(reason) = self.write_block.lock().await.as_deref() {
+            format!("writes: BLOCKED ({reason}; a write attempt retries the reconcile)")
         } else if self.hledger.has_journal() {
-            "writes: enabled"
+            "writes: enabled".to_string()
         } else {
-            "writes: blocked (no journal configured)"
+            "writes: blocked (no journal configured)".to_string()
         };
         format!("{version}\n{binary}\n{journal}\n{git}\n{epoch}\n{writes}")
     }
@@ -260,10 +288,11 @@ impl HledgerMcp {
             Ok(args) => args,
             Err(err) => return Ok(err),
         };
-        let epoch = self.sample_epoch(); // before the read — see `sample_epoch`
-        match self.hledger.balance(Some(&args.account)).await {
+        let result = self
+            .grounded_read(|| self.hledger.balance(Some(&args.account)))
+            .await;
+        match result {
             Ok(report) => {
-                self.bump_last_seen(epoch).await;
                 let mut text = render_balance(&report);
                 let flags = crate::flags::overdraft_flags(&report);
                 if !flags.is_empty() {
@@ -294,26 +323,57 @@ impl HledgerMcp {
             Err(err) => return Ok(err),
         };
         let terms = args.query.unwrap_or_default();
-        let epoch = self.sample_epoch(); // before the read — see `sample_epoch`
-        match self.hledger.list_transactions(&terms).await {
-            Ok(txns) => {
-                self.bump_last_seen(epoch).await;
-                Ok(CallToolResult::success(vec![Content::text(
-                    render_transactions(&txns),
-                )]))
-            }
+        let result = self
+            .grounded_read(|| self.hledger.list_transactions(&terms))
+            .await;
+        match result {
+            Ok(txns) => Ok(CallToolResult::success(vec![Content::text(
+                render_transactions(&txns),
+            )])),
             Err(err) => Ok(adapter_error(&err)),
         }
     }
 
-    /// Run a write op through [`write::guarded_write`] with this connection's locks and
-    /// last-seen slot — the single dispatch point where a tool's [`ToolClass`] takes effect.
-    async fn guarded<T, F, Fut>(&self, class: ToolClass, op: F) -> Result<T, WriteError>
+    /// Run a write tool through [`write::guarded_write`] with this connection's locks and
+    /// last-seen slot, rendering the outcome — the single dispatch point where a tool's
+    /// [`ToolClass`] takes effect (and where every write-tool body collapses to one call).
+    /// `op` receives the [`WriteGuard`] proof the write ops require.
+    ///
+    /// If writes are blocked (startup reconciliation failed), retries the reconcile first and
+    /// self-heals on success; otherwise refuses with the reason — a write against an
+    /// unreconciled tree would silently absorb foreign content into its commit.
+    async fn guarded_tool<T, F, Fut>(
+        &self,
+        class: ToolClass,
+        op: F,
+        render: impl FnOnce(&T) -> String,
+    ) -> Result<CallToolResult, McpError>
     where
-        F: FnOnce() -> Fut,
+        F: FnOnce(WriteGuard) -> Fut,
         Fut: Future<Output = Result<T, WriteError>>,
     {
-        write::guarded_write(&self.hledger, &self.write_lock, &self.last_seen, class, op).await
+        {
+            let mut block = self.write_block.lock().await;
+            if let Some(reason) = block.clone() {
+                match write::reconcile(&self.hledger).await {
+                    Ok(_) => {
+                        tracing::warn!("reconcile retry succeeded; writes unblocked");
+                        *block = None;
+                    }
+                    Err(err) => {
+                        return Ok(write_error_result(WriteError::Refused(format!(
+                            "writes blocked: {reason} (reconcile retry failed: {err})"
+                        ))));
+                    }
+                }
+            }
+        }
+        let result =
+            write::guarded_write(&self.hledger, &self.write_lock, &self.last_seen, class, op).await;
+        match result {
+            Ok(out) => Ok(CallToolResult::success(vec![Content::text(render(&out))])),
+            Err(err) => Ok(write_error_result(err)),
+        }
     }
 
     /// Declare an account so transactions may post to it (require-pre-declare). **Record** —
@@ -332,19 +392,19 @@ impl HledgerMcp {
             Ok(args) => args,
             Err(err) => return Ok(err),
         };
-        let result = self
-            .guarded(ToolClass::Record, || {
-                write::declare_account(&self.hledger, &args.account)
-            })
-            .await;
-        match result {
-            Ok(commit) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "declared account '{}' (commit {})",
-                args.account,
-                short(&commit)
-            ))])),
-            Err(err) => Ok(write_error_result(err)),
-        }
+        let account = args.account.clone();
+        self.guarded_tool(
+            ToolClass::Record,
+            |proof| async move { write::declare_account(&proof, &self.hledger, &account).await },
+            |commit| {
+                format!(
+                    "declared account '{}' (commit {})",
+                    args.account,
+                    short_oid(commit)
+                )
+            },
+        )
+        .await
     }
 
     /// Close (tombstone) an account — **soft-delete**: the account stays declared, history and
@@ -364,19 +424,19 @@ impl HledgerMcp {
             Ok(args) => args,
             Err(err) => return Ok(err),
         };
-        let result = self
-            .guarded(ToolClass::Record, || {
-                write::tombstone_account(&self.hledger, &args.account)
-            })
-            .await;
-        match result {
-            Ok(commit) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "closed (tombstoned) account '{}' (commit {})",
-                args.account,
-                short(&commit)
-            ))])),
-            Err(err) => Ok(write_error_result(err)),
-        }
+        let account = args.account.clone();
+        self.guarded_tool(
+            ToolClass::Record,
+            |proof| async move { write::tombstone_account(&proof, &self.hledger, &account).await },
+            |commit| {
+                format!(
+                    "closed (tombstoned) account '{}' (commit {})",
+                    args.account,
+                    short_oid(commit)
+                )
+            },
+        )
+        .await
     }
 
     /// Declare a commodity so amounts may use it (require-pre-declare). **Record** —
@@ -395,20 +455,22 @@ impl HledgerMcp {
             Err(err) => return Ok(err),
         };
         let places = args.decimal_places.unwrap_or(2);
-        let result = self
-            .guarded(ToolClass::Record, || {
-                write::declare_commodity(&self.hledger, &args.commodity, places)
-            })
-            .await;
-        match result {
-            Ok(commit) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "declared commodity '{}' ({} dp, commit {})",
-                args.commodity,
-                places,
-                short(&commit)
-            ))])),
-            Err(err) => Ok(write_error_result(err)),
-        }
+        let commodity = args.commodity.clone();
+        self.guarded_tool(
+            ToolClass::Record,
+            |proof| async move {
+                write::declare_commodity(&proof, &self.hledger, &commodity, places).await
+            },
+            |commit| {
+                format!(
+                    "declared commodity '{}' ({} dp, commit {})",
+                    args.commodity,
+                    places,
+                    short_oid(commit)
+                )
+            },
+        )
+        .await
     }
 
     /// Post a balanced transaction (validate → check --strict → atomic write → git commit).
@@ -430,17 +492,12 @@ impl HledgerMcp {
             Ok(input) => input,
             Err(err) => return Ok(err),
         };
-        let result = self
-            .guarded(ToolClass::Record, || {
-                write::post_transaction(&self.hledger, input)
-            })
-            .await;
-        match result {
-            Ok(outcome) => Ok(CallToolResult::success(vec![Content::text(
-                post_outcome_text(&outcome),
-            )])),
-            Err(err) => Ok(write_error_result(err)),
-        }
+        self.guarded_tool(
+            ToolClass::Record,
+            |proof| async move { write::post_transaction(&proof, &self.hledger, input).await },
+            post_outcome_text,
+        )
+        .await
     }
 
     /// Void a transaction by posting a reversing entry (append-only correction). **Record** —
@@ -459,20 +516,20 @@ impl HledgerMcp {
             Ok(args) => args,
             Err(err) => return Ok(err),
         };
-        let result = self
-            .guarded(ToolClass::Record, || {
-                write::void_transaction(&self.hledger, &args.id)
-            })
-            .await;
-        match result {
-            Ok(outcome) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "voided '{}' with reversing entry id:{} (commit {})",
-                args.id,
-                outcome.id,
-                short(&outcome.commit)
-            ))])),
-            Err(err) => Ok(write_error_result(err)),
-        }
+        let id = args.id.clone();
+        self.guarded_tool(
+            ToolClass::Record,
+            |proof| async move { write::void_transaction(&proof, &self.hledger, &id).await },
+            |outcome: &WriteOutcome| {
+                format!(
+                    "voided '{}' with reversing entry id:{} (commit {})",
+                    args.id,
+                    outcome.id,
+                    short_oid(&outcome.commit)
+                )
+            },
+        )
+        .await
     }
 
     /// Replace a transaction: void the original and post a replacement (two entries, no edit).
@@ -493,20 +550,22 @@ impl HledgerMcp {
             Ok(args) => args,
             Err(err) => return Ok(err),
         };
-        let result = self
-            .guarded(ToolClass::Record, || {
-                write::update_transaction(&self.hledger, &args.id, args.transaction)
-            })
-            .await;
-        match result {
-            Ok(outcome) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "updated: voided '{}', posted replacement id:{} (commit {})",
-                args.id,
-                outcome.id,
-                short(&outcome.commit)
-            ))])),
-            Err(err) => Ok(write_error_result(err)),
-        }
+        let id = args.id.clone();
+        self.guarded_tool(
+            ToolClass::Record,
+            |proof| async move {
+                write::update_transaction(&proof, &self.hledger, &id, args.transaction).await
+            },
+            |outcome: &WriteOutcome| {
+                format!(
+                    "updated: voided '{}', posted replacement id:{} (commit {})",
+                    args.id,
+                    outcome.id,
+                    short_oid(&outcome.commit)
+                )
+            },
+        )
+        .await
     }
 
     /// Echo a message back unchanged — a minimal tool-invocation connectivity check.
@@ -540,24 +599,19 @@ fn adapter_error(err: &HledgerError) -> CallToolResult {
     CallToolResult::error(vec![Content::text(format!("hledger error: {err}"))])
 }
 
-/// Short (12-char) commit oid for human-facing messages.
-fn short(oid: &str) -> &str {
-    &oid[..oid.len().min(12)]
-}
-
 /// Human-facing result text for a `post_transaction` outcome (handles the deduped case).
 fn post_outcome_text(outcome: &WriteOutcome) -> String {
     if outcome.deduped {
         format!(
             "already posted (idempotent): transaction id:{} — no new commit (HEAD {})",
             outcome.id,
-            short(&outcome.commit)
+            short_oid(&outcome.commit)
         )
     } else {
         format!(
             "posted transaction id:{} (commit {})",
             outcome.id,
-            short(&outcome.commit)
+            short_oid(&outcome.commit)
         )
     }
 }
@@ -669,6 +723,50 @@ mod tests {
     /// don't touch hledger (`echo`) and for exercising the `NoJournal` error path.
     fn test_server() -> HledgerMcp {
         HledgerMcp::new(Hledger::new("hledger", None))
+    }
+
+    /// Resolve a runnable hledger for write-path tests, else `None` (test skips).
+    fn hledger_bin() -> Option<String> {
+        let runnable = |bin: &str| {
+            std::process::Command::new(bin)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        match std::env::var("HLEDGER_EXECUTABLE_PATH") {
+            Ok(p) if !p.is_empty() && runnable(&p) => Some(p),
+            _ => runnable("hledger").then(|| "hledger".to_string()),
+        }
+    }
+
+    /// A write-blocked server self-heals: the first write attempt retries the reconcile
+    /// (healthy journal → success), clears the block, and the write proceeds. `status`
+    /// reports BLOCKED before and enabled after.
+    #[tokio::test]
+    async fn write_block_self_heals_on_successful_reconcile_retry() {
+        let Some(bin) = hledger_bin() else { return };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = dir.path().join("main.journal");
+        let server = HledgerMcp::new(Hledger::new(bin, Some(journal)))
+            .with_write_block(Some("startup reconciliation failed: synthetic".into()));
+
+        assert!(
+            server.backend_block().await.contains("writes: BLOCKED"),
+            "status reports the block"
+        );
+
+        // The journal is healthy (reconcile retry will succeed) → the write self-heals.
+        let result = server
+            .declare_commodity(args(serde_json::json!({ "commodity": "$" })))
+            .await
+            .expect("dispatch");
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        assert!(server.write_block.lock().await.is_none(), "block cleared");
+        assert!(
+            server.backend_block().await.contains("writes: enabled"),
+            "status reports enabled after the self-heal"
+        );
     }
 
     #[tokio::test]
@@ -941,8 +1039,8 @@ mod tests {
 
     #[test]
     fn short_truncates_oid() {
-        assert_eq!(short("0123456789abcdef0123"), "0123456789ab");
-        assert_eq!(short("abc"), "abc");
+        assert_eq!(short_oid("0123456789abcdef0123"), "0123456789ab");
+        assert_eq!(short_oid("abc"), "abc");
     }
 
     #[test]

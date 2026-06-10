@@ -68,7 +68,8 @@ impl Conn {
         *self.last_seen.lock().await = Some(epoch);
     }
 
-    /// A guarded write of the given class posting `input` — the production dispatch path.
+    /// A guarded write of the given class posting `input` — the production dispatch path
+    /// (the ops demand the `WriteGuard` proof only the gate mints).
     async fn guarded_post(
         &self,
         class: ToolClass,
@@ -79,7 +80,7 @@ impl Conn {
             &self.write_lock,
             &self.last_seen,
             class,
-            || write::post_transaction(&self.hledger, input),
+            |proof| async move { write::post_transaction(&proof, &self.hledger, input).await },
         )
         .await
     }
@@ -112,10 +113,18 @@ fn txn(description: &str, to: &str, amount: &str, idem: Option<&str>) -> Transac
 async fn setup(bin: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let journal = dir.path().join("main.journal");
-    let hl = Hledger::new(bin, Some(journal.clone()));
-    write::declare_commodity(&hl, "$", 2).await.expect("$");
+    let hl = &Hledger::new(bin, Some(journal.clone()));
+    write::guarded_once(hl, ToolClass::Record, |proof| async move {
+        write::declare_commodity(&proof, hl, "$", 2).await
+    })
+    .await
+    .expect("$");
     for account in ["assets:checking", "expenses:misc", "equity:opening"] {
-        write::declare_account(&hl, account).await.expect(account);
+        write::guarded_once(hl, ToolClass::Record, |proof| async move {
+            write::declare_account(&proof, hl, account).await
+        })
+        .await
+        .expect(account);
     }
     (dir, journal)
 }
@@ -284,12 +293,13 @@ async fn c4_posting_to_tombstoned_account_resolves() {
     )
     .await
     .expect("pre-tombstone post");
+    let hl = &a.hledger;
     write::guarded_write(
-        &a.hledger,
+        hl,
         &a.write_lock,
         &a.last_seen,
         ToolClass::Record,
-        || write::tombstone_account(&a.hledger, "expenses:misc"),
+        |proof| async move { write::tombstone_account(&proof, hl, "expenses:misc").await },
     )
     .await
     .expect("tombstone");
@@ -312,15 +322,19 @@ async fn c4_posting_to_tombstoned_account_resolves() {
 
     // Tombstoning is idempotent (a repeat is a no-op at the current epoch, not an error).
     let head_before = write::current_epoch(&journal).expect("epoch");
-    let again = write::tombstone_account(&a.hledger, "expenses:misc")
-        .await
-        .expect("idempotent re-tombstone");
+    let again = write::guarded_once(hl, ToolClass::Record, |proof| async move {
+        write::tombstone_account(&proof, hl, "expenses:misc").await
+    })
+    .await
+    .expect("idempotent re-tombstone");
     assert_eq!(Some(again.as_str()), head_before.oid(), "no new commit");
 
     // Tombstoning an undeclared account is a correctable input error.
-    let err = write::tombstone_account(&a.hledger, "no:such")
-        .await
-        .expect_err("undeclared");
+    let err = write::guarded_once(hl, ToolClass::Record, |proof| async move {
+        write::tombstone_account(&proof, hl, "no:such").await
+    })
+    .await
+    .expect_err("undeclared");
     assert!(matches!(err, WriteError::Input(_)), "{err:?}");
 }
 
