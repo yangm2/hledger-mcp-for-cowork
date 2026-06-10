@@ -10,7 +10,7 @@
 //!
 //! This module is the *pure* state machine: no I/O, no locks. Lock ordering and the
 //! TOCTOU discipline (the check must run **inside** the write locks) live in
-//! [`crate::write::guarded_write`]; the formal model is `proofs/tla/Ledger.tla`.
+//! [`crate::write::ConnectionView::guarded`]; the formal model is `proofs/tla/Ledger.tla`.
 
 /// The record-vs-decide partition (`concurrency-model.md`). Every write tool declares
 /// which class it is in; only [`Decide`](ToolClass::Decide) calls are epoch-checked.

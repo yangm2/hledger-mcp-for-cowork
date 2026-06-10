@@ -292,6 +292,17 @@ Checklist notes:
    (class + op + render closure).
 7. One oid-shortening implementation (`epoch::short_oid`); the server duplicate is gone.
 
+**Follow-up refactor (2026-06-10): `write::ConnectionView`.** The free-function
+`guarded_write(hledger, &write_lock, &last_seen, class, op)` became a method on a
+`ConnectionView` (per-connection last-seen paired at construction with a shared handle to the
+process-wide `WriterLock`), and the server's `grounded_read` moved onto the same type — both
+ordering disciplines now live on the one struct that owns the state they protect, and a call
+site can no longer pair one connection's lock with another's view. The cardinality split
+(lock per process, view per connection) is exactly the seam the HTTP/M6 transport needs.
+`tests/concurrency.rs`'s hand-rolled `Conn` scaffolding collapsed onto the production type,
+and the mid-read-write ordering test now drives the production `grounded_read` instead of
+simulating it.
+
 **Deferrals (accepted, none block M4):**
 
 - **`Progress` liveness is not machine-checked by the gate.** tla-checker 0.6.3 cannot verify

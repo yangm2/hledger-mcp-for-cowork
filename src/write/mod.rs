@@ -10,8 +10,10 @@
 //!   error with the `check` output attached (logged verbatim; logs are local, not the repo).
 //! - **Require pre-declare:** accounts/commodities must already be declared (`declare_*`).
 //! - **Append-only:** corrections are reversing entries (`void`); nothing is ever edited in place.
-//! - **git2, not a subprocess** (see [`crate::git`]). The serializing write mutex lives in the
-//!   server; the dedup→append→commit sequence here must run under it.
+//! - **git2, not a subprocess** (see [`crate::git`]). The two-layer serialization — the
+//!   in-process [`WriterLock`] plus the cross-process flock — and the per-connection epoch view
+//!   live in [`ConnectionView`]; every write op runs under [`ConnectionView::guarded`], which
+//!   holds both locks across the whole dedup→append→commit sequence.
 
 pub mod format;
 pub mod input;
@@ -19,6 +21,7 @@ pub mod validate;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use uuid::Uuid;
 
@@ -148,73 +151,147 @@ pub fn current_epoch(journal: &Path) -> Result<Epoch, WriteError> {
 }
 
 /// Proof that the write locks are held and the epoch CAS ran: every write op demands one, and
-/// the **only** way to mint one is [`guarded_write`] / [`guarded_once`] (the private unit field
-/// makes outside construction a compile error). This turns "every write goes through the gate"
-/// from a convention into a type-level invariant — a future tool calling
+/// the **only** way to mint one is [`ConnectionView::guarded`] / [`guarded_once`] (the private
+/// unit field makes outside construction a compile error). This turns "every write goes through
+/// the gate" from a convention into a type-level invariant — a future tool calling
 /// `write::post_transaction` directly simply does not compile without the gate.
 pub struct WriteGuard(());
 
-/// The single write entry point (M3): every mutating tool call goes through here, declaring its
-/// [`ToolClass`]. Runs `op` with **both** write locks held — the in-process mutex (tasks within
-/// this server) and the cross-process flock (other server processes on the same journal) — and
-/// applies the epoch CAS for [`ToolClass::Decide`] calls **inside** those locks, so there is no
-/// check-to-commit gap (a TOCTOU would break `NoLostDecision`; see `proofs/tla/Ledger.tla`).
-/// `op` receives the [`WriteGuard`] proof the write ops require.
+/// The **process-wide** half of the single-writer invariant: the in-process serializing write
+/// mutex for one journal (the cross-process half is the flock inside
+/// [`ConnectionView::guarded`]). Cheap to clone — clones share the same underlying mutex, so
+/// every [`ConnectionView`] built from the same `WriterLock` contends on one lock. One per
+/// process/journal: over stdio that is one per server; a future multi-connection transport
+/// (HTTP, M6) clones the one `WriterLock` into each connection's view.
+#[derive(Clone, Default)]
+pub struct WriterLock(Arc<tokio::sync::Mutex<()>>);
+
+/// One connection's view of the ledger: its **last-seen epoch** (this connection's entry in
+/// the CAS directory) paired at construction with a shared handle to the process-wide
+/// [`WriterLock`]. The pairing is the point — the two halves have different cardinalities
+/// (per-process vs per-connection), and nesting the shared handle inside the per-connection
+/// struct makes it impossible to combine one connection's lock with another's view.
 ///
-/// On success the connection's `last_seen` is bumped to the new `HEAD` **only when the write
-/// landed on top of what the connection had already seen** (`last_seen == HEAD` before the
-/// op). A writer learns nothing about *other* connections' commits from its own append
-/// succeeding — an unconditional bump would mask any write that interleaved since this
-/// connection's last read, letting a later decide pass the CAS on a belief that never saw it.
-/// (`FullyInformedDecisions` in `proofs/tla/Ledger.tla` is the formal version; the `bump`
-/// spec-mutation demonstrates the unconditional variant is unsound.)
-pub async fn guarded_write<T, F, Fut>(
-    hledger: &Hledger,
-    write_lock: &tokio::sync::Mutex<()>,
-    last_seen: &tokio::sync::Mutex<Option<Epoch>>,
-    class: ToolClass,
-    op: F,
-) -> Result<T, WriteError>
-where
-    F: FnOnce(WriteGuard) -> Fut,
-    Fut: Future<Output = Result<T, WriteError>>,
-{
-    let journal = gate(hledger).await?;
-    ensure_journal_exists(&journal)?;
-    let dir = repo_dir(&journal);
-
-    let _guard = write_lock.lock().await;
-    let _flock = acquire_write_flock(&dir).await?;
-
-    let head_before = current_epoch(&journal)?;
-    if class == ToolClass::Decide {
-        let seen = last_seen.lock().await.clone();
-        crate::epoch::check(class, seen.as_ref(), &head_before).map_err(WriteError::StaleEpoch)?;
-    }
-
-    let out = op(WriteGuard(())).await?;
-
-    // Conditional bump, still inside the locks: only a write on top of an up-to-date view
-    // keeps the view up to date. (For a decide the guard above guarantees this branch.)
-    // A failed re-sample must NOT fail the already-committed write: clear the view instead
-    // (conservative — the connection re-reads before its next decide).
-    let mut seen = last_seen.lock().await;
-    if *seen == Some(head_before) {
-        match current_epoch(&journal) {
-            Ok(now) => *seen = Some(now),
-            Err(err) => {
-                tracing::warn!(%err, "post-write epoch sample failed; clearing last-seen");
-                *seen = None;
-            }
-        }
-    }
-    Ok(out)
+/// Both M3 ordering disciplines live here, as the only entry points that touch `last_seen`:
+/// [`Self::guarded`] (the write path) and [`Self::grounded_read`] (the read path).
+pub struct ConnectionView {
+    writer: WriterLock,
+    /// The `HEAD` this connection last **read** (`None` = never read). Decide calls are
+    /// CAS-checked against it *inside* the write locks; reads bump it (pre-read sample,
+    /// success only); a write bumps it only when it was already current ([`Self::guarded`]).
+    last_seen: tokio::sync::Mutex<Option<Epoch>>,
 }
 
-/// One-shot [`guarded_write`] with fresh in-process state — for tests and single-shot callers
-/// that don't hold a server's mutex/last-seen. Still fully serialized: the cross-process flock
-/// contends even between two handles in one process, and a fresh (never-read) last-seen makes
-/// any [`ToolClass::Decide`] call conservatively `STALE`.
+impl Default for ConnectionView {
+    /// A standalone view: fresh [`WriterLock`], never-read last-seen. Right for stdio (one
+    /// connection per process) and for one-shot callers; a multi-connection transport instead
+    /// shares one `WriterLock` across views via [`Self::new`].
+    fn default() -> Self {
+        Self::new(WriterLock::default())
+    }
+}
+
+impl ConnectionView {
+    /// A view for one connection over the process-wide `writer` lock (clone the same
+    /// [`WriterLock`] into every connection's view).
+    pub fn new(writer: WriterLock) -> Self {
+        Self {
+            writer,
+            last_seen: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// This connection's last-seen epoch (for `status`/diagnostics).
+    pub async fn last_seen(&self) -> Option<Epoch> {
+        self.last_seen.lock().await.clone()
+    }
+
+    /// The single write entry point (M3): every mutating tool call goes through here, declaring
+    /// its [`ToolClass`]. Runs `op` with **both** write locks held — the in-process
+    /// [`WriterLock`] (tasks within this process) and the cross-process flock (other server
+    /// processes on the same journal) — and applies the epoch CAS for [`ToolClass::Decide`]
+    /// calls **inside** those locks, so there is no check-to-commit gap (a TOCTOU would break
+    /// `NoLostDecision`; see `proofs/tla/Ledger.tla`). `op` receives the [`WriteGuard`] proof
+    /// the write ops require.
+    ///
+    /// On success the connection's `last_seen` is bumped to the new `HEAD` **only when the
+    /// write landed on top of what the connection had already seen** (`last_seen == HEAD`
+    /// before the op). A writer learns nothing about *other* connections' commits from its own
+    /// append succeeding — an unconditional bump would mask any write that interleaved since
+    /// this connection's last read, letting a later decide pass the CAS on a belief that never
+    /// saw it. (`FullyInformedDecisions` in `proofs/tla/Ledger.tla` is the formal version; the
+    /// `bump` spec-mutation demonstrates the unconditional variant is unsound.)
+    pub async fn guarded<T, F, Fut>(
+        &self,
+        hledger: &Hledger,
+        class: ToolClass,
+        op: F,
+    ) -> Result<T, WriteError>
+    where
+        F: FnOnce(WriteGuard) -> Fut,
+        Fut: Future<Output = Result<T, WriteError>>,
+    {
+        let journal = gate(hledger).await?;
+        ensure_journal_exists(&journal)?;
+        let dir = repo_dir(&journal);
+
+        let _guard = self.writer.0.lock().await;
+        let _flock = acquire_write_flock(&dir).await?;
+
+        let head_before = current_epoch(&journal)?;
+        if class == ToolClass::Decide {
+            let seen = self.last_seen.lock().await.clone();
+            crate::epoch::check(class, seen.as_ref(), &head_before)
+                .map_err(WriteError::StaleEpoch)?;
+        }
+
+        let out = op(WriteGuard(())).await?;
+
+        // Conditional bump, still inside the locks: only a write on top of an up-to-date view
+        // keeps the view up to date. (For a decide the guard above guarantees this branch.)
+        // A failed re-sample must NOT fail the already-committed write: clear the view instead
+        // (conservative — the connection re-reads before its next decide).
+        let mut seen = self.last_seen.lock().await;
+        if *seen == Some(head_before) {
+            match current_epoch(&journal) {
+                Ok(now) => *seen = Some(now),
+                Err(err) => {
+                    tracing::warn!(%err, "post-write epoch sample failed; clearing last-seen");
+                    *seen = None;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Run a ledger read with the grounding discipline built in: sample `HEAD` **before**
+    /// invoking hledger, and bump this connection's last-seen to that pre-read sample only on
+    /// success. Owning the ordering here makes it impossible for a (future) read tool to get
+    /// wrong — bumping to a *post*-read `HEAD` could record an epoch newer than the data
+    /// actually seen (the unsafe direction for the CAS); sampling before is conservative
+    /// (worst case a spurious `STALE` re-read). Every ledger-reading tool goes through this.
+    pub async fn grounded_read<T, E, F, Fut>(&self, hledger: &Hledger, op: F) -> Result<T, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        let epoch = hledger
+            .journal_path()
+            .and_then(|journal| current_epoch(journal).ok());
+        let out = op().await;
+        if out.is_ok()
+            && let Some(epoch) = epoch
+        {
+            *self.last_seen.lock().await = Some(epoch);
+        }
+        out
+    }
+}
+
+/// One-shot [`ConnectionView::guarded`] on a fresh [`ConnectionView`] — for tests and
+/// single-shot callers that don't hold a server's view. Still fully serialized: the
+/// cross-process flock contends even between two views in one process, and a fresh
+/// (never-read) last-seen makes any [`ToolClass::Decide`] call conservatively `STALE`.
 pub async fn guarded_once<T, F, Fut>(
     hledger: &Hledger,
     class: ToolClass,
@@ -224,9 +301,7 @@ where
     F: FnOnce(WriteGuard) -> Fut,
     Fut: Future<Output = Result<T, WriteError>>,
 {
-    let write_lock = tokio::sync::Mutex::new(());
-    let last_seen = tokio::sync::Mutex::new(None);
-    guarded_write(hledger, &write_lock, &last_seen, class, op).await
+    ConnectionView::default().guarded(hledger, class, op).await
 }
 
 /// Create the journal (and its directory) if missing, so reads/declared-set queries work and the

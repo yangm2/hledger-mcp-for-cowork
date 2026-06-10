@@ -57,14 +57,18 @@ data/version skew). Granularity is **whole-journal**: coarse, but the rare false
 re-read is acceptable precisely because contention is rare.
 
 **Implementation — the server tracks per-connection last-seen `HEAD`** (over stdio that is
-one field per server instance; the multi-connection directory materializes only with HTTP),
-*not* a token threaded through the model (an LLM won't reliably echo it). A read bumps that
+one `write::ConnectionView` per server instance; the multi-connection directory — one shared
+`WriterLock`, one view per connection — materializes only with HTTP), *not* a token threaded
+through the model (an LLM won't reliably echo it). A read bumps that
 connection's last-seen; a consequential call checks last-seen vs current `HEAD`; if behind →
 `STALE` → client re-reads, retries. No deadlock is possible (nothing is held), so progress
 is always available by re-reading.
 
 Two ordering disciplines the atomic-action spec doesn't show but the implementation must
-keep (both are check-then-act races of the kind M2's dedup-inside-the-mutex lesson covers):
+keep (both are check-then-act races of the kind M2's dedup-inside-the-mutex lesson covers).
+Both live structurally on `ConnectionView` — `guarded` (writes) and `grounded_read` (reads)
+are the only code paths that touch a connection's last-seen, so a new tool cannot re-derive
+the ordering wrongly:
 
 1. **The `STALE` check runs inside the write locks.** Check-then-commit with a gap lets
    another writer commit in between — a successful `Decide` that did *not* observe the

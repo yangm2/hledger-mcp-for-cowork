@@ -204,16 +204,18 @@ touches one place. This seam is covered by golden-file tests against recorded re
 ## Concurrency model (implemented in M3)
 
 Single serializing writer — two layers, since stdio multi-client = multi-*process*: the
-in-process async mutex + a cross-process advisory file lock (`.hledger-mcp.lock` beside the
-journal), both held across the whole dedup → validate → format → check → swap → commit
-sequence. Every write tool dispatches through **`write::guarded_write`** with a declared
-`ToolClass`; **the git commit IS the epoch** (one validated write = one commit). Idempotency
-via a write-once `; idem:<uuid>` tag. Consequential **decide** calls are epoch-checked *inside
-the locks* (reject `STALE` if the connection's last-seen HEAD ≠ current HEAD → re-read →
-retry); append-only **record** calls never are — today the whole surface is record; the first
-decide tool arrives with M4/M5 (`eco_approve`). Reads bump the connection's last-seen,
-sampling HEAD **before** the hledger read (conservative: a mid-read write leaves you stale,
-never falsely fresh). Accounts soft-delete by appending a tombstone-tagged directive
+in-process async mutex (`write::WriterLock`, one per process) + a cross-process advisory file
+lock (`.hledger-mcp.lock` beside the journal), both held across the whole dedup → validate →
+format → check → swap → commit sequence. Per-connection state (the last-seen epoch) pairs with
+a shared `WriterLock` handle in **`write::ConnectionView`**, which owns both ordering
+disciplines: every write tool dispatches through **`ConnectionView::guarded`** with a declared
+`ToolClass`, every read through **`ConnectionView::grounded_read`**. **The git commit IS the
+epoch** (one validated write = one commit). Idempotency via a write-once `; idem:<uuid>` tag.
+Consequential **decide** calls are epoch-checked *inside the locks* (reject `STALE` if the
+connection's last-seen HEAD ≠ current HEAD → re-read → retry); append-only **record** calls
+never are — today the whole surface is record; the first decide tool arrives with M4/M5
+(`eco_approve`). Reads bump the connection's last-seen, sampling HEAD **before** the hledger
+read (conservative: a mid-read write leaves you stale, never falsely fresh). Accounts soft-delete by appending a tombstone-tagged directive
 (`account <name>  ; tombstoned:`); postings to tombstoned accounts still resolve (C-4). Soft
 invariants (overdraft) surface as report **flags**, never write rejections (C-6). Formally
 checked: `proofs/tla/Ledger.tla` via the Rust `tla-checker` — `mise run tla` runs the model
@@ -224,7 +226,7 @@ TLC-compatible (`tla2tools.jar` is a drop-in fallback). The C-1…C-6 suite live
 ## Repository map
 
 - `src/` — the Rust crate: `hledger/` (the adapter seam), `write/` (the fail-closed pipeline +
-  `guarded_write`), `epoch.rs` (the pure CAS), `flags.rs` (soft invariants), `git.rs`,
+  `ConnectionView`), `epoch.rs` (the pure CAS), `flags.rs` (soft invariants), `git.rs`,
   `server.rs` (MCP tools), `protocol.rs`, `logging.rs`.
 - `tests/smoke.rs` — real-hledger e2e (write → `check --strict` → read → `git commit`);
   `tests/concurrency.rs` — the C-1…C-6 suite; `tests/mcp_stdio.rs` — wire-level e2e incl. the

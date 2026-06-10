@@ -2,19 +2,19 @@
 //! plus the carried M2 deferrals (crash-reconcile invalid→restore e2e; a dedicated C-3
 //! monotonicity test) and the read-ordering discipline.
 //!
-//! These drive the **production entry points** in-process: [`write::guarded_write`] with a
-//! declared [`ToolClass`] is exactly what every MCP write tool calls (and what the first
+//! These drive the **production entry points** in-process: [`write::ConnectionView::guarded`]
+//! with a declared [`ToolClass`] is exactly what every MCP write tool calls (and what the first
 //! decide-classified domain tool will call in M4/M5 — no MCP decide tool exists yet, so C-1's
-//! end-to-end variant lands there). Each "connection" below is a separate server-shaped pair of
-//! (in-process write mutex, last-seen slot) over the same journal — the in-process analogue of
-//! the real deployment, where every MCP host spawns its own server process on one journal.
+//! end-to-end variant lands there), and [`write::ConnectionView::grounded_read`] is the read
+//! path. Each "connection" below is its own [`write::ConnectionView`] over the same journal —
+//! the in-process analogue of the real deployment, where every MCP host spawns its own server
+//! process on one journal.
 //!
 //! All tests skip gracefully when hledger is absent (mirroring `tests/smoke.rs`).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use hledger_mcp_for_cowork::epoch::{Epoch, ToolClass};
+use hledger_mcp_for_cowork::epoch::ToolClass;
 use hledger_mcp_for_cowork::flags;
 use hledger_mcp_for_cowork::git::GitRepo;
 use hledger_mcp_for_cowork::hledger::Hledger;
@@ -38,34 +38,29 @@ fn hledger_bin() -> Option<String> {
     }
 }
 
-/// One "connection": its own in-process write mutex and last-seen slot, sharing the journal.
-/// This is the shape [`crate::server::HledgerMcp`] holds per instance.
+/// One "connection": its own [`write::ConnectionView`] (standalone — fresh writer lock, the
+/// multi-*process* analogue), sharing the journal. This is the shape
+/// [`crate::server::HledgerMcp`] holds per instance.
 struct Conn {
     hledger: Hledger,
-    journal: PathBuf,
-    write_lock: Arc<tokio::sync::Mutex<()>>,
-    last_seen: Arc<tokio::sync::Mutex<Option<Epoch>>>,
+    view: write::ConnectionView,
 }
 
 impl Conn {
     fn new(bin: &str, journal: &Path) -> Self {
         Self {
             hledger: Hledger::new(bin, Some(journal.to_path_buf())),
-            journal: journal.to_path_buf(),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            last_seen: Arc::new(tokio::sync::Mutex::new(None)),
+            view: write::ConnectionView::default(),
         }
     }
 
-    /// A read, as the server performs it: sample HEAD **before** the hledger read, bump
-    /// last-seen to that pre-sample after the read succeeds.
+    /// A read, as the server performs it — through the production `grounded_read` (pre-read
+    /// sample, bump on success).
     async fn read(&self) {
-        let epoch = write::current_epoch(&self.journal).expect("sample epoch");
-        self.hledger
-            .list_transactions(&[])
+        self.view
+            .grounded_read(&self.hledger, || self.hledger.list_transactions(&[]))
             .await
             .expect("read journal");
-        *self.last_seen.lock().await = Some(epoch);
     }
 
     /// A guarded write of the given class posting `input` — the production dispatch path
@@ -75,14 +70,11 @@ impl Conn {
         class: ToolClass,
         input: TransactionInput,
     ) -> Result<write::WriteOutcome, WriteError> {
-        write::guarded_write(
-            &self.hledger,
-            &self.write_lock,
-            &self.last_seen,
-            class,
-            |proof| async move { write::post_transaction(&proof, &self.hledger, input).await },
-        )
-        .await
+        self.view
+            .guarded(&self.hledger, class, |proof| async move {
+                write::post_transaction(&proof, &self.hledger, input).await
+            })
+            .await
     }
 }
 
@@ -294,15 +286,12 @@ async fn c4_posting_to_tombstoned_account_resolves() {
     .await
     .expect("pre-tombstone post");
     let hl = &a.hledger;
-    write::guarded_write(
-        hl,
-        &a.write_lock,
-        &a.last_seen,
-        ToolClass::Record,
-        |proof| async move { write::tombstone_account(&proof, hl, "expenses:misc").await },
-    )
-    .await
-    .expect("tombstone");
+    a.view
+        .guarded(hl, ToolClass::Record, |proof| async move {
+            write::tombstone_account(&proof, hl, "expenses:misc").await
+        })
+        .await
+        .expect("tombstone");
 
     let tombstoned = a.hledger.tombstoned_accounts().await.expect("tombstoned");
     assert_eq!(tombstoned, vec!["expenses:misc".to_string()]);
@@ -496,18 +485,21 @@ async fn read_bump_uses_pre_read_sample_so_midread_writes_keep_us_stale() {
     let a = Conn::new(&bin, &journal);
     let b = Conn::new(&bin, &journal);
 
-    // A samples (as its read begins)…
-    let pre = write::current_epoch(&journal).expect("sample");
-    a.hledger.list_transactions(&[]).await.expect("read");
-    // …B commits while A's read is in flight…
-    b.guarded_post(
-        ToolClass::Record,
-        txn("midread", "expenses:misc", "1.00", None),
-    )
-    .await
-    .expect("mid-read write");
-    // …and A bumps with the PRE-read sample (what the server does).
-    *a.last_seen.lock().await = Some(pre);
+    // A reads through the production `grounded_read`; B's write lands while A's read op is
+    // in flight (after the pre-read sample, before the bump) — the racy interleaving.
+    a.view
+        .grounded_read(&a.hledger, || async {
+            let out = a.hledger.list_transactions(&[]).await;
+            b.guarded_post(
+                ToolClass::Record,
+                txn("midread", "expenses:misc", "1.00", None),
+            )
+            .await
+            .expect("mid-read write");
+            out
+        })
+        .await
+        .expect("read");
 
     // A's decide must see STALE: its data may predate B's write.
     let err = a

@@ -1,6 +1,6 @@
 //! The stdio `rmcp` MCP server: read tools (M1), write tools (M2), and the epoch-CAS
-//! concurrency layer (M3 — per-connection last-seen `HEAD`, record-vs-decide via
-//! [`write::guarded_write`], soft-invariant flags).
+//! concurrency layer (M3 — per-connection [`write::ConnectionView`], record-vs-decide via
+//! [`write::ConnectionView::guarded`], soft-invariant flags).
 //!
 //! Capabilities declared: **`tools` only** (no `resources`/`prompts` yet — M5). The
 //! `initialize` override emits the handshake wire-log and negotiates the protocol
@@ -21,7 +21,9 @@ use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router
 use crate::epoch::{Epoch, ToolClass, short_oid};
 use crate::hledger::amount::render_amounts;
 use crate::hledger::{BalanceReport, Hledger, HledgerError, PINNED_VERSION, Transaction};
-use crate::write::{self, WriteError, WriteGuard, WriteOutcome, input::TransactionInput};
+use crate::write::{
+    self, ConnectionView, WriteError, WriteGuard, WriteOutcome, input::TransactionInput,
+};
 
 const SERVER_NAME: &str = "hledger-mcp";
 
@@ -106,18 +108,13 @@ pub struct CloseAccountArgs {
 pub struct HledgerMcp {
     started: Instant,
     hledger: Hledger,
-    /// Serializes the write path **within this process** (single-writer invariant): every write
-    /// op holds this for the whole dedup → validate → format → check → swap → commit sequence,
-    /// so concurrent writes don't interleave and idempotency has no TOCTOU window. The matching
-    /// **cross-process** lock (stdio multi-client = multi-process) is the flock inside
-    /// [`write::guarded_write`].
-    write_lock: Arc<tokio::sync::Mutex<()>>,
-    /// The epoch CAS directory (M3): the `HEAD` this connection last **read**. Over stdio there
-    /// is exactly one connection per server instance, so a single slot is per-connection by
-    /// construction (the multi-connection directory arrives with HTTP, M6). Read tools bump it
-    /// (via [`Self::grounded_read`], which owns the sample-before-read ordering); decide calls
-    /// are checked against it.
-    last_seen: Arc<tokio::sync::Mutex<Option<Epoch>>>,
+    /// This connection's [`ConnectionView`] (M3): the per-connection last-seen epoch paired
+    /// with the process-wide writer lock. Over stdio there is exactly one connection per server
+    /// process, so one standalone view (the multi-connection directory — one `WriterLock`, one
+    /// view per connection — arrives with HTTP, M6). All reads go through
+    /// [`ConnectionView::grounded_read`], all writes through [`ConnectionView::guarded`]; both
+    /// ordering disciplines live on the view, not here.
+    view: Arc<ConnectionView>,
     /// When `Some`, writes are refused (with the reason) — set when startup reconciliation
     /// failed, so the working tree may hold unreconciled content a write would silently absorb
     /// into its commit. Self-healing: the next write attempt retries `reconcile` and clears
@@ -138,8 +135,7 @@ impl HledgerMcp {
         Self {
             started: Instant::now(),
             hledger,
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            last_seen: Arc::new(tokio::sync::Mutex::new(None)),
+            view: Arc::new(ConnectionView::default()),
             write_block: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
@@ -158,27 +154,6 @@ impl HledgerMcp {
     fn sample_epoch(&self) -> Option<Epoch> {
         let journal = self.hledger.journal_path()?;
         write::current_epoch(journal).ok()
-    }
-
-    /// Run a ledger read with the grounding discipline built in: sample `HEAD` **before**
-    /// invoking hledger, and bump this connection's last-seen to that pre-read sample only on
-    /// success. Owning the ordering here makes it impossible for a (future) read tool to get
-    /// wrong — bumping to a *post*-read `HEAD` could record an epoch newer than the data
-    /// actually seen (the unsafe direction for the CAS); sampling before is conservative
-    /// (worst case a spurious `STALE` re-read). Every ledger-reading tool goes through this.
-    async fn grounded_read<T, E, F, Fut>(&self, op: F) -> Result<T, E>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<T, E>>,
-    {
-        let epoch = self.sample_epoch();
-        let out = op().await;
-        if out.is_ok()
-            && let Some(epoch) = epoch
-        {
-            *self.last_seen.lock().await = Some(epoch);
-        }
-        out
     }
 
     /// Report server health: name, version, the session's **negotiated** protocol version,
@@ -234,7 +209,7 @@ impl HledgerMcp {
         // The epoch story (M3): current HEAD vs what this connection last read.
         let epoch = match self.sample_epoch() {
             Some(head) => {
-                let seen = self.last_seen.lock().await.clone();
+                let seen = self.view.last_seen().await;
                 let connection = match &seen {
                     Some(seen) if *seen == head => format!("last-seen {} (fresh)", seen.short()),
                     Some(seen) => format!("last-seen {} (STALE — re-read)", seen.short()),
@@ -289,7 +264,8 @@ impl HledgerMcp {
             Err(err) => return Ok(err),
         };
         let result = self
-            .grounded_read(|| self.hledger.balance(Some(&args.account)))
+            .view
+            .grounded_read(&self.hledger, || self.hledger.balance(Some(&args.account)))
             .await;
         match result {
             Ok(report) => {
@@ -324,7 +300,8 @@ impl HledgerMcp {
         };
         let terms = args.query.unwrap_or_default();
         let result = self
-            .grounded_read(|| self.hledger.list_transactions(&terms))
+            .view
+            .grounded_read(&self.hledger, || self.hledger.list_transactions(&terms))
             .await;
         match result {
             Ok(txns) => Ok(CallToolResult::success(vec![Content::text(
@@ -334,10 +311,10 @@ impl HledgerMcp {
         }
     }
 
-    /// Run a write tool through [`write::guarded_write`] with this connection's locks and
-    /// last-seen slot, rendering the outcome — the single dispatch point where a tool's
-    /// [`ToolClass`] takes effect (and where every write-tool body collapses to one call).
-    /// `op` receives the [`WriteGuard`] proof the write ops require.
+    /// Run a write tool through this connection's [`ConnectionView::guarded`], rendering the
+    /// outcome — the single dispatch point where a tool's [`ToolClass`] takes effect (and
+    /// where every write-tool body collapses to one call). `op` receives the [`WriteGuard`]
+    /// proof the write ops require.
     ///
     /// If writes are blocked (startup reconciliation failed), retries the reconcile first and
     /// self-heals on success; otherwise refuses with the reason — a write against an
@@ -368,8 +345,7 @@ impl HledgerMcp {
                 }
             }
         }
-        let result =
-            write::guarded_write(&self.hledger, &self.write_lock, &self.last_seen, class, op).await;
+        let result = self.view.guarded(&self.hledger, class, op).await;
         match result {
             Ok(out) => Ok(CallToolResult::success(vec![Content::text(render(&out))])),
             Err(err) => Ok(write_error_result(err)),
@@ -535,7 +511,7 @@ impl HledgerMcp {
     /// Replace a transaction: void the original and post a replacement (two entries, no edit).
     /// **Record** — a correction (void + re-post), not a decision; never epoch-checked. (The
     /// first *decide*-classified tool arrives with the M4/M5 domain surface, e.g.
-    /// `eco_approve`; the CAS mechanism it will use is [`Self::guarded`].)
+    /// `eco_approve`; the CAS mechanism it will use is [`ConnectionView::guarded`].)
     #[tool(
         description = "Replace a transaction: void the original (reversing entry) and post a \
                       replacement. This is two appended transactions, not an in-place edit. \
