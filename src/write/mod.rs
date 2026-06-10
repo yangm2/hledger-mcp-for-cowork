@@ -156,20 +156,25 @@ pub fn current_epoch(journal: &Path) -> Result<Epoch, WriteError> {
 /// the gate" a compile-time invariant rather than a convention.
 struct WriteGuard(());
 
-/// The execution context passed into every write operation: the resolved journal path (already
-/// validated by [`gate`] and version-checked) and a reference to the hledger adapter — plus the
-/// [`WriteGuard`] that proves the locks are held. The only way to obtain one is through
-/// [`ConnectionView::guarded`] or [`guarded_once`]; the private fields make outside construction
-/// a compile error.
+/// The execution context passed into every write operation: the hledger adapter (which carries
+/// the journal path) plus the [`WriteGuard`] that proves the locks are held. The only way to
+/// obtain one is through [`ConnectionView::guarded`] or [`guarded_once`]; the private fields
+/// make outside construction a compile error.
 ///
 /// Replaces the `(_proof: &WriteGuard, hledger: &Hledger)` two-arg pattern: write ops take
-/// `ctx: &WriteContext<'_>` and access `ctx.journal` / `ctx.hledger` directly, with no
-/// repeated [`gate`] call.
+/// `ctx: &WriteContext<'_>` and access `ctx.hledger` and `ctx.journal()` directly.
 pub struct WriteContext<'hledger> {
     pub(crate) hledger: &'hledger Hledger,
-    /// Resolved at gate time; cached here so inner ops skip the `journal_path` re-derivation.
-    pub(crate) journal: PathBuf,
     _guard: WriteGuard,
+}
+
+impl WriteContext<'_> {
+    /// The journal path. [`gate`] already verified it is `Some`; the `expect` is unreachable.
+    pub(crate) fn journal(&self) -> &Path {
+        self.hledger
+            .journal_path()
+            .expect("gate verified journal is configured")
+    }
 }
 
 /// The **process-wide** half of the single-writer invariant: the in-process serializing write
@@ -261,7 +266,6 @@ impl ConnectionView {
 
         let ctx = WriteContext {
             hledger,
-            journal: journal.clone(),
             _guard: WriteGuard(()),
         };
         let out = op(ctx).await?;
@@ -448,7 +452,7 @@ pub async fn post_transaction(
     ctx: &WriteContext<'_>,
     input: TransactionInput,
 ) -> Result<WriteOutcome, WriteError> {
-    let journal = &ctx.journal;
+    let journal = ctx.journal();
     ensure_journal_exists(journal)?;
 
     let idem = input
@@ -514,7 +518,7 @@ pub async fn void_transaction(
     ctx: &WriteContext<'_>,
     target_id: &str,
 ) -> Result<WriteOutcome, WriteError> {
-    let journal = &ctx.journal;
+    let journal = ctx.journal();
     ensure_journal_exists(journal)?;
 
     let matches = find_by_exact_tag(ctx.hledger, "id", target_id)
@@ -596,7 +600,7 @@ pub async fn declare_account(ctx: &WriteContext<'_>, name: &str) -> Result<Strin
     }
     append_and_commit(
         ctx.hledger,
-        &ctx.journal,
+        ctx.journal(),
         &format!("account {name}\n"),
         "declare account",
     )
@@ -631,7 +635,7 @@ pub async fn declare_commodity(
     } else {
         format!("commodity {sample_number} {symbol}\n")
     };
-    append_and_commit(ctx.hledger, &ctx.journal, &directive, "declare commodity").await
+    append_and_commit(ctx.hledger, ctx.journal(), &directive, "declare commodity").await
 }
 
 /// `tombstone_account`: **soft-delete** an account by appending a duplicate `account` directive
@@ -640,7 +644,7 @@ pub async fn declare_commodity(
 /// existing references and even new postings still resolve (C-4) — nothing is ever hard-deleted.
 /// Idempotent: re-tombstoning an already-tombstoned account is a no-op returning current `HEAD`.
 pub async fn tombstone_account(ctx: &WriteContext<'_>, name: &str) -> Result<String, WriteError> {
-    let journal = &ctx.journal;
+    let journal = ctx.journal();
     ensure_journal_exists(journal)?;
     let name = name.trim();
     let declared: HashSet<String> = ctx
@@ -789,10 +793,9 @@ mod tests {
 
     /// Build a [`WriteContext`] without going through the gate — unit tests only. The private
     /// fields are reachable from this child module; integration tests use `guarded_once`.
-    fn ctx(hledger: &Hledger, journal: PathBuf) -> WriteContext<'_> {
+    fn ctx(hledger: &Hledger) -> WriteContext<'_> {
         WriteContext {
             hledger,
-            journal,
             _guard: WriteGuard(()),
         }
     }
@@ -916,12 +919,8 @@ mod tests {
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
         // Bootstrap a committed, valid journal.
-        declare_commodity(&ctx(&hl, journal.clone()), "$", 2)
-            .await
-            .unwrap();
-        declare_account(&ctx(&hl, journal.clone()), "assets:checking")
-            .await
-            .unwrap();
+        declare_commodity(&ctx(&hl), "$", 2).await.unwrap();
+        declare_account(&ctx(&hl), "assets:checking").await.unwrap();
         let before = std::fs::read_to_string(&journal).unwrap();
 
         // Deliberately malformed (unbalanced single posting) — simulates a formatter bug. The
@@ -953,9 +952,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
-        declare_commodity(&ctx(&hl, journal.clone()), "$", 2)
-            .await
-            .unwrap();
+        declare_commodity(&ctx(&hl), "$", 2).await.unwrap();
         let committed = GitRepo::open(dir.path())
             .unwrap()
             .unwrap()
@@ -1003,15 +1000,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
-        declare_commodity(&ctx(&hl, journal.clone()), "$", 2)
-            .await
-            .unwrap();
-        declare_account(&ctx(&hl, journal.clone()), "assets:checking")
-            .await
-            .unwrap();
-        declare_account(&ctx(&hl, journal.clone()), "equity:opening")
-            .await
-            .unwrap();
+        declare_commodity(&ctx(&hl), "$", 2).await.unwrap();
+        declare_account(&ctx(&hl), "assets:checking").await.unwrap();
+        declare_account(&ctx(&hl), "equity:opening").await.unwrap();
 
         let entry = |idem: &str| TransactionInput {
             date: "2026-01-01".into(),
@@ -1033,19 +1024,13 @@ mod tests {
             idem: Some(idem.to_string()),
         };
 
-        let first = post_transaction(&ctx(&hl, journal.clone()), entry("txn-1"))
-            .await
-            .unwrap();
+        let first = post_transaction(&ctx(&hl), entry("txn-1")).await.unwrap();
         assert!(!first.deduped);
-        let second = post_transaction(&ctx(&hl, journal.clone()), entry("txn-10"))
-            .await
-            .unwrap();
+        let second = post_transaction(&ctx(&hl), entry("txn-10")).await.unwrap();
         assert!(!second.deduped, "txn-10 must not dedup against txn-1");
 
         // And an exact retry of txn-1 *does* dedup.
-        let retry = post_transaction(&ctx(&hl, journal.clone()), entry("txn-1"))
-            .await
-            .unwrap();
+        let retry = post_transaction(&ctx(&hl), entry("txn-1")).await.unwrap();
         assert!(retry.deduped, "exact idem retry deduplicates");
 
         let all = hl.list_transactions(&[]).await.unwrap();
@@ -1062,15 +1047,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
-        declare_commodity(&ctx(&hl, journal.clone()), "$", 2)
-            .await
-            .unwrap();
-        declare_account(&ctx(&hl, journal.clone()), "assets:checking")
-            .await
-            .unwrap();
-        declare_account(&ctx(&hl, journal.clone()), "equity:opening")
-            .await
-            .unwrap();
+        declare_commodity(&ctx(&hl), "$", 2).await.unwrap();
+        declare_account(&ctx(&hl), "assets:checking").await.unwrap();
+        declare_account(&ctx(&hl), "equity:opening").await.unwrap();
 
         let mk = |postings: Vec<(&str, Option<&str>)>| TransactionInput {
             date: "2026-01-01".into(),
@@ -1090,7 +1069,7 @@ mod tests {
         };
 
         let posted = post_transaction(
-            &ctx(&hl, journal.clone()),
+            &ctx(&hl),
             mk(vec![
                 ("assets:checking", Some("10.00")),
                 ("equity:opening", None),
@@ -1104,7 +1083,7 @@ mod tests {
             ("assets:savings", Some("10.00")),
             ("equity:opening", None),
         ]);
-        let err = update_transaction(&ctx(&hl, journal.clone()), &posted.id, bad)
+        let err = update_transaction(&ctx(&hl), &posted.id, bad)
             .await
             .expect_err("invalid replacement must fail");
         assert!(matches!(err, WriteError::Input(_)), "{err:?}");
@@ -1127,9 +1106,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
-        declare_commodity(&ctx(&hl, journal.clone()), "$", 2)
-            .await
-            .unwrap();
+        declare_commodity(&ctx(&hl), "$", 2).await.unwrap();
         let head_before = GitRepo::open(dir.path())
             .unwrap()
             .unwrap()
