@@ -71,8 +71,8 @@ impl Conn {
         input: TransactionInput,
     ) -> Result<write::WriteOutcome, WriteError> {
         self.view
-            .guarded(&self.hledger, class, |proof| async move {
-                write::post_transaction(&proof, &self.hledger, input).await
+            .guarded(&self.hledger, class, async |ctx| {
+                write::post_transaction(&ctx, input).await
             })
             .await
     }
@@ -106,14 +106,14 @@ async fn setup(bin: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let journal = dir.path().join("main.journal");
     let hl = &Hledger::new(bin, Some(journal.clone()));
-    write::guarded_once(hl, ToolClass::Record, |proof| async move {
-        write::declare_commodity(&proof, hl, "$", 2).await
+    write::guarded_once(hl, ToolClass::Record, async |ctx| {
+        write::declare_commodity(&ctx, "$", 2).await
     })
     .await
     .expect("$");
     for account in ["assets:checking", "expenses:misc", "equity:opening"] {
-        write::guarded_once(hl, ToolClass::Record, |proof| async move {
-            write::declare_account(&proof, hl, account).await
+        write::guarded_once(hl, ToolClass::Record, async |ctx| {
+            write::declare_account(&ctx, account).await
         })
         .await
         .expect(account);
@@ -287,8 +287,8 @@ async fn c4_posting_to_tombstoned_account_resolves() {
     .expect("pre-tombstone post");
     let hl = &a.hledger;
     a.view
-        .guarded(hl, ToolClass::Record, |proof| async move {
-            write::tombstone_account(&proof, hl, "expenses:misc").await
+        .guarded(hl, ToolClass::Record, async |ctx| {
+            write::tombstone_account(&ctx, "expenses:misc").await
         })
         .await
         .expect("tombstone");
@@ -311,16 +311,16 @@ async fn c4_posting_to_tombstoned_account_resolves() {
 
     // Tombstoning is idempotent (a repeat is a no-op at the current epoch, not an error).
     let head_before = write::current_epoch(&journal).expect("epoch");
-    let again = write::guarded_once(hl, ToolClass::Record, |proof| async move {
-        write::tombstone_account(&proof, hl, "expenses:misc").await
+    let again = write::guarded_once(hl, ToolClass::Record, async |ctx| {
+        write::tombstone_account(&ctx, "expenses:misc").await
     })
     .await
     .expect("idempotent re-tombstone");
     assert_eq!(Some(again.as_str()), head_before.oid(), "no new commit");
 
     // Tombstoning an undeclared account is a correctable input error.
-    let err = write::guarded_once(hl, ToolClass::Record, |proof| async move {
-        write::tombstone_account(&proof, hl, "no:such").await
+    let err = write::guarded_once(hl, ToolClass::Record, async |ctx| {
+        write::tombstone_account(&ctx, "no:such").await
     })
     .await
     .expect_err("undeclared");

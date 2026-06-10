@@ -129,15 +129,15 @@ use hledger_mcp_for_cowork::write::{
 // invariant), so the e2e drives them through `guarded_once` — the production locking path.
 
 async fn declare_commodity(hl: &Hledger, symbol: &str, places: u32) -> Result<String, WriteError> {
-    write::guarded_once(hl, ToolClass::Record, |proof| async move {
-        write::declare_commodity(&proof, hl, symbol, places).await
+    write::guarded_once(hl, ToolClass::Record, async |ctx| {
+        write::declare_commodity(&ctx, symbol, places).await
     })
     .await
 }
 
 async fn declare_account(hl: &Hledger, name: &str) -> Result<String, WriteError> {
-    write::guarded_once(hl, ToolClass::Record, |proof| async move {
-        write::declare_account(&proof, hl, name).await
+    write::guarded_once(hl, ToolClass::Record, async |ctx| {
+        write::declare_account(&ctx, name).await
     })
     .await
 }
@@ -146,15 +146,15 @@ async fn post_transaction(
     hl: &Hledger,
     input: TransactionInput,
 ) -> Result<WriteOutcome, WriteError> {
-    write::guarded_once(hl, ToolClass::Record, |proof| async move {
-        write::post_transaction(&proof, hl, input).await
+    write::guarded_once(hl, ToolClass::Record, async |ctx| {
+        write::post_transaction(&ctx, input).await
     })
     .await
 }
 
 async fn void_transaction(hl: &Hledger, id: &str) -> Result<WriteOutcome, WriteError> {
-    write::guarded_once(hl, ToolClass::Record, |proof| async move {
-        write::void_transaction(&proof, hl, id).await
+    write::guarded_once(hl, ToolClass::Record, async |ctx| {
+        write::void_transaction(&ctx, id).await
     })
     .await
 }

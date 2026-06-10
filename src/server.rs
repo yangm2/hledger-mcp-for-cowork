@@ -21,8 +21,10 @@ use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router
 use crate::epoch::{Epoch, ToolClass, short_oid};
 use crate::hledger::amount::render_amounts;
 use crate::hledger::{BalanceReport, Hledger, HledgerError, PINNED_VERSION, Transaction};
+use std::ops::AsyncFnOnce;
+
 use crate::write::{
-    self, ConnectionView, WriteError, WriteGuard, WriteOutcome, input::TransactionInput,
+    self, ConnectionView, WriteContext, WriteError, WriteOutcome, input::TransactionInput,
 };
 
 const SERVER_NAME: &str = "hledger-mcp";
@@ -313,21 +315,20 @@ impl HledgerMcp {
 
     /// Run a write tool through this connection's [`ConnectionView::guarded`], rendering the
     /// outcome — the single dispatch point where a tool's [`ToolClass`] takes effect (and
-    /// where every write-tool body collapses to one call). `op` receives the [`WriteGuard`]
-    /// proof the write ops require.
+    /// where every write-tool body collapses to one call). `op` receives a [`WriteContext`]
+    /// that carries the resolved journal, the hledger adapter, and proof the gate ran.
     ///
     /// If writes are blocked (startup reconciliation failed), retries the reconcile first and
     /// self-heals on success; otherwise refuses with the reason — a write against an
     /// unreconciled tree would silently absorb foreign content into its commit.
-    async fn guarded_tool<T, F, Fut>(
+    async fn guarded_tool<T, F>(
         &self,
         class: ToolClass,
         op: F,
         render: impl FnOnce(&T) -> String,
     ) -> Result<CallToolResult, McpError>
     where
-        F: FnOnce(WriteGuard) -> Fut,
-        Fut: Future<Output = Result<T, WriteError>>,
+        F: AsyncFnOnce(WriteContext<'_>) -> Result<T, WriteError>,
     {
         {
             let mut block = self.write_block.lock().await;
@@ -371,7 +372,7 @@ impl HledgerMcp {
         let account = args.account.clone();
         self.guarded_tool(
             ToolClass::Record,
-            |proof| async move { write::declare_account(&proof, &self.hledger, &account).await },
+            async |ctx| write::declare_account(&ctx, &account).await,
             |commit| {
                 format!(
                     "declared account '{}' (commit {})",
@@ -403,7 +404,7 @@ impl HledgerMcp {
         let account = args.account.clone();
         self.guarded_tool(
             ToolClass::Record,
-            |proof| async move { write::tombstone_account(&proof, &self.hledger, &account).await },
+            async |ctx| write::tombstone_account(&ctx, &account).await,
             |commit| {
                 format!(
                     "closed (tombstoned) account '{}' (commit {})",
@@ -434,9 +435,7 @@ impl HledgerMcp {
         let commodity = args.commodity.clone();
         self.guarded_tool(
             ToolClass::Record,
-            |proof| async move {
-                write::declare_commodity(&proof, &self.hledger, &commodity, places).await
-            },
+            async |ctx| write::declare_commodity(&ctx, &commodity, places).await,
             |commit| {
                 format!(
                     "declared commodity '{}' ({} dp, commit {})",
@@ -470,7 +469,7 @@ impl HledgerMcp {
         };
         self.guarded_tool(
             ToolClass::Record,
-            |proof| async move { write::post_transaction(&proof, &self.hledger, input).await },
+            async |ctx| write::post_transaction(&ctx, input).await,
             post_outcome_text,
         )
         .await
@@ -495,7 +494,7 @@ impl HledgerMcp {
         let id = args.id.clone();
         self.guarded_tool(
             ToolClass::Record,
-            |proof| async move { write::void_transaction(&proof, &self.hledger, &id).await },
+            async |ctx| write::void_transaction(&ctx, &id).await,
             |outcome: &WriteOutcome| {
                 format!(
                     "voided '{}' with reversing entry id:{} (commit {})",
@@ -529,9 +528,7 @@ impl HledgerMcp {
         let id = args.id.clone();
         self.guarded_tool(
             ToolClass::Record,
-            |proof| async move {
-                write::update_transaction(&proof, &self.hledger, &id, args.transaction).await
-            },
+            async |ctx| write::update_transaction(&ctx, &id, args.transaction).await,
             |outcome: &WriteOutcome| {
                 format!(
                     "updated: voided '{}', posted replacement id:{} (commit {})",

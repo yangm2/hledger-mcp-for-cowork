@@ -20,6 +20,7 @@ pub mod input;
 pub mod validate;
 
 use std::collections::HashSet;
+use std::ops::AsyncFnOnce;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -150,12 +151,26 @@ pub fn current_epoch(journal: &Path) -> Result<Epoch, WriteError> {
     }
 }
 
-/// Proof that the write locks are held and the epoch CAS ran: every write op demands one, and
-/// the **only** way to mint one is [`ConnectionView::guarded`] / [`guarded_once`] (the private
-/// unit field makes outside construction a compile error). This turns "every write goes through
-/// the gate" from a convention into a type-level invariant — a future tool calling
-/// `write::post_transaction` directly simply does not compile without the gate.
-pub struct WriteGuard(());
+/// Proof that the write locks are held and the epoch CAS ran. Private unit field — only
+/// [`ConnectionView::guarded`] / [`guarded_once`] can mint one, making "every write goes through
+/// the gate" a compile-time invariant rather than a convention.
+struct WriteGuard(());
+
+/// The execution context passed into every write operation: the resolved journal path (already
+/// validated by [`gate`] and version-checked) and a reference to the hledger adapter — plus the
+/// [`WriteGuard`] that proves the locks are held. The only way to obtain one is through
+/// [`ConnectionView::guarded`] or [`guarded_once`]; the private fields make outside construction
+/// a compile error.
+///
+/// Replaces the `(_proof: &WriteGuard, hledger: &Hledger)` two-arg pattern: write ops take
+/// `ctx: &WriteContext<'_>` and access `ctx.journal` / `ctx.hledger` directly, with no
+/// repeated [`gate`] call.
+pub struct WriteContext<'hledger> {
+    pub(crate) hledger: &'hledger Hledger,
+    /// Resolved at gate time; cached here so inner ops skip the `journal_path` re-derivation.
+    pub(crate) journal: PathBuf,
+    _guard: WriteGuard,
+}
 
 /// The **process-wide** half of the single-writer invariant: the in-process serializing write
 /// mutex for one journal (the cross-process half is the flock inside
@@ -211,8 +226,8 @@ impl ConnectionView {
     /// [`WriterLock`] (tasks within this process) and the cross-process flock (other server
     /// processes on the same journal) — and applies the epoch CAS for [`ToolClass::Decide`]
     /// calls **inside** those locks, so there is no check-to-commit gap (a TOCTOU would break
-    /// `NoLostDecision`; see `proofs/tla/Ledger.tla`). `op` receives the [`WriteGuard`] proof
-    /// the write ops require.
+    /// `NoLostDecision`; see `proofs/tla/Ledger.tla`). `op` receives a [`WriteContext`] that
+    /// carries the resolved journal path, the hledger adapter, and the proof that the gate ran.
     ///
     /// On success the connection's `last_seen` is bumped to the new `HEAD` **only when the
     /// write landed on top of what the connection had already seen** (`last_seen == HEAD`
@@ -221,21 +236,20 @@ impl ConnectionView {
     /// this connection's last read, letting a later decide pass the CAS on a belief that never
     /// saw it. (`FullyInformedDecisions` in `proofs/tla/Ledger.tla` is the formal version; the
     /// `bump` spec-mutation demonstrates the unconditional variant is unsound.)
-    pub async fn guarded<T, F, Fut>(
+    pub async fn guarded<T, F>(
         &self,
         hledger: &Hledger,
         class: ToolClass,
         op: F,
     ) -> Result<T, WriteError>
     where
-        F: FnOnce(WriteGuard) -> Fut,
-        Fut: Future<Output = Result<T, WriteError>>,
+        F: AsyncFnOnce(WriteContext<'_>) -> Result<T, WriteError>,
     {
         let journal = gate(hledger).await?;
         ensure_journal_exists(&journal)?;
         let dir = repo_dir(&journal);
 
-        let _guard = self.writer.0.lock().await;
+        let _writer_guard = self.writer.0.lock().await;
         let _flock = acquire_write_flock(&dir).await?;
 
         let head_before = current_epoch(&journal)?;
@@ -245,7 +259,12 @@ impl ConnectionView {
                 .map_err(WriteError::StaleEpoch)?;
         }
 
-        let out = op(WriteGuard(())).await?;
+        let ctx = WriteContext {
+            hledger,
+            journal: journal.clone(),
+            _guard: WriteGuard(()),
+        };
+        let out = op(ctx).await?;
 
         // Conditional bump, still inside the locks: only a write on top of an up-to-date view
         // keeps the view up to date. (For a decide the guard above guarantees this branch.)
@@ -292,14 +311,9 @@ impl ConnectionView {
 /// single-shot callers that don't hold a server's view. Still fully serialized: the
 /// cross-process flock contends even between two views in one process, and a fresh
 /// (never-read) last-seen makes any [`ToolClass::Decide`] call conservatively `STALE`.
-pub async fn guarded_once<T, F, Fut>(
-    hledger: &Hledger,
-    class: ToolClass,
-    op: F,
-) -> Result<T, WriteError>
+pub async fn guarded_once<T, F>(hledger: &Hledger, class: ToolClass, op: F) -> Result<T, WriteError>
 where
-    F: FnOnce(WriteGuard) -> Fut,
-    Fut: Future<Output = Result<T, WriteError>>,
+    F: AsyncFnOnce(WriteContext<'_>) -> Result<T, WriteError>,
 {
     ConnectionView::default().guarded(hledger, class, op).await
 }
@@ -428,15 +442,14 @@ async fn declared_sets(
 }
 
 /// `post_transaction`: validate → format (stamping `id:`/`idem:`) → candidate → check → swap →
-/// commit. Idempotent on the `idem` key (dedup runs here, under the locks the [`WriteGuard`]
+/// commit. Idempotent on the `idem` key (dedup runs here, under the locks the [`WriteContext`]
 /// proves are held).
 pub async fn post_transaction(
-    _proof: &WriteGuard,
-    hledger: &Hledger,
+    ctx: &WriteContext<'_>,
     input: TransactionInput,
 ) -> Result<WriteOutcome, WriteError> {
-    let journal = gate(hledger).await?;
-    ensure_journal_exists(&journal)?;
+    let journal = &ctx.journal;
+    ensure_journal_exists(journal)?;
 
     let idem = input
         .idem
@@ -444,11 +457,11 @@ pub async fn post_transaction(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // Idempotency: a prior write with this *exact* idem tag means "already done".
-    let existing = find_by_exact_tag(hledger, "idem", &idem)
+    let existing = find_by_exact_tag(ctx.hledger, "idem", &idem)
         .await
         .map_err(|e| WriteError::Internal(format!("idempotency query: {e}")))?;
     if let Some(prior) = existing.first() {
-        let repo = GitRepo::open_or_init(&repo_dir(&journal))?;
+        let repo = GitRepo::open_or_init(&repo_dir(journal))?;
         let commit = repo.head_oid()?.unwrap_or_default();
         return Ok(WriteOutcome {
             id: tag_value(prior, "id").unwrap_or_default(),
@@ -457,7 +470,7 @@ pub async fn post_transaction(
         });
     }
 
-    let (accounts, commodities) = declared_sets(hledger).await?;
+    let (accounts, commodities) = declared_sets(ctx.hledger).await?;
     let validated =
         validate::validate(&input, &accounts, &commodities).map_err(WriteError::Input)?;
 
@@ -471,7 +484,7 @@ pub async fn post_transaction(
         &tags,
     );
 
-    let commit = append_and_commit(hledger, &journal, &text, &format!("post id:{id}")).await?;
+    let commit = append_and_commit(ctx.hledger, journal, &text, &format!("post id:{id}")).await?;
     Ok(WriteOutcome {
         id,
         commit,
@@ -498,14 +511,13 @@ fn reversal_postings(target: &Transaction) -> Vec<EntryPosting> {
 /// `void_transaction`: post a **reversing** entry (tagged `reverses:<id>`) that negates every
 /// posting of the target. Append-only — the original line is never touched.
 pub async fn void_transaction(
-    _proof: &WriteGuard,
-    hledger: &Hledger,
+    ctx: &WriteContext<'_>,
     target_id: &str,
 ) -> Result<WriteOutcome, WriteError> {
-    let journal = gate(hledger).await?;
-    ensure_journal_exists(&journal)?;
+    let journal = &ctx.journal;
+    ensure_journal_exists(journal)?;
 
-    let matches = find_by_exact_tag(hledger, "id", target_id)
+    let matches = find_by_exact_tag(ctx.hledger, "id", target_id)
         .await
         .map_err(|e| WriteError::Internal(format!("lookup by id: {e}")))?;
     let target = matches
@@ -536,8 +548,8 @@ pub async fn void_transaction(
     let text = render_entry(&target.date, &description, &postings, &tags);
 
     let commit = append_and_commit(
-        hledger,
-        &journal,
+        ctx.hledger,
+        journal,
         &text,
         &format!("void reverses:{target_id} id:{id}"),
     )
@@ -557,18 +569,15 @@ pub async fn void_transaction(
 /// voided-with-no-replacement. (A post-format `check` failure would still be an internal bug,
 /// but validation rules out every *correctable* input error up front.)
 pub async fn update_transaction(
-    proof: &WriteGuard,
-    hledger: &Hledger,
+    ctx: &WriteContext<'_>,
     target_id: &str,
     replacement: TransactionInput,
 ) -> Result<WriteOutcome, WriteError> {
-    let journal = gate(hledger).await?;
-    ensure_journal_exists(&journal)?;
-    let (accounts, commodities) = declared_sets(hledger).await?;
+    let (accounts, commodities) = declared_sets(ctx.hledger).await?;
     validate::validate(&replacement, &accounts, &commodities).map_err(WriteError::Input)?;
 
-    void_transaction(proof, hledger, target_id).await?;
-    post_transaction(proof, hledger, replacement).await
+    void_transaction(ctx, target_id).await?;
+    post_transaction(ctx, replacement).await
 }
 
 /// Strip newlines / `;` from text destined for a description (defensive — target text could
@@ -579,20 +588,15 @@ fn sanitize(text: &str) -> String {
 
 /// `declare_account`: append an `account <name>` directive (the require-pre-declare prerequisite
 /// of posting). Idempotent at the journal level (a duplicate directive is harmless).
-pub async fn declare_account(
-    _proof: &WriteGuard,
-    hledger: &Hledger,
-    name: &str,
-) -> Result<String, WriteError> {
-    let journal = gate(hledger).await?;
+pub async fn declare_account(ctx: &WriteContext<'_>, name: &str) -> Result<String, WriteError> {
     let name = name.trim();
     if name.is_empty() || name.contains(['\n', ';']) || name.starts_with(':') || name.ends_with(':')
     {
         return Err(WriteError::Input(format!("invalid account name: '{name}'")));
     }
     append_and_commit(
-        hledger,
-        &journal,
+        ctx.hledger,
+        &ctx.journal,
         &format!("account {name}\n"),
         "declare account",
     )
@@ -603,12 +607,10 @@ pub async fn declare_account(
 /// `places` decimals. Symbols starting with a non-alphanumeric char (e.g. `$`) render on the
 /// left; alphabetic codes (e.g. `USD`) on the right — matching hledger conventions.
 pub async fn declare_commodity(
-    _proof: &WriteGuard,
-    hledger: &Hledger,
+    ctx: &WriteContext<'_>,
     symbol: &str,
     places: u32,
 ) -> Result<String, WriteError> {
-    let journal = gate(hledger).await?;
     let symbol = symbol.trim();
     if symbol.is_empty()
         || symbol.contains(['\n', ';', ' '])
@@ -629,7 +631,7 @@ pub async fn declare_commodity(
     } else {
         format!("commodity {sample_number} {symbol}\n")
     };
-    append_and_commit(hledger, &journal, &directive, "declare commodity").await
+    append_and_commit(ctx.hledger, &ctx.journal, &directive, "declare commodity").await
 }
 
 /// `tombstone_account`: **soft-delete** an account by appending a duplicate `account` directive
@@ -637,15 +639,12 @@ pub async fn declare_commodity(
 /// and `accounts --declared tag:^tombstoned$` filters on it). The account stays declared, so
 /// existing references and even new postings still resolve (C-4) — nothing is ever hard-deleted.
 /// Idempotent: re-tombstoning an already-tombstoned account is a no-op returning current `HEAD`.
-pub async fn tombstone_account(
-    _proof: &WriteGuard,
-    hledger: &Hledger,
-    name: &str,
-) -> Result<String, WriteError> {
-    let journal = gate(hledger).await?;
-    ensure_journal_exists(&journal)?;
+pub async fn tombstone_account(ctx: &WriteContext<'_>, name: &str) -> Result<String, WriteError> {
+    let journal = &ctx.journal;
+    ensure_journal_exists(journal)?;
     let name = name.trim();
-    let declared: HashSet<String> = hledger
+    let declared: HashSet<String> = ctx
+        .hledger
         .declared_accounts()
         .await
         .map_err(|e| WriteError::Internal(format!("read declared accounts: {e}")))?
@@ -656,19 +655,20 @@ pub async fn tombstone_account(
             "cannot tombstone undeclared account '{name}'"
         )));
     }
-    let tombstoned = hledger
+    let tombstoned = ctx
+        .hledger
         .tombstoned_accounts()
         .await
         .map_err(|e| WriteError::Internal(format!("read tombstoned accounts: {e}")))?;
     if tombstoned.iter().any(|a| a == name) {
         // Already tombstoned — idempotent no-op at the current epoch. A hand-authored journal
         // can carry the tag with no repo/commit yet; render that as "(unborn)", never "".
-        let epoch = current_epoch(&journal)?;
+        let epoch = current_epoch(journal)?;
         return Ok(epoch.oid().map_or_else(|| epoch.short(), str::to_string));
     }
     append_and_commit(
-        hledger,
-        &journal,
+        ctx.hledger,
+        journal,
         &format!("account {name}  ; tombstoned:\n"),
         &format!("tombstone account {name}"),
     )
@@ -787,10 +787,14 @@ mod tests {
         }
     }
 
-    /// Mint a [`WriteGuard`] without the locks — unit tests only (a child module can reach the
-    /// private constructor; integration tests must go through `guarded_once`/`guarded_write`).
-    fn proof() -> WriteGuard {
-        WriteGuard(())
+    /// Build a [`WriteContext`] without going through the gate — unit tests only. The private
+    /// fields are reachable from this child module; integration tests use `guarded_once`.
+    fn ctx(hledger: &Hledger, journal: PathBuf) -> WriteContext<'_> {
+        WriteContext {
+            hledger,
+            journal,
+            _guard: WriteGuard(()),
+        }
     }
 
     fn posting(account: &str, mantissa: i128, commodity: &str) -> Posting {
@@ -912,8 +916,10 @@ mod tests {
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
         // Bootstrap a committed, valid journal.
-        declare_commodity(&proof(), &hl, "$", 2).await.unwrap();
-        declare_account(&proof(), &hl, "assets:checking")
+        declare_commodity(&ctx(&hl, journal.clone()), "$", 2)
+            .await
+            .unwrap();
+        declare_account(&ctx(&hl, journal.clone()), "assets:checking")
             .await
             .unwrap();
         let before = std::fs::read_to_string(&journal).unwrap();
@@ -947,7 +953,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
-        declare_commodity(&proof(), &hl, "$", 2).await.unwrap();
+        declare_commodity(&ctx(&hl, journal.clone()), "$", 2)
+            .await
+            .unwrap();
         let committed = GitRepo::open(dir.path())
             .unwrap()
             .unwrap()
@@ -995,11 +1003,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
-        declare_commodity(&proof(), &hl, "$", 2).await.unwrap();
-        declare_account(&proof(), &hl, "assets:checking")
+        declare_commodity(&ctx(&hl, journal.clone()), "$", 2)
             .await
             .unwrap();
-        declare_account(&proof(), &hl, "equity:opening")
+        declare_account(&ctx(&hl, journal.clone()), "assets:checking")
+            .await
+            .unwrap();
+        declare_account(&ctx(&hl, journal.clone()), "equity:opening")
             .await
             .unwrap();
 
@@ -1023,17 +1033,17 @@ mod tests {
             idem: Some(idem.to_string()),
         };
 
-        let first = post_transaction(&proof(), &hl, entry("txn-1"))
+        let first = post_transaction(&ctx(&hl, journal.clone()), entry("txn-1"))
             .await
             .unwrap();
         assert!(!first.deduped);
-        let second = post_transaction(&proof(), &hl, entry("txn-10"))
+        let second = post_transaction(&ctx(&hl, journal.clone()), entry("txn-10"))
             .await
             .unwrap();
         assert!(!second.deduped, "txn-10 must not dedup against txn-1");
 
         // And an exact retry of txn-1 *does* dedup.
-        let retry = post_transaction(&proof(), &hl, entry("txn-1"))
+        let retry = post_transaction(&ctx(&hl, journal.clone()), entry("txn-1"))
             .await
             .unwrap();
         assert!(retry.deduped, "exact idem retry deduplicates");
@@ -1052,11 +1062,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
-        declare_commodity(&proof(), &hl, "$", 2).await.unwrap();
-        declare_account(&proof(), &hl, "assets:checking")
+        declare_commodity(&ctx(&hl, journal.clone()), "$", 2)
             .await
             .unwrap();
-        declare_account(&proof(), &hl, "equity:opening")
+        declare_account(&ctx(&hl, journal.clone()), "assets:checking")
+            .await
+            .unwrap();
+        declare_account(&ctx(&hl, journal.clone()), "equity:opening")
             .await
             .unwrap();
 
@@ -1078,8 +1090,7 @@ mod tests {
         };
 
         let posted = post_transaction(
-            &proof(),
-            &hl,
+            &ctx(&hl, journal.clone()),
             mk(vec![
                 ("assets:checking", Some("10.00")),
                 ("equity:opening", None),
@@ -1093,7 +1104,7 @@ mod tests {
             ("assets:savings", Some("10.00")),
             ("equity:opening", None),
         ]);
-        let err = update_transaction(&proof(), &hl, &posted.id, bad)
+        let err = update_transaction(&ctx(&hl, journal.clone()), &posted.id, bad)
             .await
             .expect_err("invalid replacement must fail");
         assert!(matches!(err, WriteError::Input(_)), "{err:?}");
@@ -1116,7 +1127,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path().join("main.journal");
         let hl = Hledger::new(bin, Some(journal.clone()));
-        declare_commodity(&proof(), &hl, "$", 2).await.unwrap();
+        declare_commodity(&ctx(&hl, journal.clone()), "$", 2)
+            .await
+            .unwrap();
         let head_before = GitRepo::open(dir.path())
             .unwrap()
             .unwrap()
