@@ -111,6 +111,60 @@ PY
 description = "One-time per-clone setup: init-env + init-settings-local"
 depends = ["init-env", "init-settings-local"]
 
+[tasks.init-journal]
+description = "Initialize an empty hledger journal at the given path (creates the file + a git repo for the commit-as-epoch write path). Idempotent."
+quiet = true
+usage = '''
+flag "-p --path <path>" help="Path to the journal file to create (required)"
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+journal="${usage_path:-}"
+[ -n "$journal" ] || { echo "init-journal: --path <path> is required" >&2; exit 1; }
+
+# Make the path absolute so git init and hledger always agree on the location.
+case "$journal" in
+  /*) : ;;
+  *)
+    mkdir -p "$(dirname "$journal")"
+    journal="$(cd "$(dirname "$journal")" && pwd)/$(basename "$journal")"
+    ;;
+esac
+
+jdir="$(dirname "$journal")"
+mkdir -p "$jdir"
+
+# Create the journal file if it doesn't exist.
+if [ ! -f "$journal" ]; then
+  cat > "$journal" <<'EOF'
+; hledger journal
+; created by mise run init-journal
+;
+; Add account declarations here, then record transactions below.
+EOF
+  echo "init-journal: created $journal"
+else
+  echo "init-journal: journal already exists at $journal (skipping file creation)"
+fi
+
+# The write path commits on every validated write (git-as-epoch). The repo must exist.
+if [ ! -d "$jdir/.git" ]; then
+  git -C "$jdir" init -q
+  git -C "$jdir" add "$(basename "$journal")"
+  git -C "$jdir" -c user.name="hledger-mcp" -c user.email="hledger-mcp@localhost" \
+      commit -q -m "init: empty journal"
+  echo "init-journal: initialized git repo and committed initial journal"
+else
+  echo "init-journal: git repo already initialized at $jdir"
+fi
+
+echo ""
+echo "Journal ready. Register it with:"
+echo "  mise run install --journal $journal"
+'''
+
 [tasks.build]
 description = "Compile (debug)"
 run = "cargo build"

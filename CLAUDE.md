@@ -61,9 +61,10 @@ After that the everyday loop runs **outside nix, sandboxed** — `mise run <task
   for them to apply.
 
 **Tasks:** `build`, `fmt`, `lint`, `test`, `e2e`, `cov`, `check` (the fmt+clippy+test gate),
-`run`, `clean` (cargo artifacts), `clean-more` (+ generated dev-env files), and the per-clone
-setup `init` (= `init-env` + `init-settings-local`). `test`/`check` use nextest when on PATH,
-else fall back to `cargo test`.
+`run`, `clean` (cargo artifacts), `clean-more` (+ generated dev-env files), the per-clone
+setup `init` (= `init-env` + `init-settings-local`), and `init-journal --path <file>` (create
+an empty hledger journal + its git repo at the given path — needed before `mise run install`).
+`test`/`check` use nextest when on PATH, else fall back to `cargo test`.
 
 **Linux portability is covered by the native CI matrix, not a local cross-lint.** There is no
 `check-cross` task: the per-OS CI matrix (see *Platform targets*) compiles and tests natively on
