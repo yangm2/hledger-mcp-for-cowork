@@ -79,7 +79,12 @@ Unlocks: M5 (tiering/profiles organize *this* catalog; budget + ECO extend it).
   `pay_invoice` → `get_ap_aging`/`get_project_summary` — produces correct balances and commits.
 - **Correction path:** `void_transaction` on a domain entry posts a correct reversing txn.
 - **Partition tests:** record tools never `STALE`; any decide-classified tool is epoch-checked
-  (ties to M3 C-1).
+  (ties to M3 C-1). **M3 shipped only the in-process C-1** (no MCP decide tool existed) — the
+  first tool here classified decide (candidate: `pay_invoice`, the
+  "release-because-cash-positive" example from
+  [concurrency-model.md](../concurrency-model.md); revisit its *(record)* marking above when
+  classifying) must add the **end-to-end** C-1 through the MCP surface. If everything in M4
+  stays record, that obligation rolls to M5's `eco_approve`.
 - **Golden tests:** new report JSON shapes.
 - **Coverage: ≥ 85% lines.**
 

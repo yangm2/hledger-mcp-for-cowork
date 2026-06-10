@@ -24,9 +24,16 @@ reduce contention cost is omitted.
 
 ## Design
 
-- **Single serializing writer** — the daemon serializes all writes; there is no container
-  pool (it shells out to `hledger` and appends to the journal). "Multi-client" reduces to
-  *multiple connections, serialized execution, where a client may hold a stale read.*
+- **Single serializing writer** — all writes on a journal are serialized; there is no
+  container pool (it shells out to `hledger` and appends to the journal). "Multi-client"
+  reduces to *multiple connections, serialized execution, where a client may hold a stale
+  read.* **Over stdio, "multiple connections" means multiple server processes** — Desktop,
+  Cowork, and Claude Code each spawn their own server on the same journal — so serialization
+  is two layers: an in-process async mutex (tasks within a server) **plus an advisory file
+  lock (`flock`) on a lockfile beside the journal** (processes), both held across the full
+  dedup → validate → format → check → swap → commit sequence. HEAD lives in git (shared
+  state), so with check-and-commit atomic under the lock the epoch CAS is cross-process-
+  correct with no further machinery.
 - **Idempotency keys** — a write-once journal tag `; idem:<uuid>`; dedup via
   `hledger print tag:idem=<uuid>` before append. A correctness need even at zero concurrency
   (retries/double-posts).
@@ -49,11 +56,24 @@ atomically — so the epoch a client holds is *by construction* the commit it re
 data/version skew). Granularity is **whole-journal**: coarse, but the rare false-positive
 re-read is acceptable precisely because contention is rare.
 
-**Implementation — the daemon tracks per-connection last-seen `HEAD`** (a minimal
-directory), *not* a token threaded through the model (an LLM won't reliably echo it). A
-read bumps that connection's last-seen; a consequential call checks last-seen vs current
-`HEAD`; if behind → `STALE` → client re-reads, retries. No deadlock is possible (nothing is
-held), so progress is always available by re-reading.
+**Implementation — the server tracks per-connection last-seen `HEAD`** (over stdio that is
+one field per server instance; the multi-connection directory materializes only with HTTP),
+*not* a token threaded through the model (an LLM won't reliably echo it). A read bumps that
+connection's last-seen; a consequential call checks last-seen vs current `HEAD`; if behind →
+`STALE` → client re-reads, retries. No deadlock is possible (nothing is held), so progress
+is always available by re-reading.
+
+Two ordering disciplines the atomic-action spec doesn't show but the implementation must
+keep (both are check-then-act races of the kind M2's dedup-inside-the-mutex lesson covers):
+
+1. **The `STALE` check runs inside the write locks.** Check-then-commit with a gap lets
+   another writer commit in between — a successful `Decide` that did *not* observe the
+   latest epoch, i.e. a `NoLostDecision` violation the spec can't see because its `Decide`
+   is atomic.
+2. **Reads sample `HEAD` *before* invoking hledger, never after.** Bumping last-seen to a
+   post-read `HEAD` can record an epoch newer than the data the client actually saw (unsafe:
+   a stale belief passes the CAS). Sampling before is conservative — worst case a spurious
+   `STALE` re-read, which this model already accepts as cheap.
 
 ## Record vs decide partition
 
@@ -129,8 +149,13 @@ referenced accounts); `lastSeen[c]` per connection; `accts` with a `tombstoned` 
 for unbounded `epoch`; TLC covers the rest. Treat TLAPS as a stretch goal — TLC
 model-checking is the gate.
 
-**CI:** a `mise tla` task runs TLC headless (TLA+ tools jar), gated alongside the C-x
-integration tests.
+**CI:** a `mise tla` task runs the model check headless via the Rust
+[`tla-checker`](https://crates.io/crates/tla-checker) (pinned in mise `[tools]`; no Java
+dep), gated alongside the C-x integration tests. The spec stays **TLC-compatible**
+(standard syntax + `.cfg`) so `tla2tools.jar` remains a drop-in fallback/cross-check. The
+task also runs **spec-mutation sanity checks** — deliberately broken spec variants (drop the
+`Decide` guard, allow txn removal, reuse an idem key) that must each be reported as
+violations; this proves the gate is load-bearing and validates the young checker itself.
 
 > **Crash safety (add a `Crash` action when implementing):** a crash between the atomic
 > journal replace and `git commit` must leave `HEAD` a valid `check`-passing journal —

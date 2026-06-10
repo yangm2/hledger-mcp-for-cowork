@@ -202,10 +202,13 @@ touches one place. This seam is covered by golden-file tests against recorded re
 
 ## Concurrency model (planned — see docs, not yet built)
 
-Single serializing writer; **the git commit IS the epoch** (one validated write = one commit).
-Idempotency via a write-once `; idem:<uuid>` tag. Consequential "decide" calls are epoch-checked
-(reject `STALE` if a client's last-seen HEAD ≠ current HEAD → re-read → retry); append-only
-"record" calls are not. To be formally checked with a TLA+/TLC model (`mise tla`).
+Single serializing writer — two layers, since stdio multi-client = multi-*process* (in-process
+async mutex + cross-process `flock` beside the journal); **the git commit IS the epoch** (one
+validated write = one commit). Idempotency via a write-once `; idem:<uuid>` tag. Consequential
+"decide" calls are epoch-checked (reject `STALE` if a client's last-seen HEAD ≠ current HEAD →
+re-read → retry, checked *inside* the write locks); append-only "record" calls are not. To be
+formally checked with a TLA+ model via the Rust `tla-checker` (`mise tla`; spec kept
+TLC-compatible).
 
 ## Repository map
 
