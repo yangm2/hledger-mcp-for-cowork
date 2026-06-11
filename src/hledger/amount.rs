@@ -104,6 +104,71 @@ impl std::ops::Add for Quantity {
     }
 }
 
+/// A commodity symbol, e.g. `"$"` or `"EUR"`.
+///
+/// A transparent newtype over the raw symbol so a commodity can't be swapped with an
+/// account or amount `String` in an argument list. Commodities are user-declared at
+/// runtime (not a closed set), so this stays a wrapped string rather than an enum.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(transparent)]
+pub struct Commodity(String);
+
+impl Commodity {
+    /// Wrap a raw symbol.
+    pub fn new(symbol: impl Into<String>) -> Self {
+        Commodity(symbol.into())
+    }
+
+    /// The raw symbol.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Commodity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for Commodity {
+    fn from(s: &str) -> Self {
+        Commodity(s.to_string())
+    }
+}
+
+impl From<String> for Commodity {
+    fn from(s: String) -> Self {
+        Commodity(s)
+    }
+}
+
+/// Lets a `HashSet<Commodity>` be probed with a `&str` (sound: the derived `Hash` hashes
+/// exactly the inner `String`).
+impl std::borrow::Borrow<str> for Commodity {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<&str> for Commodity {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<str> for Commodity {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<String> for Commodity {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
+    }
+}
+
 /// A commodity-tagged amount, e.g. `$87.66` or `40.00 EUR`.
 ///
 /// Carries just enough of hledger's `astyle` (`ascommodityside`, `ascommodityspaced`) to
@@ -112,7 +177,7 @@ impl std::ops::Add for Quantity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Amount {
     /// The commodity symbol (hledger `acommodity`), e.g. `"$"` or `"EUR"`.
-    pub commodity: String,
+    pub commodity: Commodity,
     /// The exact quantity.
     pub quantity: Quantity,
     /// `true` when the commodity prints to the left of the number (`astyle.ascommodityside`

@@ -5,6 +5,7 @@
 
 use chrono::NaiveDate;
 
+use crate::hledger::amount::Commodity;
 use crate::hledger::{Amount, BalanceReport, Transaction};
 use crate::write::input::{PostingAmount, PostingInput, TransactionInput};
 
@@ -41,7 +42,7 @@ pub fn professional_expense_account(vendor: &str) -> String {
 fn posting(
     account: impl Into<String>,
     qty: impl Into<String>,
-    commodity: impl Into<String>,
+    commodity: impl Into<Commodity>,
 ) -> PostingInput {
     PostingInput {
         account: account.into(),
@@ -63,7 +64,7 @@ fn balancer(account: impl Into<String>) -> PostingInput {
 pub fn fund_project_input(
     date: NaiveDate,
     amount: String,
-    commodity: String,
+    commodity: Commodity,
     idem: Option<String>,
 ) -> TransactionInput {
     TransactionInput {
@@ -86,7 +87,7 @@ pub fn receive_invoice_input(
     vendor: &str,
     expense_account: String,
     amount: String,
-    commodity: String,
+    commodity: Commodity,
     invoice_ref: String,
     idem: Option<String>,
 ) -> TransactionInput {
@@ -112,7 +113,7 @@ pub fn pay_invoice_input(
     date: NaiveDate,
     vendor: &str,
     amount: String,
-    commodity: String,
+    commodity: Commodity,
     idem: Option<String>,
 ) -> TransactionInput {
     TransactionInput {
@@ -131,7 +132,7 @@ pub fn pay_invoice_input(
 pub fn post_interest_input(
     date: NaiveDate,
     amount: String,
-    commodity: String,
+    commodity: Commodity,
     idem: Option<String>,
 ) -> TransactionInput {
     TransactionInput {
@@ -463,7 +464,7 @@ mod tests {
 
     fn make_amount(mantissa: i128) -> Amount {
         Amount {
-            commodity: "$".to_string(),
+            commodity: "$".into(),
             quantity: Quantity::new(mantissa, 2),
             commodity_left: true,
             spaced: false,

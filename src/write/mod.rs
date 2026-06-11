@@ -446,7 +446,7 @@ async fn find_by_exact_tag(
 /// [`validate::validate`]). A read failure is internal (the journal exists by this point).
 async fn declared_sets(
     hledger: &Hledger,
-) -> Result<(HashSet<String>, HashSet<String>), WriteError> {
+) -> Result<(HashSet<String>, HashSet<crate::hledger::amount::Commodity>), WriteError> {
     let accounts = hledger
         .declared_accounts()
         .await
@@ -458,6 +458,7 @@ async fn declared_sets(
         .await
         .map_err(|e| WriteError::Internal(format!("read declared commodities: {e}")))?
         .into_iter()
+        .map(crate::hledger::amount::Commodity::new)
         .collect();
     Ok((accounts, commodities))
 }
@@ -1084,7 +1085,7 @@ mod tests {
                 account,
                 amount: amt.map(|(q, c)| input::PostingAmount {
                     quantity: q.to_string(),
-                    commodity: c.to_string(),
+                    commodity: c.into(),
                 }),
             })
             .collect(),
@@ -1128,7 +1129,7 @@ mod tests {
                     account: account.to_string(),
                     amount: amt.map(|q| input::PostingAmount {
                         quantity: q.to_string(),
-                        commodity: "$".to_string(),
+                        commodity: "$".into(),
                     }),
                 })
                 .collect(),

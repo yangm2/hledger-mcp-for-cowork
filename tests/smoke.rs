@@ -168,7 +168,7 @@ fn posting(account: &str, qty: Option<&str>, commodity: &str) -> PostingInput {
         account: account.to_string(),
         amount: qty.map(|q| PostingAmount {
             quantity: q.to_string(),
-            commodity: commodity.to_string(),
+            commodity: commodity.into(),
         }),
     }
 }

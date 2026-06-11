@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::hledger::amount::Quantity;
+use crate::hledger::amount::{Commodity, Quantity};
 
 use super::format::EntryPosting;
 use super::input::TransactionInput;
@@ -30,7 +30,7 @@ pub struct ValidatedTxn {
 pub fn validate(
     input: &TransactionInput,
     declared_accounts: &HashSet<String>,
-    declared_commodities: &HashSet<String>,
+    declared_commodities: &HashSet<Commodity>,
 ) -> Result<ValidatedTxn, String> {
     validate_text("description", &input.description)?;
 
@@ -141,7 +141,7 @@ mod tests {
     use super::*;
     use crate::write::input::{PostingAmount, PostingInput};
 
-    fn declared() -> (HashSet<String>, HashSet<String>) {
+    fn declared() -> (HashSet<String>, HashSet<Commodity>) {
         (
             [
                 "assets:checking",
@@ -151,7 +151,7 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect(),
-            ["$", "EUR"].into_iter().map(String::from).collect(),
+            ["$", "EUR"].into_iter().map(Commodity::from).collect(),
         )
     }
 
@@ -160,7 +160,7 @@ mod tests {
             account: account.to_string(),
             amount: qty.map(|q| PostingAmount {
                 quantity: q.to_string(),
-                commodity: commodity.to_string(),
+                commodity: commodity.into(),
             }),
         }
     }

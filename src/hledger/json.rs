@@ -45,7 +45,7 @@ struct JsonAmount {
 impl From<JsonAmount> for Amount {
     fn from(a: JsonAmount) -> Self {
         Amount {
-            commodity: a.acommodity,
+            commodity: a.acommodity.into(),
             quantity: Quantity::new(a.aquantity.mantissa, a.aquantity.places),
             commodity_left: a.astyle.ascommodityside == "L",
             spaced: a.astyle.ascommodityspaced,

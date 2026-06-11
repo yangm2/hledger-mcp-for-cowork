@@ -13,7 +13,8 @@ pub struct PostingAmount {
     /// not a JSON number (floats can't represent money exactly).
     pub quantity: String,
     /// Commodity symbol, e.g. `"$"` or `"EUR"`. Must already be declared.
-    pub commodity: String,
+    #[schemars(with = "String")]
+    pub commodity: crate::hledger::amount::Commodity,
 }
 
 /// One posting line of a transaction.

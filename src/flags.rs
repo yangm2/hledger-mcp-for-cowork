@@ -116,7 +116,7 @@ mod tests {
         AccountBalance {
             account: account.to_string(),
             amounts: vec![Amount {
-                commodity: "$".to_string(),
+                commodity: "$".into(),
                 quantity: Quantity::new(mantissa, 2),
                 commodity_left: true,
                 spaced: false,
@@ -185,7 +185,7 @@ mod tests {
             ApAgingEntry {
                 vendor_account: account.to_string(),
                 outstanding: vec![Amount {
-                    commodity: "$".to_string(),
+                    commodity: "$".into(),
                     quantity: crate::hledger::Quantity::new(250000, 2),
                     commodity_left: true,
                     spaced: false,

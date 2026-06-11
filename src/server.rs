@@ -117,7 +117,8 @@ pub struct FundProjectArgs {
     /// Amount deposited, e.g. `"50000.00"`.
     pub amount: String,
     /// Commodity symbol, e.g. `"$"`.
-    pub commodity: String,
+    #[schemars(with = "String")]
+    pub commodity: crate::hledger::amount::Commodity,
     /// Optional idempotency key — reuse on retry to avoid a duplicate.
     #[serde(default)]
     pub idem: Option<String>,
@@ -137,7 +138,8 @@ pub struct ReceiveInvoiceArgs {
     /// Invoice amount, e.g. `"8000.00"`.
     pub amount: String,
     /// Commodity symbol, e.g. `"$"`.
-    pub commodity: String,
+    #[schemars(with = "String")]
+    pub commodity: crate::hledger::amount::Commodity,
     /// Vendor-assigned invoice reference, e.g. `"INV-001"`.
     pub invoice_ref: String,
     /// Optional idempotency key.
@@ -156,7 +158,8 @@ pub struct PayInvoiceArgs {
     /// Amount paid, e.g. `"8000.00"`.
     pub amount: String,
     /// Commodity symbol, e.g. `"$"`.
-    pub commodity: String,
+    #[schemars(with = "String")]
+    pub commodity: crate::hledger::amount::Commodity,
     /// Optional idempotency key.
     #[serde(default)]
     pub idem: Option<String>,
@@ -171,7 +174,8 @@ pub struct PostInterestArgs {
     /// Interest amount, e.g. `"125.00"`.
     pub amount: String,
     /// Commodity symbol, e.g. `"$"`.
-    pub commodity: String,
+    #[schemars(with = "String")]
+    pub commodity: crate::hledger::amount::Commodity,
     /// Optional idempotency key.
     #[serde(default)]
     pub idem: Option<String>,

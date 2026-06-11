@@ -12,10 +12,10 @@
 //! Amounts render as `<quantity> <commodity>` (e.g. `100.00 $`, `-44.00 EUR`) — the space form
 //! hledger parses unambiguously regardless of the declared commodity style.
 
-use crate::hledger::amount::Quantity;
+use crate::hledger::amount::{Commodity, Quantity};
 
 /// A posting to render: account, and an optional `(quantity, commodity)` (omit = the balancer).
-pub type EntryPosting = (String, Option<(Quantity, String)>);
+pub type EntryPosting = (String, Option<(Quantity, Commodity)>);
 
 /// Render one journal entry. `tags` are emitted on the date line in order (the caller places
 /// `id:`/`idem:`/`reverses:` first). Pure — no I/O, total.
@@ -65,7 +65,7 @@ mod tests {
         let postings = vec![
             (
                 "expenses:supplies".to_string(),
-                Some((q(1234, 2), "$".to_string())),
+                Some((q(1234, 2), "$".into())),
             ),
             ("assets:checking".to_string(), None),
         ];
@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn renders_empty_description_and_no_tags() {
-        let postings = vec![("a:b".to_string(), Some((q(-100, 2), "EUR".to_string())))];
+        let postings = vec![("a:b".to_string(), Some((q(-100, 2), "EUR".into())))];
         let text = render_entry("2026-02-02", "", &postings, &[]);
         assert_eq!(text, "2026-02-02\n    a:b  -1.00 EUR\n");
     }
@@ -96,7 +96,7 @@ mod tests {
             mantissa in any::<i64>(), places in 0u32..=6, n in 1usize..=5,
         ) {
             let postings: Vec<EntryPosting> = (0..n)
-                .map(|i| (format!("acct:{i}"), Some((q(i128::from(mantissa), places), "$".to_string()))))
+                .map(|i| (format!("acct:{i}"), Some((q(i128::from(mantissa), places), "$".into()))))
                 .collect();
             let text = render_entry("2026-01-01", "d", &postings, &[]);
             // header + n posting lines, all newline-terminated.
