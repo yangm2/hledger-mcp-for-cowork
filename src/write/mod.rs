@@ -627,7 +627,7 @@ pub async fn declare_account(
 pub async fn declare_commodity(
     ctx: &WriteContext<'_>,
     symbol: &str,
-    places: u32,
+    places: u8,
 ) -> Result<CommitOutcome, WriteError> {
     let symbol = symbol.trim();
     if symbol.is_empty()

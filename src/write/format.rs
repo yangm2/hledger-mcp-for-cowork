@@ -56,7 +56,7 @@ pub fn render_entry(
 mod tests {
     use super::*;
 
-    fn q(mantissa: i128, places: u32) -> Quantity {
+    fn q(mantissa: i128, places: u8) -> Quantity {
         Quantity::new(mantissa, places)
     }
 
@@ -93,7 +93,7 @@ mod tests {
     proptest! {
         #[test]
         fn rendered_postings_count_matches_input(
-            mantissa in any::<i64>(), places in 0u32..=6, n in 1usize..=5,
+            mantissa in any::<i64>(), places in 0u8..=6, n in 1usize..=5,
         ) {
             let postings: Vec<EntryPosting> = (0..n)
                 .map(|i| (format!("acct:{i}"), Some((q(i128::from(mantissa), places), "$".into()))))

@@ -131,7 +131,7 @@ use hledger_mcp_for_cowork::write::{
 async fn declare_commodity(
     hl: &Hledger,
     symbol: &str,
-    places: u32,
+    places: u8,
 ) -> Result<CommitOutcome, WriteError> {
     write::guarded_once(hl, ToolClass::Record, async |ctx| {
         write::declare_commodity(&ctx, symbol, places).await

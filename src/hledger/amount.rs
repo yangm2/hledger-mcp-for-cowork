@@ -18,12 +18,13 @@ pub struct Quantity {
     /// The unscaled integer value (signed). `8766` with `places = 2` is `87.66`.
     pub mantissa: i128,
     /// Number of fractional decimal places to scale [`mantissa`](Self::mantissa) by.
-    pub places: u32,
+    /// `u8` mirrors hledger's own precision type (`Word8`), so 0–255 is the real contract.
+    pub places: u8,
 }
 
 impl Quantity {
     /// Construct a quantity from its mantissa and decimal-place count.
-    pub fn new(mantissa: i128, places: u32) -> Self {
+    pub fn new(mantissa: i128, places: u8) -> Self {
         Self { mantissa, places }
     }
 
@@ -52,7 +53,10 @@ impl Quantity {
         let digits = format!("{int_part}{frac_part}");
         let magnitude: i128 = digits.parse().ok()?;
         let mantissa = if neg { -magnitude } else { magnitude };
-        Some(Quantity::new(mantissa, frac_part.len() as u32))
+        // More than 255 fractional digits exceeds hledger's Word8 precision; reject rather
+        // than wrap. (Unreachable in practice: 255 digits already overflows the i128 parse.)
+        let places = u8::try_from(frac_part.len()).ok()?;
+        Some(Quantity::new(mantissa, places))
     }
 
     /// Whether this quantity is exactly zero.
@@ -98,8 +102,8 @@ impl std::ops::Add for Quantity {
     /// Exact sum, aligning to the greater scale. Integer math only — no float.
     fn add(self, other: Quantity) -> Quantity {
         let places = self.places.max(other.places);
-        let lhs = self.mantissa * 10i128.pow(places - self.places);
-        let rhs = other.mantissa * 10i128.pow(places - other.places);
+        let lhs = self.mantissa * 10i128.pow(u32::from(places - self.places));
+        let rhs = other.mantissa * 10i128.pow(u32::from(places - other.places));
         Quantity::new(lhs + rhs, places)
     }
 }

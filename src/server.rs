@@ -82,7 +82,7 @@ pub struct DeclareCommodityArgs {
     pub commodity: String,
     /// Decimal places for the display style (default 2).
     #[serde(default)]
-    pub decimal_places: Option<u32>,
+    pub decimal_places: Option<u8>,
 }
 
 /// Arguments for `void_transaction`.

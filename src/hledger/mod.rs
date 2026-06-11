@@ -159,7 +159,7 @@ pub struct Transaction {
     /// Description / payee.
     pub description: String,
     /// hledger's 1-based transaction index within the journal.
-    pub index: i64,
+    pub index: u64,
     /// Status mark.
     pub status: Status,
     /// Transaction-level comment text, or empty.

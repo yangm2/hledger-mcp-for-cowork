@@ -23,7 +23,7 @@ struct JsonQuantity {
     #[serde(rename = "decimalMantissa")]
     mantissa: i128,
     #[serde(rename = "decimalPlaces")]
-    places: u32,
+    places: u8,
 }
 
 /// hledger `astyle`: we keep only the commodity placement needed to render the amount.
@@ -223,7 +223,7 @@ impl From<JsonPosting> for Posting {
 struct JsonTransaction {
     tdate: NaiveDate,
     tdescription: String,
-    tindex: i64,
+    tindex: u64,
     #[serde(default)]
     tstatus: Status,
     #[serde(default)]
@@ -457,7 +457,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn quantity_render_is_lossless(mantissa in any::<i64>(), places in 0u32..=8) {
+        fn quantity_render_is_lossless(mantissa in any::<i64>(), places in 0u8..=8) {
             let rendered = Quantity::new(mantissa as i128, places).render();
             // The rendered decimal must reconstruct the exact mantissa (no float drift).
             let digits: String = rendered.chars().filter(char::is_ascii_digit).collect();
@@ -471,14 +471,14 @@ mod tests {
                 prop_assert!(!rendered.contains('.'));
             } else {
                 let frac = rendered.split('.').nth(1).expect("fractional part");
-                prop_assert_eq!(frac.len() as u32, places);
+                prop_assert_eq!(frac.len(), usize::from(places));
             }
         }
 
         #[test]
         fn amount_json_round_trips_through_parser(
             mantissa in any::<i64>(),
-            places in 0u32..=6,
+            places in 0u8..=6,
             commodity in "[A-Z$]{1,3}",
             left in any::<bool>(),
             spaced in any::<bool>(),
