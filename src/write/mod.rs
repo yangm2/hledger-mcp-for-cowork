@@ -852,7 +852,7 @@ mod tests {
             date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             description: "x".into(),
             index: 1,
-            status: "Unmarked".into(),
+            status: crate::hledger::Status::Unmarked,
             comment: String::new(),
             tags,
             postings,

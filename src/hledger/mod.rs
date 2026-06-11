@@ -141,6 +141,16 @@ pub struct Posting {
     pub tags: Vec<(String, String)>,
 }
 
+/// Transaction status mark. hledger's closed set: unmarked (no mark), `!` (pending),
+/// `*` (cleared) — `-O json` spells them `"Unmarked"` / `"Pending"` / `"Cleared"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+pub enum Status {
+    #[default]
+    Unmarked,
+    Pending,
+    Cleared,
+}
+
 /// A transaction as returned by `hledger print`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
@@ -150,8 +160,8 @@ pub struct Transaction {
     pub description: String,
     /// hledger's 1-based transaction index within the journal.
     pub index: i64,
-    /// Status word (`"Unmarked"`, `"Pending"`, `"Cleared"`).
-    pub status: String,
+    /// Status mark.
+    pub status: Status,
     /// Transaction-level comment text, or empty.
     pub comment: String,
     /// Transaction-level `(key, value)` tags.

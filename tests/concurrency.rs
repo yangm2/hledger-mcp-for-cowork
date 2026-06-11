@@ -395,7 +395,7 @@ async fn c6_overdraft_succeeds_and_surfaces_as_flag() {
         .expect("balance");
     let flags = flags::overdraft_flags(&report);
     assert_eq!(flags.len(), 1, "overdraft flagged");
-    assert_eq!(flags[0].kind, "overdraft");
+    assert_eq!(flags[0].kind, flags::FlagKind::Overdraft);
     assert_eq!(flags[0].account, "assets:checking");
 }
 

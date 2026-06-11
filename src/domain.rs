@@ -150,17 +150,9 @@ pub fn post_interest_input(
 
 use chrono::Local;
 
-/// Today's date as `YYYY-MM-DD` (local time).
-pub fn today_iso() -> String {
-    Local::now().date_naive().format("%Y-%m-%d").to_string()
-}
-
-/// Days from `earlier` to `later` (positive = later is after earlier).
-/// Returns `None` if either string is not a valid `YYYY-MM-DD`.
-pub fn days_between(earlier: &str, later: &str) -> Option<i64> {
-    let e = NaiveDate::parse_from_str(earlier, "%Y-%m-%d").ok()?;
-    let l = NaiveDate::parse_from_str(later, "%Y-%m-%d").ok()?;
-    Some((l - e).num_days())
+/// Today's date (local time).
+pub fn today() -> NaiveDate {
+    Local::now().date_naive()
 }
 
 // ---- AP aging ----------------------------------------------------------------------
@@ -312,7 +304,7 @@ pub fn render_composite(report: &crate::hledger::CompositeReport) -> String {
 }
 
 /// Render AP aging entries as a text table.
-pub fn render_ap_aging(entries: &[ApAgingEntry], as_of: &str) -> String {
+pub fn render_ap_aging(entries: &[ApAgingEntry], as_of: NaiveDate) -> String {
     if entries.is_empty() {
         return format!("AP aging as of {as_of}: (no outstanding payables)");
     }
@@ -436,44 +428,6 @@ mod tests {
         assert!(has_balancer(&inp));
     }
 
-    // ---- Date arithmetic ----
-
-    #[test]
-    fn days_between_known_dates() {
-        // 2026-01-01 → 2026-02-01 = 31 days
-        assert_eq!(days_between("2026-01-01", "2026-02-01"), Some(31));
-        // Same date = 0
-        assert_eq!(days_between("2026-06-01", "2026-06-01"), Some(0));
-        // Reversed = negative
-        assert_eq!(days_between("2026-02-01", "2026-01-01"), Some(-31));
-        // Leap year: 2024 has a Feb 29
-        assert_eq!(days_between("2024-02-28", "2024-03-01"), Some(2));
-        // Non-leap year: 2025 Feb 28 → Mar 1 = 1 day
-        assert_eq!(days_between("2025-02-28", "2025-03-01"), Some(1));
-    }
-
-    #[test]
-    fn days_between_invalid_dates_return_none() {
-        assert_eq!(days_between("not-a-date", "2026-01-01"), None);
-        assert_eq!(days_between("2026-01-01", "garbage"), None);
-        assert_eq!(days_between("2026-13-01", "2026-01-01"), None);
-    }
-
-    #[test]
-    fn today_iso_is_well_formed() {
-        let today = today_iso();
-        // YYYY-MM-DD = 10 chars
-        assert_eq!(today.len(), 10, "today: {today}");
-        let parts: Vec<&str> = today.split('-').collect();
-        assert_eq!(parts.len(), 3);
-        let y: u32 = parts[0].parse().expect("year");
-        let m: u32 = parts[1].parse().expect("month");
-        let d: u32 = parts[2].parse().expect("day");
-        assert!(y >= 2024, "year looks plausible: {y}");
-        assert!((1..=12).contains(&m));
-        assert!((1..=31).contains(&d));
-    }
-
     // ---- AP aging ----
 
     #[test]
@@ -533,7 +487,7 @@ mod tests {
             date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
             description: "test invoice".to_string(),
             index: 1,
-            status: "Unmarked".to_string(),
+            status: crate::hledger::Status::Unmarked,
             comment: String::new(),
             tags: vec![("invoice".to_string(), "INV-001".to_string())],
             postings: vec![Posting {
@@ -595,7 +549,7 @@ mod tests {
             date: nd(2026, 1, 1),
             description: "payment".to_string(),
             index: 1,
-            status: "Unmarked".to_string(),
+            status: crate::hledger::Status::Unmarked,
             comment: String::new(),
             tags: vec![("other".to_string(), "value".to_string())],
             postings: vec![Posting {
@@ -650,7 +604,7 @@ mod tests {
 
     #[test]
     fn render_ap_aging_empty_returns_no_payables_message() {
-        let text = render_ap_aging(&[], "2026-06-01");
+        let text = render_ap_aging(&[], nd(2026, 6, 1));
         assert_eq!(text, "AP aging as of 2026-06-01: (no outstanding payables)");
     }
 
@@ -662,7 +616,7 @@ mod tests {
             oldest_invoice_date: Some(nd(2026, 1, 1)),
             age: Some(AgeCategory::Over90Days),
         }];
-        let text = render_ap_aging(&entries, "2026-06-01");
+        let text = render_ap_aging(&entries, nd(2026, 6, 1));
         assert!(text.contains("AP aging as of 2026-06-01"), "header: {text}");
         assert!(
             text.contains("liabilities:ap:vendor:Acme"),
@@ -680,15 +634,6 @@ mod tests {
             let cat = age_category(days);
             // Every non-negative input maps to exactly one bucket
             let _ = cat.label();
-        }
-
-        #[test]
-        fn days_between_roundtrips_unix_days(year in 2000i32..=2100, month in 1u32..=12, day in 1u32..=28) {
-            // Use days 1-28 so we never hit an invalid date (Feb only has 28 days in some years)
-            let date = format!("{year:04}-{month:02}-{day:02}");
-            // days_between(d, d) == 0 for any valid date
-            let diff = days_between(&date, &date);
-            prop_assert_eq!(diff, Some(0));
         }
 
         #[test]

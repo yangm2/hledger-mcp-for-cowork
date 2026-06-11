@@ -112,7 +112,8 @@ pub struct CloseAccountArgs {
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub struct FundProjectArgs {
     /// Date of the funding (YYYY-MM-DD).
-    pub date: String,
+    #[schemars(with = "String")]
+    pub date: chrono::NaiveDate,
     /// Amount deposited, e.g. `"50000.00"`.
     pub amount: String,
     /// Commodity symbol, e.g. `"$"`.
@@ -126,7 +127,8 @@ pub struct FundProjectArgs {
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub struct ReceiveInvoiceArgs {
     /// Invoice date (YYYY-MM-DD).
-    pub date: String,
+    #[schemars(with = "String")]
+    pub date: chrono::NaiveDate,
     /// Vendor name, e.g. `"Acme"`.
     pub vendor: String,
     /// Expense account, e.g. `"expenses:construction:plumbing"` or
@@ -147,7 +149,8 @@ pub struct ReceiveInvoiceArgs {
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub struct PayInvoiceArgs {
     /// Payment date (YYYY-MM-DD).
-    pub date: String,
+    #[schemars(with = "String")]
+    pub date: chrono::NaiveDate,
     /// Vendor name matching the AP account, e.g. `"Acme"`.
     pub vendor: String,
     /// Amount paid, e.g. `"8000.00"`.
@@ -163,7 +166,8 @@ pub struct PayInvoiceArgs {
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub struct PostInterestArgs {
     /// Date interest was earned (YYYY-MM-DD).
-    pub date: String,
+    #[schemars(with = "String")]
+    pub date: chrono::NaiveDate,
     /// Interest amount, e.g. `"125.00"`.
     pub amount: String,
     /// Commodity symbol, e.g. `"$"`.
@@ -173,13 +177,14 @@ pub struct PostInterestArgs {
     pub idem: Option<String>,
 }
 
-/// Parse a `YYYY-MM-DD` date string into a `NaiveDate`, returning a tool error on failure.
-fn parse_date(s: &str) -> Result<NaiveDate, CallToolResult> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
-        CallToolResult::error(vec![Content::text(format!(
-            "input error: date must be YYYY-MM-DD, got {s:?}"
-        ))])
-    })
+/// The two vendor kinds, deciding which expense account `vendor_add` declares.
+#[derive(Debug, Clone, Copy, serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum VendorType {
+    /// Shared trade expense account (`expenses:construction:{trade}`).
+    Trade,
+    /// Dedicated per-vendor account (`expenses:professional - {vendor}`).
+    Professional,
 }
 
 /// Arguments for `vendor_add`.
@@ -189,7 +194,7 @@ pub struct VendorAddArgs {
     pub vendor: String,
     /// `"trade"` for a shared trade expense account (`expenses:construction:{trade}`), or
     /// `"professional"` for a dedicated per-vendor account (`expenses:professional - {vendor}`).
-    pub vendor_type: String,
+    pub vendor_type: VendorType,
     /// The trade/sub-trade name (e.g. `"plumbing"`). Required when `vendor_type` is `"trade"`.
     #[serde(default)]
     pub trade: Option<String>,
@@ -200,7 +205,8 @@ pub struct VendorAddArgs {
 pub struct GetApAgingArgs {
     /// Reference date for age computation (YYYY-MM-DD). Defaults to today.
     #[serde(default)]
-    pub as_of: Option<String>,
+    #[schemars(with = "Option<String>")]
+    pub as_of: Option<NaiveDate>,
 }
 
 /// The MCP server handler.
@@ -657,10 +663,7 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let date = match parse_date(&args.date) {
-            Ok(d) => d,
-            Err(e) => return Ok(e),
-        };
+        let date = args.date;
         let amount = args.amount;
         let commodity = args.commodity;
         let idem = args.idem;
@@ -692,10 +695,7 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let date = match parse_date(&args.date) {
-            Ok(d) => d,
-            Err(e) => return Ok(e),
-        };
+        let date = args.date;
         let vendor = args.vendor;
         let expense_account = args.expense_account;
         let amount = args.amount;
@@ -736,10 +736,7 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let date = match parse_date(&args.date) {
-            Ok(d) => d,
-            Err(e) => return Ok(e),
-        };
+        let date = args.date;
         let vendor = args.vendor;
         let amount = args.amount;
         let commodity = args.commodity;
@@ -785,10 +782,7 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let date = match parse_date(&args.date) {
-            Ok(d) => d,
-            Err(e) => return Ok(e),
-        };
+        let date = args.date;
         let amount = args.amount;
         let commodity = args.commodity;
         let idem = args.idem;
@@ -821,8 +815,8 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let expense_account = match args.vendor_type.as_str() {
-            "trade" => {
+        let expense_account = match args.vendor_type {
+            VendorType::Trade => {
                 let trade = match args.trade {
                     Some(t) => t,
                     None => {
@@ -833,12 +827,7 @@ impl HledgerMcp {
                 };
                 crate::domain::trade_expense_account(&trade)
             }
-            "professional" => crate::domain::professional_expense_account(&args.vendor),
-            other => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "input error: vendor_type must be \"trade\" or \"professional\", got \"{other}\""
-                ))]));
-            }
+            VendorType::Professional => crate::domain::professional_expense_account(&args.vendor),
         };
         let ap_account = crate::domain::vendor_ap_account(&args.vendor);
         let vendor = args.vendor;
@@ -903,15 +892,7 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let as_of_str = args.as_of.unwrap_or_else(crate::domain::today_iso);
-        let as_of = match NaiveDate::parse_from_str(&as_of_str, "%Y-%m-%d") {
-            Ok(d) => d,
-            Err(_) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "input error: as_of must be YYYY-MM-DD, got {as_of_str:?}"
-                ))]));
-            }
-        };
+        let as_of = args.as_of.unwrap_or_else(crate::domain::today);
         let hledger = &self.hledger;
         let ap_query = "liabilities:ap".to_string();
         let result = self
@@ -925,7 +906,7 @@ impl HledgerMcp {
         match result {
             Ok((balance, txns)) => {
                 let entries = crate::domain::compute_ap_aging(&balance, &txns, as_of);
-                let mut text = crate::domain::render_ap_aging(&entries, &as_of_str);
+                let mut text = crate::domain::render_ap_aging(&entries, as_of);
                 let flags = crate::flags::ap_aging_flags(&entries);
                 if !flags.is_empty() {
                     text.push('\n');
@@ -1303,7 +1284,7 @@ mod tests {
             date: chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
             description: "Acme".into(),
             index: 1,
-            status: "Unmarked".into(),
+            status: crate::hledger::Status::Unmarked,
             comment: String::new(),
             tags: vec![],
             postings: vec![Posting {

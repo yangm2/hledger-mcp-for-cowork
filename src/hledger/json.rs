@@ -12,7 +12,8 @@ use serde_json::Value;
 
 use super::amount::{Amount, Quantity};
 use super::{
-    AccountBalance, BalanceReport, CompositeReport, Posting, ReportRow, Subreport, Transaction,
+    AccountBalance, BalanceReport, CompositeReport, Posting, ReportRow, Status, Subreport,
+    Transaction,
 };
 
 /// hledger `aquantity`: an exact decimal. We read the integer mantissa + place count and
@@ -224,7 +225,7 @@ struct JsonTransaction {
     tdescription: String,
     tindex: i64,
     #[serde(default)]
-    tstatus: String,
+    tstatus: Status,
     #[serde(default)]
     tcomment: String,
     #[serde(default)]

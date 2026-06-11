@@ -11,11 +11,28 @@
 use crate::domain::ApAgingEntry;
 use crate::hledger::{BalanceReport, amount::render_amounts};
 
+/// The closed set of soft invariants we surface (M5 adds `OverBudget`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagKind {
+    Overdraft,
+    ApAging,
+}
+
+impl FlagKind {
+    /// The label used in rendered report footers.
+    pub fn label(self) -> &'static str {
+        match self {
+            FlagKind::Overdraft => "overdraft",
+            FlagKind::ApAging => "ap-aging",
+        }
+    }
+}
+
 /// One surfaced soft-invariant violation. Informational only, by design.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Flag {
-    /// The invariant kind, e.g. `"overdraft"` (M4/M5 add `"ap-aging"`, `"over-budget"`).
-    pub kind: &'static str,
+    /// The invariant kind.
+    pub kind: FlagKind,
     /// The account the flag is about.
     pub account: String,
     /// Human-readable detail (rendered amounts).
@@ -24,7 +41,13 @@ pub struct Flag {
 
 impl std::fmt::Display for Flag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "flag {}: {} {}", self.kind, self.account, self.detail)
+        write!(
+            f,
+            "flag {}: {} {}",
+            self.kind.label(),
+            self.account,
+            self.detail
+        )
     }
 }
 
@@ -45,7 +68,7 @@ pub fn overdraft_flags(report: &BalanceReport) -> Vec<Flag> {
         for amount in &row.amounts {
             if amount.quantity.mantissa < 0 {
                 flags.push(Flag {
-                    kind: "overdraft",
+                    kind: FlagKind::Overdraft,
                     account: row.account.clone(),
                     detail: format!("balance {}", amount.render()),
                 });
@@ -62,7 +85,7 @@ pub fn ap_aging_flags(entries: &[ApAgingEntry]) -> Vec<Flag> {
         .iter()
         .filter(|e| e.age.as_ref().map(|a| a.is_overdue()).unwrap_or(false))
         .map(|e| Flag {
-            kind: "ap-aging",
+            kind: FlagKind::ApAging,
             account: e.vendor_account.clone(),
             detail: format!(
                 "outstanding {} since {} (90+ days overdue)",
@@ -112,7 +135,7 @@ mod tests {
     fn negative_asset_balance_is_flagged() {
         let flags = overdraft_flags(&report(vec![row("assets:checking", -1250)]));
         assert_eq!(flags.len(), 1);
-        assert_eq!(flags[0].kind, "overdraft");
+        assert_eq!(flags[0].kind, FlagKind::Overdraft);
         assert_eq!(flags[0].account, "assets:checking");
         assert_eq!(flags[0].detail, "balance $-12.50");
     }
@@ -178,7 +201,7 @@ mod tests {
         ];
         let flags = ap_aging_flags(&entries);
         assert_eq!(flags.len(), 1);
-        assert_eq!(flags[0].kind, "ap-aging");
+        assert_eq!(flags[0].kind, FlagKind::ApAging);
         assert_eq!(flags[0].account, "liabilities:ap:vendor:A");
         assert!(flags[0].detail.contains("overdue"), "{}", flags[0].detail);
     }
