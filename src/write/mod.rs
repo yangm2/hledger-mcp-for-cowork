@@ -1197,4 +1197,38 @@ mod tests {
         );
         assert!(!stray.exists(), "stray candidate temp was swept");
     }
+
+    #[test]
+    fn validate_account_name_accepts_valid_names() {
+        assert!(validate_account_name("assets:checking").is_ok());
+        assert!(validate_account_name("liabilities:ap:vendor:Acme").is_ok());
+        // leading/trailing whitespace is trimmed and the result is valid
+        assert!(validate_account_name("  assets:checking  ").is_ok());
+    }
+
+    #[test]
+    fn validate_account_name_rejects_empty_and_blank() {
+        assert!(validate_account_name("").is_err());
+        assert!(validate_account_name("   ").is_err());
+    }
+
+    #[test]
+    fn validate_account_name_rejects_newline() {
+        assert!(validate_account_name("assets\nchecking").is_err());
+    }
+
+    #[test]
+    fn validate_account_name_rejects_semicolon() {
+        assert!(validate_account_name("assets:checking ; comment").is_err());
+    }
+
+    #[test]
+    fn validate_account_name_rejects_leading_colon() {
+        assert!(validate_account_name(":assets:checking").is_err());
+    }
+
+    #[test]
+    fn validate_account_name_rejects_trailing_colon() {
+        assert!(validate_account_name("assets:checking:").is_err());
+    }
 }

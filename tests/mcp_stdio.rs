@@ -387,6 +387,143 @@ fn concurrent_writers_from_two_processes_serialize() {
     );
 }
 
+/// **M4 domain tools e2e:** drive all eight M4 tools over the wire against a fresh
+/// tempdir journal, checking response content (not just `isError: false`). Skips when
+/// hledger is absent.
+#[test]
+fn m4_domain_tools_work_end_to_end() {
+    if !hledger_available() {
+        eprintln!("SKIP M4 e2e: hledger not found (run inside `nix develop`)");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let journal = dir.path().join("main.journal");
+    let journal_arg = journal.display().to_string();
+    let mut server = Server::spawn_args(&["--journal", &journal_arg]);
+    initialize(&mut server, "2025-11-25");
+
+    let mut id = 700;
+    let mut call = |server: &mut Server, name: &str, args: Value| -> String {
+        id += 1;
+        server.send(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": name, "arguments": args }
+        }));
+        let resp = server.recv();
+        assert_eq!(
+            resp["result"]["isError"],
+            json!(false),
+            "{name} must not be isError: {resp}"
+        );
+        resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content")
+            .to_owned()
+    };
+
+    // Bootstrap declarations
+    call(
+        &mut server,
+        "declare_commodity",
+        json!({ "commodity": "$" }),
+    );
+    call(
+        &mut server,
+        "declare_account",
+        json!({ "account": "assets:checking" }),
+    );
+    call(
+        &mut server,
+        "declare_account",
+        json!({ "account": "equity:owner capital" }),
+    );
+    call(
+        &mut server,
+        "declare_account",
+        json!({ "account": "income:interest" }),
+    );
+
+    // vendor_add — declares AP + expense accounts
+    let va = call(
+        &mut server,
+        "vendor_add",
+        json!({ "vendor": "Acme", "vendor_type": "trade", "trade": "plumbing" }),
+    );
+    assert!(va.contains("Acme"), "vendor_add response: {va}");
+
+    // vendor_list — Acme's AP account is now declared
+    let vl = call(&mut server, "vendor_list", json!({}));
+    assert!(
+        vl.contains("liabilities:ap:vendor:Acme"),
+        "vendor_list response: {vl}"
+    );
+
+    // fund_project
+    let fp = call(
+        &mut server,
+        "fund_project",
+        json!({ "date": "2020-01-01", "amount": "50000.00", "commodity": "$" }),
+    );
+    assert!(fp.contains("commit"), "fund_project response: {fp}");
+
+    // receive_invoice — use an old date so the aging flag fires
+    let ri = call(
+        &mut server,
+        "receive_invoice",
+        json!({
+            "date": "2020-01-15",
+            "vendor": "Acme",
+            "expense_account": "expenses:construction:plumbing",
+            "amount": "8000.00",
+            "commodity": "$",
+            "invoice_ref": "INV-001"
+        }),
+    );
+    assert!(ri.contains("commit"), "receive_invoice response: {ri}");
+
+    // get_ap_aging — Acme balance is outstanding and old enough to be overdue
+    let aging = call(&mut server, "get_ap_aging", json!({}));
+    assert!(aging.contains("AP aging"), "get_ap_aging header: {aging}");
+    assert!(aging.contains("Acme"), "get_ap_aging has vendor: {aging}");
+    // The invoice is from 2020 — definitely Over90Days; the ap-aging flag must appear
+    assert!(
+        aging.contains("overdue"),
+        "get_ap_aging must surface overdue flag: {aging}"
+    );
+
+    // pay_invoice — clears Acme's AP balance
+    let pi = call(
+        &mut server,
+        "pay_invoice",
+        json!({
+            "date": "2020-02-01",
+            "vendor": "Acme",
+            "amount": "8000.00",
+            "commodity": "$"
+        }),
+    );
+    assert!(pi.contains("commit"), "pay_invoice response: {pi}");
+
+    // post_interest
+    let int = call(
+        &mut server,
+        "post_interest",
+        json!({ "date": "2020-03-01", "amount": "10.00", "commodity": "$" }),
+    );
+    assert!(int.contains("commit"), "post_interest response: {int}");
+
+    // get_project_summary — balance sheet + income statement
+    let summary = call(&mut server, "get_project_summary", json!({}));
+    assert!(
+        summary.contains("Balance Sheet"),
+        "summary has balance sheet: {summary}"
+    );
+    assert!(
+        summary.contains("Income Statement"),
+        "summary has income statement: {summary}"
+    );
+}
+
 #[test]
 fn bad_tool_args_return_iserror_not_protocol_error() {
     let mut server = Server::spawn();

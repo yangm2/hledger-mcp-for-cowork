@@ -6,6 +6,7 @@ description = "An hledger MCP (model context protocol) implementation for Claude
 
 [dependencies]
 anyhow = "1.0.102"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 uuid = { version = "1.18.1", features = ["v4"] }

@@ -144,61 +144,21 @@ pub fn post_interest_input(
     }
 }
 
-// ---- Date arithmetic (no external deps) --------------------------------------------
-//
-// Uses Howard Hinnant's civil-calendar algorithm:
-// https://howardhinnant.github.io/date_algorithms.html
+// ---- Date arithmetic ---------------------------------------------------------------
 
-/// Convert (year, month, day) to days since the UNIX epoch (1970-01-01).
-fn unix_days_from_ymd(y: i32, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y } as i64;
-    let m = m as i64;
-    let d = d as i64;
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
+use chrono::{Local, NaiveDate};
 
-/// Parse `YYYY-MM-DD` to (year, month, day). Returns `None` on malformed input.
-fn parse_iso_date(s: &str) -> Option<(i32, u32, u32)> {
-    let mut parts = s.splitn(3, '-');
-    let y: i32 = parts.next()?.parse().ok()?;
-    let m: u32 = parts.next()?.parse().ok()?;
-    let d: u32 = parts.next()?.parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return None;
-    }
-    Some((y, m, d))
-}
-
-/// Today's date as `YYYY-MM-DD` (UTC).
+/// Today's date as `YYYY-MM-DD` (local time).
 pub fn today_iso() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    // Hinnant days-from-epoch → (y, m, d)
-    let z = secs / 86400 + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y_raw = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y_raw + 1 } else { y_raw };
-    format!("{y:04}-{m:02}-{d:02}")
+    Local::now().date_naive().format("%Y-%m-%d").to_string()
 }
 
 /// Days from `earlier` to `later` (positive = later is after earlier).
 /// Returns `None` if either string is not a valid `YYYY-MM-DD`.
 pub fn days_between(earlier: &str, later: &str) -> Option<i64> {
-    let (y1, m1, d1) = parse_iso_date(earlier)?;
-    let (y2, m2, d2) = parse_iso_date(later)?;
-    Some(unix_days_from_ymd(y2, m2, d2) - unix_days_from_ymd(y1, m1, d1))
+    let e = NaiveDate::parse_from_str(earlier, "%Y-%m-%d").ok()?;
+    let l = NaiveDate::parse_from_str(later, "%Y-%m-%d").ok()?;
+    Some((l - e).num_days())
 }
 
 // ---- AP aging ----------------------------------------------------------------------
@@ -599,6 +559,102 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(entries[0].oldest_invoice_date.is_none());
         assert!(entries[0].age.is_none());
+    }
+
+    #[test]
+    fn age_category_labels_are_exact() {
+        assert_eq!(AgeCategory::Current.label(), "current (0-30 days)");
+        assert_eq!(AgeCategory::Days31to60.label(), "31-60 days");
+        assert_eq!(AgeCategory::Days61to90.label(), "61-90 days");
+        assert_eq!(AgeCategory::Over90Days.label(), "90+ days (overdue)");
+    }
+
+    #[test]
+    fn compute_ap_aging_excludes_non_invoice_tagged_transactions() {
+        use crate::hledger::Posting;
+        let balance = BalanceReport {
+            rows: vec![ap_balance("liabilities:ap:vendor:X", -5000)],
+            totals: vec![],
+        };
+        let non_invoice = Transaction {
+            date: "2026-01-01".to_string(),
+            description: "payment".to_string(),
+            index: 1,
+            status: "Unmarked".to_string(),
+            comment: String::new(),
+            tags: vec![("other".to_string(), "value".to_string())],
+            postings: vec![Posting {
+                account: "liabilities:ap:vendor:X".to_string(),
+                amounts: vec![make_amount(-5000)],
+                comment: String::new(),
+                tags: vec![],
+            }],
+        };
+        let entries = compute_ap_aging(&balance, &[non_invoice], "2026-06-01");
+        assert!(
+            entries[0].oldest_invoice_date.is_none(),
+            "non-invoice txn must not count as invoice date"
+        );
+    }
+
+    #[test]
+    fn compute_ap_aging_excludes_invoice_txns_for_other_accounts() {
+        let balance = BalanceReport {
+            rows: vec![ap_balance("liabilities:ap:vendor:X", -5000)],
+            totals: vec![],
+        };
+        // Invoice txn for a different account: should not contribute to X's date
+        let other = invoice_txn("2026-01-01", "liabilities:ap:vendor:OTHER");
+        let entries = compute_ap_aging(&balance, &[other], "2026-06-01");
+        assert!(entries[0].oldest_invoice_date.is_none());
+    }
+
+    #[test]
+    fn render_composite_basic() {
+        use crate::hledger::{CompositeReport, ReportRow, Subreport};
+        let report = CompositeReport {
+            title: "Balance Sheet".to_string(),
+            subreports: vec![Subreport {
+                name: "Assets".to_string(),
+                rows: vec![ReportRow {
+                    account: "assets:checking".to_string(),
+                    total: vec![make_amount(10000)],
+                }],
+                totals: vec![make_amount(10000)],
+                is_positive: true,
+            }],
+            totals: vec![make_amount(10000)],
+        };
+        let text = render_composite(&report);
+        assert!(text.starts_with("Balance Sheet"), "title: {text}");
+        assert!(text.contains("Assets:"), "subreport name: {text}");
+        assert!(text.contains("assets:checking"), "account row: {text}");
+        assert!(text.contains("$100.00"), "amount: {text}");
+        assert!(text.contains("Net:"), "net total line: {text}");
+    }
+
+    #[test]
+    fn render_ap_aging_empty_returns_no_payables_message() {
+        let text = render_ap_aging(&[], "2026-06-01");
+        assert_eq!(text, "AP aging as of 2026-06-01: (no outstanding payables)");
+    }
+
+    #[test]
+    fn render_ap_aging_with_entry_contains_key_fields() {
+        let entries = vec![ApAgingEntry {
+            vendor_account: "liabilities:ap:vendor:Acme".to_string(),
+            outstanding: vec![make_amount(-800000)],
+            oldest_invoice_date: Some("2026-01-01".to_string()),
+            age: Some(AgeCategory::Over90Days),
+        }];
+        let text = render_ap_aging(&entries, "2026-06-01");
+        assert!(text.contains("AP aging as of 2026-06-01"), "header: {text}");
+        assert!(
+            text.contains("liabilities:ap:vendor:Acme"),
+            "vendor: {text}"
+        );
+        assert!(text.contains("90+ days (overdue)"), "age label: {text}");
+        assert!(text.contains("2026-01-01"), "oldest invoice date: {text}");
     }
 
     use proptest::prelude::*;
