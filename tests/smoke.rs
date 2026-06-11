@@ -121,21 +121,25 @@ fn hledger_check_read_and_commit_roundtrip() {
 use hledger_mcp_for_cowork::epoch::ToolClass;
 use hledger_mcp_for_cowork::hledger::Hledger;
 use hledger_mcp_for_cowork::write::{
-    self, WriteError, WriteOutcome,
+    self, CommitOutcome, WriteError, WriteOutcome,
     input::{PostingAmount, PostingInput, TransactionInput},
 };
 
 // The write ops demand a `WriteGuard` proof that only the gate mints (the M3 type-level
 // invariant), so the e2e drives them through `guarded_once` — the production locking path.
 
-async fn declare_commodity(hl: &Hledger, symbol: &str, places: u32) -> Result<String, WriteError> {
+async fn declare_commodity(
+    hl: &Hledger,
+    symbol: &str,
+    places: u32,
+) -> Result<CommitOutcome, WriteError> {
     write::guarded_once(hl, ToolClass::Record, async |ctx| {
         write::declare_commodity(&ctx, symbol, places).await
     })
     .await
 }
 
-async fn declare_account(hl: &Hledger, name: &str) -> Result<String, WriteError> {
+async fn declare_account(hl: &Hledger, name: &str) -> Result<CommitOutcome, WriteError> {
     write::guarded_once(hl, ToolClass::Record, async |ctx| {
         write::declare_account(&ctx, name).await
     })
@@ -227,7 +231,7 @@ async fn write_path_declare_post_void_round_trip() {
     };
     let posted = post_transaction(&hl, input.clone()).await.expect("post");
     assert!(!posted.deduped);
-    assert_ne!(posted.commit, c0, "post is a new commit/epoch");
+    assert_ne!(posted.base.commit, c0.commit, "post is a new commit/epoch");
 
     // Idempotent retry with the same idem key → no new transaction.
     let retry = post_transaction(&hl, input).await.expect("retry");
@@ -244,8 +248,11 @@ async fn write_path_declare_post_void_round_trip() {
     );
 
     // Void it → append-only reversing entry; nets the account to zero.
-    let voided = void_transaction(&hl, &posted.id).await.expect("void");
-    assert_ne!(voided.commit, posted.commit, "void is its own commit");
+    let voided = void_transaction(&hl, &posted.base.id).await.expect("void");
+    assert_ne!(
+        voided.base.commit, posted.base.commit,
+        "void is its own commit"
+    );
     let after_void = hl.list_transactions(&[]).await.expect("list2");
     assert_eq!(after_void.len(), 2, "original + reversal");
     assert!(
@@ -331,7 +338,7 @@ async fn posted_transactions_round_trip_through_hledger() {
         }
         // The author-stamped id tag matches the outcome.
         assert!(
-            txn.tags.iter().any(|(k, v)| k == "id" && *v == out.id),
+            txn.tags.iter().any(|(k, v)| k == "id" && *v == out.base.id),
             "id tag round-trips for {idem}"
         );
     }

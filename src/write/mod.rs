@@ -36,16 +36,33 @@ use input::TransactionInput;
 /// The hledger version the write path hard-gates on (CLAUDE.md: pinned 1.52).
 use crate::hledger::PINNED_VERSION;
 
-/// Outcome of a successful write.
+/// The identity+epoch half of any write outcome: what was written and which commit it landed in.
+/// Returned by declare/tombstone ops. Transaction ops return [`WriteOutcome`], which composes
+/// this with dedup tracking.
+#[derive(Debug, Clone)]
+pub struct CommitOutcome {
+    /// Stable identifier: the transaction's `id:` UUID, or the account/commodity name.
+    pub id: String,
+    /// The new (or current, for a dedup) `HEAD` commit oid.
+    pub commit: String,
+}
+
+/// Outcome of a successful transaction write (`post`, `void`, `update`). Composes
+/// [`CommitOutcome`] with idempotency tracking.
 #[derive(Debug, Clone)]
 pub struct WriteOutcome {
-    /// The transaction's stable `id:` tag (a fresh UUID), or the account/commodity name for
-    /// `declare_*`.
-    pub id: String,
-    /// The new `HEAD` commit oid — the epoch. (For a deduped post, the *current* HEAD.)
-    pub commit: String,
+    pub base: CommitOutcome,
     /// `true` when an idempotent retry matched an existing transaction (no new commit).
     pub deduped: bool,
+}
+
+impl From<CommitOutcome> for WriteOutcome {
+    fn from(base: CommitOutcome) -> Self {
+        WriteOutcome {
+            base,
+            deduped: false,
+        }
+    }
 }
 
 /// Errors from the write path, partitioned by how the caller should treat them.
@@ -339,11 +356,11 @@ fn ensure_journal_exists(journal: &Path) -> Result<(), WriteError> {
 /// Assumes the version gate already passed and the input was already validated (so a `check`
 /// failure here is an [`WriteError::Internal`] — our bug — with the diagnostic attached).
 async fn append_and_commit(
-    hledger: &Hledger,
-    journal: &Path,
+    ctx: &WriteContext<'_>,
     addition: &str,
     commit_message: &str,
 ) -> Result<String, WriteError> {
+    let journal = ctx.journal();
     ensure_journal_exists(journal)?;
     let live = std::fs::read_to_string(journal).map_err(WriteError::io("read journal"))?;
 
@@ -359,7 +376,7 @@ async fn append_and_commit(
     let tmp = dir.join(format!("{CANDIDATE_PREFIX}{}.journal", Uuid::new_v4()));
     std::fs::write(&tmp, &candidate).map_err(WriteError::io("write candidate"))?;
 
-    if let Err(err) = hledger.check_strict(&tmp).await {
+    if let Err(err) = ctx.hledger.check_strict(&tmp).await {
         let _ = std::fs::remove_file(&tmp);
         let detail = match err {
             HledgerError::NonZero { stderr, .. } => stderr,
@@ -468,8 +485,10 @@ pub async fn post_transaction(
         let repo = GitRepo::open_or_init(&repo_dir(journal))?;
         let commit = repo.head_oid()?.unwrap_or_default();
         return Ok(WriteOutcome {
-            id: tag_value(prior, "id").unwrap_or_default(),
-            commit,
+            base: CommitOutcome {
+                id: tag_value(prior, "id").unwrap_or_default(),
+                commit,
+            },
             deduped: true,
         });
     }
@@ -488,10 +507,9 @@ pub async fn post_transaction(
         &tags,
     );
 
-    let commit = append_and_commit(ctx.hledger, journal, &text, &format!("post id:{id}")).await?;
+    let commit = append_and_commit(ctx, &text, &format!("post id:{id}")).await?;
     Ok(WriteOutcome {
-        id,
-        commit,
+        base: CommitOutcome { id, commit },
         deduped: false,
     })
 }
@@ -551,16 +569,10 @@ pub async fn void_transaction(
     // Reversal carries the target's date (period-neutral void).
     let text = render_entry(&target.date, &description, &postings, &tags);
 
-    let commit = append_and_commit(
-        ctx.hledger,
-        journal,
-        &text,
-        &format!("void reverses:{target_id} id:{id}"),
-    )
-    .await?;
+    let commit =
+        append_and_commit(ctx, &text, &format!("void reverses:{target_id} id:{id}")).await?;
     Ok(WriteOutcome {
-        id,
-        commit,
+        base: CommitOutcome { id, commit },
         deduped: false,
     })
 }
@@ -592,19 +604,20 @@ fn sanitize(text: &str) -> String {
 
 /// `declare_account`: append an `account <name>` directive (the require-pre-declare prerequisite
 /// of posting). Idempotent at the journal level (a duplicate directive is harmless).
-pub async fn declare_account(ctx: &WriteContext<'_>, name: &str) -> Result<String, WriteError> {
+pub async fn declare_account(
+    ctx: &WriteContext<'_>,
+    name: &str,
+) -> Result<CommitOutcome, WriteError> {
     let name = name.trim();
     if name.is_empty() || name.contains(['\n', ';']) || name.starts_with(':') || name.ends_with(':')
     {
         return Err(WriteError::Input(format!("invalid account name: '{name}'")));
     }
-    append_and_commit(
-        ctx.hledger,
-        ctx.journal(),
-        &format!("account {name}\n"),
-        "declare account",
-    )
-    .await
+    let commit = append_and_commit(ctx, &format!("account {name}\n"), "declare account").await?;
+    Ok(CommitOutcome {
+        id: name.to_string(),
+        commit,
+    })
 }
 
 /// `declare_commodity`: append a `commodity` directive defining the symbol's display style with
@@ -614,7 +627,7 @@ pub async fn declare_commodity(
     ctx: &WriteContext<'_>,
     symbol: &str,
     places: u32,
-) -> Result<String, WriteError> {
+) -> Result<CommitOutcome, WriteError> {
     let symbol = symbol.trim();
     if symbol.is_empty()
         || symbol.contains(['\n', ';', ' '])
@@ -635,7 +648,11 @@ pub async fn declare_commodity(
     } else {
         format!("commodity {sample_number} {symbol}\n")
     };
-    append_and_commit(ctx.hledger, ctx.journal(), &directive, "declare commodity").await
+    let commit = append_and_commit(ctx, &directive, "declare commodity").await?;
+    Ok(CommitOutcome {
+        id: symbol.to_string(),
+        commit,
+    })
 }
 
 /// `tombstone_account`: **soft-delete** an account by appending a duplicate `account` directive
@@ -643,7 +660,10 @@ pub async fn declare_commodity(
 /// and `accounts --declared tag:^tombstoned$` filters on it). The account stays declared, so
 /// existing references and even new postings still resolve (C-4) — nothing is ever hard-deleted.
 /// Idempotent: re-tombstoning an already-tombstoned account is a no-op returning current `HEAD`.
-pub async fn tombstone_account(ctx: &WriteContext<'_>, name: &str) -> Result<String, WriteError> {
+pub async fn tombstone_account(
+    ctx: &WriteContext<'_>,
+    name: &str,
+) -> Result<CommitOutcome, WriteError> {
     let journal = ctx.journal();
     ensure_journal_exists(journal)?;
     let name = name.trim();
@@ -665,18 +685,24 @@ pub async fn tombstone_account(ctx: &WriteContext<'_>, name: &str) -> Result<Str
         .await
         .map_err(|e| WriteError::Internal(format!("read tombstoned accounts: {e}")))?;
     if tombstoned.iter().any(|a| a == name) {
-        // Already tombstoned — idempotent no-op at the current epoch. A hand-authored journal
-        // can carry the tag with no repo/commit yet; render that as "(unborn)", never "".
+        // Already tombstoned — idempotent no-op at the current epoch.
         let epoch = current_epoch(journal)?;
-        return Ok(epoch.oid().map_or_else(|| epoch.short(), str::to_string));
+        let commit = epoch.oid().map_or_else(|| epoch.short(), str::to_string);
+        return Ok(CommitOutcome {
+            id: name.to_string(),
+            commit,
+        });
     }
-    append_and_commit(
-        ctx.hledger,
-        journal,
+    let commit = append_and_commit(
+        ctx,
         &format!("account {name}  ; tombstoned:\n"),
         &format!("tombstone account {name}"),
     )
-    .await
+    .await?;
+    Ok(CommitOutcome {
+        id: name.to_string(),
+        commit,
+    })
 }
 
 /// A one-line git/write-readiness summary for `status` (read-only — never inits a repo).
@@ -926,7 +952,7 @@ mod tests {
         // Deliberately malformed (unbalanced single posting) — simulates a formatter bug. The
         // pipeline must fail closed: internal error, live journal untouched, no commit.
         let bad = "2026-01-01 bad\n    assets:checking  100.00 $\n";
-        let err = append_and_commit(&hl, &journal, bad, "should not commit")
+        let err = append_and_commit(&ctx(&hl), bad, "should not commit")
             .await
             .expect_err("invalid candidate must be rejected");
         assert!(matches!(err, WriteError::Internal(_)), "{err:?}");
@@ -1083,7 +1109,7 @@ mod tests {
             ("assets:savings", Some("10.00")),
             ("equity:opening", None),
         ]);
-        let err = update_transaction(&ctx(&hl), &posted.id, bad)
+        let err = update_transaction(&ctx(&hl), &posted.base.id, bad)
             .await
             .expect_err("invalid replacement must fail");
         assert!(matches!(err, WriteError::Input(_)), "{err:?}");

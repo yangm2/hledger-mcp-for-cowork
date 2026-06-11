@@ -215,7 +215,10 @@ async fn c2_idempotent_posts_under_the_partition() {
         .await
         .expect("retry");
     assert!(retry.deduped, "duplicate idem deduplicates");
-    assert_eq!(retry.id, first.id, "dedup returns the original's id");
+    assert_eq!(
+        retry.base.id, first.base.id,
+        "dedup returns the original's id"
+    );
 
     let all = a.hledger.list_transactions(&[]).await.expect("list");
     assert_eq!(all.len(), 1, "exactly one transaction recorded");
@@ -245,7 +248,7 @@ async fn c3_epoch_monotonic_writes_advance_reads_dont() {
             )
             .await
             .expect("write");
-        epochs.push(outcome.commit.clone());
+        epochs.push(outcome.base.commit.clone());
     }
 
     // Strictly advancing: all distinct, and each commit's parent is its predecessor.
@@ -316,7 +319,11 @@ async fn c4_posting_to_tombstoned_account_resolves() {
     })
     .await
     .expect("idempotent re-tombstone");
-    assert_eq!(Some(again.as_str()), head_before.oid(), "no new commit");
+    assert_eq!(
+        Some(again.commit.as_str()),
+        head_before.oid(),
+        "no new commit"
+    );
 
     // Tombstoning an undeclared account is a correctable input error.
     let err = write::guarded_once(hl, ToolClass::Record, async |ctx| {

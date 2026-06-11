@@ -24,7 +24,8 @@ use crate::hledger::{BalanceReport, Hledger, HledgerError, PINNED_VERSION, Trans
 use std::ops::AsyncFnOnce;
 
 use crate::write::{
-    self, ConnectionView, WriteContext, WriteError, WriteOutcome, input::TransactionInput,
+    self, CommitOutcome, ConnectionView, WriteContext, WriteError, WriteOutcome,
+    input::TransactionInput,
 };
 
 const SERVER_NAME: &str = "hledger-mcp";
@@ -373,11 +374,11 @@ impl HledgerMcp {
         self.guarded_tool(
             ToolClass::Record,
             async |ctx| write::declare_account(&ctx, &account).await,
-            |commit| {
+            |out: &CommitOutcome| {
                 format!(
                     "declared account '{}' (commit {})",
-                    args.account,
-                    short_oid(commit)
+                    out.id,
+                    short_oid(&out.commit)
                 )
             },
         )
@@ -405,11 +406,11 @@ impl HledgerMcp {
         self.guarded_tool(
             ToolClass::Record,
             async |ctx| write::tombstone_account(&ctx, &account).await,
-            |commit| {
+            |out: &CommitOutcome| {
                 format!(
                     "closed (tombstoned) account '{}' (commit {})",
-                    args.account,
-                    short_oid(commit)
+                    out.id,
+                    short_oid(&out.commit)
                 )
             },
         )
@@ -436,12 +437,12 @@ impl HledgerMcp {
         self.guarded_tool(
             ToolClass::Record,
             async |ctx| write::declare_commodity(&ctx, &commodity, places).await,
-            |commit| {
+            |out: &CommitOutcome| {
                 format!(
                     "declared commodity '{}' ({} dp, commit {})",
-                    args.commodity,
+                    out.id,
                     places,
-                    short_oid(commit)
+                    short_oid(&out.commit)
                 )
             },
         )
@@ -499,8 +500,8 @@ impl HledgerMcp {
                 format!(
                     "voided '{}' with reversing entry id:{} (commit {})",
                     args.id,
-                    outcome.id,
-                    short_oid(&outcome.commit)
+                    outcome.base.id,
+                    short_oid(&outcome.base.commit)
                 )
             },
         )
@@ -533,8 +534,8 @@ impl HledgerMcp {
                 format!(
                     "updated: voided '{}', posted replacement id:{} (commit {})",
                     args.id,
-                    outcome.id,
-                    short_oid(&outcome.commit)
+                    outcome.base.id,
+                    short_oid(&outcome.base.commit)
                 )
             },
         )
@@ -577,14 +578,14 @@ fn post_outcome_text(outcome: &WriteOutcome) -> String {
     if outcome.deduped {
         format!(
             "already posted (idempotent): transaction id:{} — no new commit (HEAD {})",
-            outcome.id,
-            short_oid(&outcome.commit)
+            outcome.base.id,
+            short_oid(&outcome.base.commit)
         )
     } else {
         format!(
             "posted transaction id:{} (commit {})",
-            outcome.id,
-            short_oid(&outcome.commit)
+            outcome.base.id,
+            short_oid(&outcome.base.commit)
         )
     }
 }
@@ -1019,8 +1020,10 @@ mod tests {
     #[test]
     fn post_outcome_text_distinguishes_deduped() {
         let fresh = WriteOutcome {
-            id: "i1".into(),
-            commit: "deadbeefcafe0000".into(),
+            base: CommitOutcome {
+                id: "i1".into(),
+                commit: "deadbeefcafe0000".into(),
+            },
             deduped: false,
         };
         assert!(post_outcome_text(&fresh).starts_with("posted transaction id:i1"));
