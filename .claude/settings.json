@@ -18,7 +18,9 @@
       "Bash(rustup target *)",
       "Bash(python3 -)",
       "Bash(echo \"exit=$?\")",
-      "WebFetch(domain:mise.en.dev)"
+      "WebFetch(domain:mise.en.dev)",
+      "Skill(code-review)",
+      "Skill(code-review:*)"
     ]
   },
   "hooks": {

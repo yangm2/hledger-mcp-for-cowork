@@ -190,7 +190,7 @@ impl AgeCategory {
 }
 
 /// Classify a non-negative age in days into a bucket.
-pub fn age_category(days: i64) -> AgeCategory {
+pub fn age_category(days: u64) -> AgeCategory {
     match days {
         d if d <= 30 => AgeCategory::Current,
         d if d <= 60 => AgeCategory::Days31to60,
@@ -235,6 +235,17 @@ pub fn compute_ap_aging(
             let age = oldest
                 .as_deref()
                 .and_then(|d| days_between(d, as_of))
+                .and_then(|n| {
+                    u64::try_from(n)
+                        .map_err(|_| {
+                            tracing::warn!(
+                                account = %row.account,
+                                days = n,
+                                "invoice date is in the future relative to as_of; age unknown"
+                            );
+                        })
+                        .ok()
+                })
                 .map(age_category);
             ApAgingEntry {
                 vendor_account: row.account.clone(),
@@ -252,8 +263,13 @@ fn oldest_invoice_date_for(account: &str, transactions: &[Transaction]) -> Optio
     transactions
         .iter()
         .filter(|txn| {
-            txn.postings.iter().any(|p| p.account == account)
-                && txn.tags.iter().any(|(k, _)| k == "invoice")
+            let has_account_posting = txn.postings.iter().any(|p| p.account == account);
+            let has_invoice_tag = txn.tags.iter().any(|(k, _)| k == "invoice")
+                || txn
+                    .postings
+                    .iter()
+                    .any(|p| p.account == account && p.tags.iter().any(|(k, _)| k == "invoice"));
+            has_account_posting && has_invoice_tag
         })
         .map(|txn| txn.date.as_str())
         .min()
@@ -661,7 +677,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn age_category_handles_all_non_negative_days(days in 0i64..10000) {
+        fn age_category_handles_all_non_negative_days(days in 0u64..10000) {
             let cat = age_category(days);
             // Every non-negative input maps to exactly one bucket
             let _ = cat.label();

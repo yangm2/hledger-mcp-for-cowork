@@ -16,7 +16,7 @@
 ///
 /// Wraps the 40-char hex string produced by libgit2. `short()` trims to 12 chars for
 /// human-facing messages; `Display` emits the full oid.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CommitOid(String);
 
 impl CommitOid {

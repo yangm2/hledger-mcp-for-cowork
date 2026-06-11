@@ -483,7 +483,11 @@ pub async fn post_transaction(
         .map_err(|e| WriteError::Internal(format!("idempotency query: {e}")))?;
     if let Some(prior) = existing.first() {
         let repo = GitRepo::open_or_init(&repo_dir(journal))?;
-        let commit = repo.head_oid()?.unwrap_or_default();
+        let commit = repo.head_oid()?.ok_or_else(|| {
+            WriteError::Internal(
+                "idempotency dedup found a prior transaction but HEAD is unborn".to_string(),
+            )
+        })?;
         return Ok(WriteOutcome {
             base: CommitOutcome {
                 id: tag_value(prior, "id").unwrap_or_default(),
@@ -717,15 +721,15 @@ pub async fn tombstone_account(
         .await
         .map_err(|e| WriteError::Internal(format!("read tombstoned accounts: {e}")))?;
     if tombstoned.iter().any(|a| a == name) {
-        // Already tombstoned — idempotent no-op at the current epoch. HEAD must be born
-        // here: a tombstone requires a prior commit, so an unborn repo is impossible.
         let epoch = current_epoch(journal)?;
-        let commit = CommitOid::new(
-            epoch
-                .oid()
-                .expect("idempotent tombstone implies a prior commit")
-                .to_string(),
-        );
+        let commit_str = epoch.oid().ok_or_else(|| {
+            WriteError::Internal(
+                "tombstone found in journal but HEAD is unborn — \
+                 the journal may have been hand-authored outside the write tools"
+                    .to_string(),
+            )
+        })?;
+        let commit = CommitOid::new(commit_str.to_string());
         return Ok(CommitOutcome {
             id: name.to_string(),
             commit,

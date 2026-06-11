@@ -9,6 +9,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use chrono::NaiveDate;
+
 use rmcp::handler::server::common::schema_for_type;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -727,6 +729,21 @@ impl HledgerMcp {
         self.guarded_tool(
             ToolClass::Record,
             async |ctx| {
+                let ap_account = crate::domain::vendor_ap_account(&vendor);
+                let balance = ctx
+                    .hledger
+                    .balance_flat(Some(&ap_account))
+                    .await
+                    .map_err(|e| WriteError::Internal(format!("AP balance query: {e}")))?;
+                let has_outstanding = balance
+                    .rows
+                    .iter()
+                    .any(|row| row.amounts.iter().any(|a| a.quantity.mantissa < 0));
+                if !has_outstanding {
+                    return Err(WriteError::Input(format!(
+                        "vendor '{vendor}' has no outstanding AP balance"
+                    )));
+                }
                 let input =
                     crate::domain::pay_invoice_input(date, &vendor, amount, commodity, idem);
                 write::post_transaction(&ctx, input).await
@@ -866,6 +883,11 @@ impl HledgerMcp {
             Err(e) => return Ok(e),
         };
         let as_of = args.as_of.unwrap_or_else(crate::domain::today_iso);
+        if NaiveDate::parse_from_str(&as_of, "%Y-%m-%d").is_err() {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "input error: as_of must be YYYY-MM-DD, got {as_of:?}"
+            ))]));
+        }
         let hledger = &self.hledger;
         let ap_query = "liabilities:ap".to_string();
         let result = self
