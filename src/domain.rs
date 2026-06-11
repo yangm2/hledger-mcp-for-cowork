@@ -15,9 +15,32 @@ pub const CHECKING_ACCOUNT: &str = "assets:checking";
 pub const OWNER_CAPITAL_ACCOUNT: &str = "equity:owner capital";
 pub const INTEREST_INCOME_ACCOUNT: &str = "income:interest";
 
+/// Root of the accounts-payable subtree (the `get_ap_aging` query scope).
+pub const AP_ROOT: &str = "liabilities:ap";
+
+/// Prefix of every per-vendor AP account (see [`vendor_ap_account`]).
+pub const VENDOR_AP_PREFIX: &str = "liabilities:ap:vendor:";
+
 /// The AP account for a vendor: `liabilities:ap:vendor:{vendor}`.
 pub fn vendor_ap_account(vendor: &str) -> String {
-    format!("liabilities:ap:vendor:{vendor}")
+    format!("{VENDOR_AP_PREFIX}{vendor}")
+}
+
+/// Whether `account` is inside the AP subtree (an aging-report row).
+pub fn is_ap_account(account: &str) -> bool {
+    account
+        .strip_prefix(AP_ROOT)
+        .is_some_and(|rest| rest.starts_with(':'))
+}
+
+/// Whether the AP balance report shows any outstanding payable. Double-entry sign
+/// convention: a liability owed appears as a **negative** amount, so "outstanding"
+/// means some AP row carries a negative quantity. `pay_invoice`'s precondition.
+pub fn has_outstanding_ap(balance: &BalanceReport) -> bool {
+    balance
+        .rows
+        .iter()
+        .any(|row| row.amounts.iter().any(|a| a.quantity.mantissa < 0))
 }
 
 /// Shared expense account for a trade type (multiple vendors share one account):
@@ -30,6 +53,32 @@ pub fn trade_expense_account(trade: &str) -> String {
 /// `expenses:professional - {vendor}`.
 pub fn professional_expense_account(vendor: &str) -> String {
     format!("expenses:professional - {vendor}")
+}
+
+/// The two vendor kinds, deciding which expense account `vendor_add` declares.
+/// Doubles as the MCP arg type (the schema advertises the two lowercase values).
+#[derive(Debug, Clone, Copy, serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum VendorType {
+    /// Shared trade expense account (`expenses:construction:{trade}`).
+    Trade,
+    /// Dedicated per-vendor account (`expenses:professional - {vendor}`).
+    Professional,
+}
+
+/// Resolve the expense account `vendor_add` declares for a vendor, enforcing the
+/// "trade name required for trade vendors" rule. `Err` is a correctable input error.
+pub fn vendor_expense_account(
+    vendor_type: VendorType,
+    vendor: &str,
+    trade: Option<&str>,
+) -> Result<String, String> {
+    match vendor_type {
+        VendorType::Trade => trade
+            .map(trade_expense_account)
+            .ok_or_else(|| "`trade` is required when vendor_type is \"trade\"".to_string()),
+        VendorType::Professional => Ok(professional_expense_account(vendor)),
+    }
 }
 
 // ---- Transaction-input builders (pure) ---------------------------------------------
@@ -222,8 +271,7 @@ pub fn compute_ap_aging(
         .rows
         .iter()
         .filter(|row| {
-            row.account.starts_with("liabilities:ap:")
-                && row.amounts.iter().any(|a| a.quantity.mantissa != 0)
+            is_ap_account(&row.account) && row.amounts.iter().any(|a| a.quantity.mantissa != 0)
         })
         .map(|row| {
             let oldest = oldest_invoice_date_for(&row.account, transactions);
@@ -284,23 +332,9 @@ pub fn render_composite(report: &crate::hledger::CompositeReport) -> String {
         if sub.rows.is_empty() {
             lines.push("  (none)".to_string());
         }
-        lines.push(format!(
-            "  Subtotal: {}",
-            if sub.totals.is_empty() {
-                "0".to_string()
-            } else {
-                render_amounts(&sub.totals)
-            }
-        ));
+        lines.push(format!("  Subtotal: {}", render_amounts(&sub.totals)));
     }
-    lines.push(format!(
-        "Net: {}",
-        if report.totals.is_empty() {
-            "0".to_string()
-        } else {
-            render_amounts(&report.totals)
-        }
-    ));
+    lines.push(format!("Net: {}", render_amounts(&report.totals)));
     lines.join("\n")
 }
 
@@ -318,9 +352,7 @@ pub fn render_ap_aging(entries: &[ApAgingEntry], as_of: NaiveDate) -> String {
             .unwrap_or("(no invoice date)");
         let oldest = e
             .oldest_invoice_date
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "(unknown)".to_string());
-        let oldest = oldest.as_str();
+            .map_or_else(|| "(unknown)".to_string(), |d| d.to_string());
         lines.push(format!(
             "  {}  {}  oldest invoice: {}  [{}]",
             e.vendor_account,

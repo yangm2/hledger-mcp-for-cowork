@@ -270,17 +270,6 @@ impl Hledger {
         json::parse_print(&out).map_err(HledgerError::from)
     }
 
-    /// `hledger print` against an **explicit** journal path (used on the write candidate, which
-    /// is not the configured live journal).
-    pub async fn print_file(
-        &self,
-        journal: &Path,
-        query: &[String],
-    ) -> Result<Vec<Transaction>, HledgerError> {
-        let out = runner::run(&self.bin, &cli::print_argv(journal, query)).await?;
-        json::parse_print(&out).map_err(HledgerError::from)
-    }
-
     /// Run `hledger check --strict` on an explicit journal path (the write candidate). `Ok(())`
     /// = valid; a [`HledgerError::NonZero`] carries hledger's diagnostic in `stderr`.
     pub async fn check_strict(&self, journal: &Path) -> Result<(), HledgerError> {

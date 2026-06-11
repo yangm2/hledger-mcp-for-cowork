@@ -84,14 +84,8 @@ pub fn incomestatement_argv(journal: &Path) -> Vec<String> {
 /// `--flat` suppresses parent-account subtotal rows; used by AP aging to get one row
 /// per vendor rather than parent subtotals.
 pub fn balance_flat_argv(journal: &Path, account: Option<&str>) -> Vec<String> {
-    let mut argv = vec!["balance".to_string(), "--flat".to_string()];
-    if let Some(account) = account {
-        argv.push(account.to_string());
-    }
-    argv.push("-O".to_string());
-    argv.push("json".to_string());
-    argv.push("-f".to_string());
-    argv.push(journal.display().to_string());
+    let mut argv = balance_argv(journal, account);
+    argv.insert(1, "--flat".to_string());
     argv
 }
 

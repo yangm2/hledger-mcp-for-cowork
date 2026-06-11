@@ -442,25 +442,41 @@ async fn find_by_exact_tag(
         .collect())
 }
 
-/// Read the journal's declared account + commodity sets (require-pre-declare inputs to
-/// [`validate::validate`]). A read failure is internal (the journal exists by this point).
-async fn declared_sets(
-    hledger: &Hledger,
-) -> Result<(HashSet<String>, HashSet<crate::hledger::amount::Commodity>), WriteError> {
-    let accounts = hledger
+/// The journal's declared-account set (shared by [`declared_sets`] and `tombstone_account`).
+async fn declared_account_set(hledger: &Hledger) -> Result<HashSet<String>, WriteError> {
+    Ok(hledger
         .declared_accounts()
         .await
         .map_err(|e| WriteError::Internal(format!("read declared accounts: {e}")))?
         .into_iter()
-        .collect();
-    let commodities = hledger
-        .declared_commodities()
-        .await
-        .map_err(|e| WriteError::Internal(format!("read declared commodities: {e}")))?
-        .into_iter()
-        .map(crate::hledger::amount::Commodity::new)
-        .collect();
-    Ok((accounts, commodities))
+        .collect())
+}
+
+/// Read the journal's declared account + commodity sets (require-pre-declare inputs to
+/// [`validate::validate`]). The two hledger reads are independent, so they run concurrently.
+/// A read failure is internal (the journal exists by this point).
+async fn declared_sets(
+    hledger: &Hledger,
+) -> Result<(HashSet<String>, HashSet<crate::hledger::amount::Commodity>), WriteError> {
+    tokio::try_join!(declared_account_set(hledger), async {
+        Ok(hledger
+            .declared_commodities()
+            .await
+            .map_err(|e| WriteError::Internal(format!("read declared commodities: {e}")))?
+            .into_iter()
+            .map(crate::hledger::amount::Commodity::new)
+            .collect())
+    })
+}
+
+/// Current `HEAD` as a [`CommitOid`], or an internal error (`msg`) when no commit exists.
+/// Serves the dedup paths, where found-in-the-journal evidence implies a commit must exist.
+fn head_or_internal(journal: &Path, msg: &str) -> Result<CommitOid, WriteError> {
+    let head = match GitRepo::open(&repo_dir(journal))? {
+        Some(repo) => repo.head_oid()?,
+        None => None,
+    };
+    head.ok_or_else(|| WriteError::Internal(msg.to_string()))
 }
 
 /// `post_transaction`: validate → format (stamping `id:`/`idem:`) → candidate → check → swap →
@@ -470,37 +486,57 @@ pub async fn post_transaction(
     ctx: &WriteContext<'_>,
     input: TransactionInput,
 ) -> Result<WriteOutcome, WriteError> {
+    post_transaction_with_sets(ctx, input, None).await
+}
+
+/// [`post_transaction`] with optionally pre-fetched declared sets — `update_transaction`
+/// already read them to pre-validate the replacement, and the locks held across the whole
+/// sequence guarantee they cannot have changed since.
+async fn post_transaction_with_sets(
+    ctx: &WriteContext<'_>,
+    input: TransactionInput,
+    sets: Option<(
+        &HashSet<String>,
+        &HashSet<crate::hledger::amount::Commodity>,
+    )>,
+) -> Result<WriteOutcome, WriteError> {
     let journal = ctx.journal();
-    ensure_journal_exists(journal)?;
 
-    let idem = input
-        .idem
-        .clone()
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    // Idempotency: a prior write with this *exact* idem tag means "already done". A freshly
+    // generated key cannot match anything by construction, so the journal scan only runs for
+    // caller-supplied keys.
+    let idem = match input.idem.clone() {
+        None => Uuid::new_v4().to_string(),
+        Some(idem) => {
+            let existing = find_by_exact_tag(ctx.hledger, "idem", &idem)
+                .await
+                .map_err(|e| WriteError::Internal(format!("idempotency query: {e}")))?;
+            if let Some(prior) = existing.first() {
+                let commit = head_or_internal(
+                    journal,
+                    "idempotency dedup found a prior transaction but HEAD is unborn",
+                )?;
+                return Ok(WriteOutcome {
+                    base: CommitOutcome {
+                        id: tag_value(prior, "id").unwrap_or_default(),
+                        commit,
+                    },
+                    deduped: true,
+                });
+            }
+            idem
+        }
+    };
 
-    // Idempotency: a prior write with this *exact* idem tag means "already done".
-    let existing = find_by_exact_tag(ctx.hledger, "idem", &idem)
-        .await
-        .map_err(|e| WriteError::Internal(format!("idempotency query: {e}")))?;
-    if let Some(prior) = existing.first() {
-        let repo = GitRepo::open_or_init(&repo_dir(journal))?;
-        let commit = repo.head_oid()?.ok_or_else(|| {
-            WriteError::Internal(
-                "idempotency dedup found a prior transaction but HEAD is unborn".to_string(),
-            )
-        })?;
-        return Ok(WriteOutcome {
-            base: CommitOutcome {
-                id: tag_value(prior, "id").unwrap_or_default(),
-                commit,
-            },
-            deduped: true,
-        });
-    }
-
-    let (accounts, commodities) = declared_sets(ctx.hledger).await?;
-    let validated =
-        validate::validate(&input, &accounts, &commodities).map_err(WriteError::Input)?;
+    let fetched;
+    let (accounts, commodities) = match sets {
+        Some((accounts, commodities)) => (accounts, commodities),
+        None => {
+            fetched = declared_sets(ctx.hledger).await?;
+            (&fetched.0, &fetched.1)
+        }
+    };
+    let validated = validate::validate(&input, accounts, commodities).map_err(WriteError::Input)?;
 
     let id = Uuid::new_v4().to_string();
     let mut tags = vec![("id".to_string(), id.clone()), ("idem".to_string(), idem)];
@@ -541,9 +577,6 @@ pub async fn void_transaction(
     ctx: &WriteContext<'_>,
     target_id: &str,
 ) -> Result<WriteOutcome, WriteError> {
-    let journal = ctx.journal();
-    ensure_journal_exists(journal)?;
-
     let matches = find_by_exact_tag(ctx.hledger, "id", target_id)
         .await
         .map_err(|e| WriteError::Internal(format!("lookup by id: {e}")))?;
@@ -598,13 +631,13 @@ pub async fn update_transaction(
     validate::validate(&replacement, &accounts, &commodities).map_err(WriteError::Input)?;
 
     void_transaction(ctx, target_id).await?;
-    post_transaction(ctx, replacement).await
+    post_transaction_with_sets(ctx, replacement, Some((&accounts, &commodities))).await
 }
 
 /// Strip newlines / `;` from text destined for a description (defensive — target text could
 /// have been hand-edited into the journal).
 fn sanitize(text: &str) -> String {
-    text.replace(['\n', ';'], " ")
+    text.replace(validate::UNSAFE_TEXT_CHARS, " ")
 }
 
 /// `declare_account`: append an `account <name>` directive (the require-pre-declare prerequisite
@@ -631,7 +664,8 @@ pub async fn declare_commodity(
 ) -> Result<CommitOutcome, WriteError> {
     let symbol = symbol.trim();
     if symbol.is_empty()
-        || symbol.contains(['\n', ';', ' '])
+        || symbol.contains(validate::UNSAFE_TEXT_CHARS)
+        || symbol.contains(' ')
         || symbol.contains(|c: char| c.is_ascii_digit())
     {
         return Err(WriteError::Input(format!(
@@ -659,7 +693,10 @@ pub async fn declare_commodity(
 /// Validate that `name` is an acceptable account name for a directive.
 fn validate_account_name(name: &str) -> Result<&str, WriteError> {
     let name = name.trim();
-    if name.is_empty() || name.contains(['\n', ';']) || name.starts_with(':') || name.ends_with(':')
+    if name.is_empty()
+        || name.contains(validate::UNSAFE_TEXT_CHARS)
+        || name.starts_with(':')
+        || name.ends_with(':')
     {
         return Err(WriteError::Input(format!("invalid account name: '{name}'")));
     }
@@ -701,16 +738,8 @@ pub async fn tombstone_account(
     ctx: &WriteContext<'_>,
     name: &str,
 ) -> Result<CommitOutcome, WriteError> {
-    let journal = ctx.journal();
-    ensure_journal_exists(journal)?;
     let name = name.trim();
-    let declared: HashSet<String> = ctx
-        .hledger
-        .declared_accounts()
-        .await
-        .map_err(|e| WriteError::Internal(format!("read declared accounts: {e}")))?
-        .into_iter()
-        .collect();
+    let declared = declared_account_set(ctx.hledger).await?;
     if !declared.contains(name) {
         return Err(WriteError::Input(format!(
             "cannot tombstone undeclared account '{name}'"
@@ -722,15 +751,11 @@ pub async fn tombstone_account(
         .await
         .map_err(|e| WriteError::Internal(format!("read tombstoned accounts: {e}")))?;
     if tombstoned.iter().any(|a| a == name) {
-        let epoch = current_epoch(journal)?;
-        let commit_str = epoch.oid().ok_or_else(|| {
-            WriteError::Internal(
-                "tombstone found in journal but HEAD is unborn — \
-                 the journal may have been hand-authored outside the write tools"
-                    .to_string(),
-            )
-        })?;
-        let commit = CommitOid::new(commit_str.to_string());
+        let commit = head_or_internal(
+            ctx.journal(),
+            "tombstone found in journal but HEAD is unborn — \
+             the journal may have been hand-authored outside the write tools",
+        )?;
         return Ok(CommitOutcome {
             id: name.to_string(),
             commit,

@@ -17,6 +17,11 @@ use super::input::TransactionInput;
 /// Tag names the system owns; user input may not set them.
 const RESERVED_TAGS: [&str; 3] = ["id", "idem", "reverses"];
 
+/// Characters that break out of a single journal text field: a newline ends the entry line,
+/// `;` opens a comment. The **one** definition every text/account/commodity check and the
+/// description sanitizer build on — tightening it (e.g. adding `\r`) must stay in lockstep.
+pub(crate) const UNSAFE_TEXT_CHARS: [char; 2] = ['\n', ';'];
+
 /// A validated transaction: parsed amounts, verified balanced & declared, ready to format.
 #[derive(Debug)]
 pub struct ValidatedTxn {
@@ -118,7 +123,7 @@ pub fn validate(
 
 /// Free text that must stay on one line and not open a comment (`;`).
 fn validate_text(what: &str, text: &str) -> Result<(), String> {
-    if text.contains('\n') || text.contains(';') {
+    if text.contains(UNSAFE_TEXT_CHARS) {
         return Err(format!("{what} must not contain a newline or ';'"));
     }
     Ok(())

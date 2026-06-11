@@ -181,16 +181,6 @@ pub struct PostInterestArgs {
     pub idem: Option<String>,
 }
 
-/// The two vendor kinds, deciding which expense account `vendor_add` declares.
-#[derive(Debug, Clone, Copy, serde::Deserialize, rmcp::schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum VendorType {
-    /// Shared trade expense account (`expenses:construction:{trade}`).
-    Trade,
-    /// Dedicated per-vendor account (`expenses:professional - {vendor}`).
-    Professional,
-}
-
 /// Arguments for `vendor_add`.
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub struct VendorAddArgs {
@@ -198,7 +188,7 @@ pub struct VendorAddArgs {
     pub vendor: String,
     /// `"trade"` for a shared trade expense account (`expenses:construction:{trade}`), or
     /// `"professional"` for a dedicated per-vendor account (`expenses:professional - {vendor}`).
-    pub vendor_type: VendorType,
+    pub vendor_type: crate::domain::VendorType,
     /// The trade/sub-trade name (e.g. `"plumbing"`). Required when `vendor_type` is `"trade"`.
     #[serde(default)]
     pub trade: Option<String>,
@@ -477,7 +467,7 @@ impl HledgerMcp {
             Ok(args) => args,
             Err(err) => return Ok(err),
         };
-        let account = args.account.clone();
+        let account = args.account;
         self.guarded_tool(
             ToolClass::Record,
             async |ctx| write::declare_account(&ctx, &account).await,
@@ -509,7 +499,7 @@ impl HledgerMcp {
             Ok(args) => args,
             Err(err) => return Ok(err),
         };
-        let account = args.account.clone();
+        let account = args.account;
         self.guarded_tool(
             ToolClass::Record,
             async |ctx| write::tombstone_account(&ctx, &account).await,
@@ -540,7 +530,7 @@ impl HledgerMcp {
             Err(err) => return Ok(err),
         };
         let places = args.decimal_places.unwrap_or(2);
-        let commodity = args.commodity.clone();
+        let commodity = args.commodity;
         self.guarded_tool(
             ToolClass::Record,
             async |ctx| write::declare_commodity(&ctx, &commodity, places).await,
@@ -667,14 +657,15 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let date = args.date;
-        let amount = args.amount;
-        let commodity = args.commodity;
-        let idem = args.idem;
         self.guarded_tool(
             ToolClass::Record,
             async |ctx| {
-                let input = crate::domain::fund_project_input(date, amount, commodity, idem);
+                let input = crate::domain::fund_project_input(
+                    args.date,
+                    args.amount,
+                    args.commodity,
+                    args.idem,
+                );
                 write::post_transaction(&ctx, input).await
             },
             post_outcome_text,
@@ -699,24 +690,17 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let date = args.date;
-        let vendor = args.vendor;
-        let expense_account = args.expense_account;
-        let amount = args.amount;
-        let commodity = args.commodity;
-        let invoice_ref = args.invoice_ref;
-        let idem = args.idem;
         self.guarded_tool(
             ToolClass::Record,
             async |ctx| {
                 let input = crate::domain::receive_invoice_input(
-                    date,
-                    &vendor,
-                    expense_account,
-                    amount,
-                    commodity,
-                    invoice_ref,
-                    idem,
+                    args.date,
+                    &args.vendor,
+                    args.expense_account,
+                    args.amount,
+                    args.commodity,
+                    args.invoice_ref,
+                    args.idem,
                 );
                 write::post_transaction(&ctx, input).await
             },
@@ -740,31 +724,28 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let date = args.date;
-        let vendor = args.vendor;
-        let amount = args.amount;
-        let commodity = args.commodity;
-        let idem = args.idem;
         self.guarded_tool(
             ToolClass::Record,
             async |ctx| {
-                let ap_account = crate::domain::vendor_ap_account(&vendor);
+                let vendor = &args.vendor;
+                let ap_account = crate::domain::vendor_ap_account(vendor);
                 let balance = ctx
                     .hledger
                     .balance_flat(Some(&ap_account))
                     .await
                     .map_err(|e| WriteError::Internal(format!("AP balance query: {e}")))?;
-                let has_outstanding = balance
-                    .rows
-                    .iter()
-                    .any(|row| row.amounts.iter().any(|a| a.quantity.mantissa < 0));
-                if !has_outstanding {
+                if !crate::domain::has_outstanding_ap(&balance) {
                     return Err(WriteError::Input(format!(
                         "vendor '{vendor}' has no outstanding AP balance"
                     )));
                 }
-                let input =
-                    crate::domain::pay_invoice_input(date, &vendor, amount, commodity, idem);
+                let input = crate::domain::pay_invoice_input(
+                    args.date,
+                    vendor,
+                    args.amount,
+                    args.commodity,
+                    args.idem,
+                );
                 write::post_transaction(&ctx, input).await
             },
             post_outcome_text,
@@ -786,14 +767,15 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let date = args.date;
-        let amount = args.amount;
-        let commodity = args.commodity;
-        let idem = args.idem;
         self.guarded_tool(
             ToolClass::Record,
             async |ctx| {
-                let input = crate::domain::post_interest_input(date, amount, commodity, idem);
+                let input = crate::domain::post_interest_input(
+                    args.date,
+                    args.amount,
+                    args.commodity,
+                    args.idem,
+                );
                 write::post_transaction(&ctx, input).await
             },
             post_outcome_text,
@@ -819,19 +801,17 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let expense_account = match args.vendor_type {
-            VendorType::Trade => {
-                let trade = match args.trade {
-                    Some(t) => t,
-                    None => {
-                        return Ok(CallToolResult::error(vec![Content::text(
-                            "input error: `trade` is required when vendor_type is \"trade\"",
-                        )]));
-                    }
-                };
-                crate::domain::trade_expense_account(&trade)
+        let expense_account = match crate::domain::vendor_expense_account(
+            args.vendor_type,
+            &args.vendor,
+            args.trade.as_deref(),
+        ) {
+            Ok(account) => account,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "input error: {e}"
+                ))]));
             }
-            VendorType::Professional => crate::domain::professional_expense_account(&args.vendor),
         };
         let ap_account = crate::domain::vendor_ap_account(&args.vendor);
         let vendor = args.vendor;
@@ -866,7 +846,7 @@ impl HledgerMcp {
             Ok(accounts) => {
                 let vendors: Vec<&str> = accounts
                     .iter()
-                    .filter(|a| a.starts_with("liabilities:ap:vendor:"))
+                    .filter(|a| a.starts_with(crate::domain::VENDOR_AP_PREFIX))
                     .map(String::as_str)
                     .collect();
                 let text = if vendors.is_empty() {
@@ -898,13 +878,14 @@ impl HledgerMcp {
         };
         let as_of = args.as_of.unwrap_or_else(crate::domain::today);
         let hledger = &self.hledger;
-        let ap_query = "liabilities:ap".to_string();
         let result = self
             .view
             .grounded_read(&self.hledger, || async move {
-                let balance = hledger.balance_flat(Some("liabilities:ap")).await?;
-                let txns = hledger.list_transactions(&[ap_query]).await?;
-                Ok::<_, HledgerError>((balance, txns))
+                let ap_query = [crate::domain::AP_ROOT.to_string()];
+                tokio::try_join!(
+                    hledger.balance_flat(Some(crate::domain::AP_ROOT)),
+                    hledger.list_transactions(&ap_query),
+                )
             })
             .await;
         match result {
@@ -935,9 +916,7 @@ impl HledgerMcp {
         let result = self
             .view
             .grounded_read(&self.hledger, || async move {
-                let bs = hledger.balancesheet().await?;
-                let is = hledger.incomestatement().await?;
-                Ok::<_, HledgerError>((bs, is))
+                tokio::try_join!(hledger.balancesheet(), hledger.incomestatement())
             })
             .await;
         match result {
