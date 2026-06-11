@@ -173,6 +173,15 @@ pub struct PostInterestArgs {
     pub idem: Option<String>,
 }
 
+/// Parse a `YYYY-MM-DD` date string into a `NaiveDate`, returning a tool error on failure.
+fn parse_date(s: &str) -> Result<NaiveDate, CallToolResult> {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
+        CallToolResult::error(vec![Content::text(format!(
+            "input error: date must be YYYY-MM-DD, got {s:?}"
+        ))])
+    })
+}
+
 /// Arguments for `vendor_add`.
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub struct VendorAddArgs {
@@ -648,7 +657,10 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let date = args.date;
+        let date = match parse_date(&args.date) {
+            Ok(d) => d,
+            Err(e) => return Ok(e),
+        };
         let amount = args.amount;
         let commodity = args.commodity;
         let idem = args.idem;
@@ -680,7 +692,10 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let date = args.date;
+        let date = match parse_date(&args.date) {
+            Ok(d) => d,
+            Err(e) => return Ok(e),
+        };
         let vendor = args.vendor;
         let expense_account = args.expense_account;
         let amount = args.amount;
@@ -721,7 +736,10 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let date = args.date;
+        let date = match parse_date(&args.date) {
+            Ok(d) => d,
+            Err(e) => return Ok(e),
+        };
         let vendor = args.vendor;
         let amount = args.amount;
         let commodity = args.commodity;
@@ -767,7 +785,10 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let date = args.date;
+        let date = match parse_date(&args.date) {
+            Ok(d) => d,
+            Err(e) => return Ok(e),
+        };
         let amount = args.amount;
         let commodity = args.commodity;
         let idem = args.idem;
@@ -882,12 +903,15 @@ impl HledgerMcp {
             Ok(a) => a,
             Err(e) => return Ok(e),
         };
-        let as_of = args.as_of.unwrap_or_else(crate::domain::today_iso);
-        if NaiveDate::parse_from_str(&as_of, "%Y-%m-%d").is_err() {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "input error: as_of must be YYYY-MM-DD, got {as_of:?}"
-            ))]));
-        }
+        let as_of_str = args.as_of.unwrap_or_else(crate::domain::today_iso);
+        let as_of = match NaiveDate::parse_from_str(&as_of_str, "%Y-%m-%d") {
+            Ok(d) => d,
+            Err(_) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "input error: as_of must be YYYY-MM-DD, got {as_of_str:?}"
+                ))]));
+            }
+        };
         let hledger = &self.hledger;
         let ap_query = "liabilities:ap".to_string();
         let result = self
@@ -900,8 +924,8 @@ impl HledgerMcp {
             .await;
         match result {
             Ok((balance, txns)) => {
-                let entries = crate::domain::compute_ap_aging(&balance, &txns, &as_of);
-                let mut text = crate::domain::render_ap_aging(&entries, &as_of);
+                let entries = crate::domain::compute_ap_aging(&balance, &txns, as_of);
+                let mut text = crate::domain::render_ap_aging(&entries, &as_of_str);
                 let flags = crate::flags::ap_aging_flags(&entries);
                 if !flags.is_empty() {
                     text.push('\n');
@@ -1276,7 +1300,7 @@ mod tests {
     fn render_transactions_shows_header_and_postings_or_empty() {
         assert!(render_transactions(&[]).contains("no matching transactions"));
         let txns = vec![Transaction {
-            date: "2026-01-15".into(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
             description: "Acme".into(),
             index: 1,
             status: "Unmarked".into(),

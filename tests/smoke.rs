@@ -199,7 +199,7 @@ async fn write_path_declare_post_void_round_trip() {
     // file change — fail-closed: the journal is byte-identical afterward.
     let before = std::fs::read_to_string(&journal).expect("read journal");
     let bad = TransactionInput {
-        date: "2026-01-01".into(),
+        date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
         description: "bad".into(),
         postings: vec![
             posting("assets:savings", Some("1.00"), "$"),
@@ -220,7 +220,7 @@ async fn write_path_declare_post_void_round_trip() {
 
     // Post a balanced transaction (one omitted amount balances).
     let input = TransactionInput {
-        date: "2026-01-01".into(),
+        date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
         description: "opening balance".into(),
         postings: vec![
             posting("assets:checking", Some("100.00"), "$"),
@@ -289,7 +289,7 @@ async fn posted_transactions_round_trip_through_hledger() {
         (
             "rt-1",
             TransactionInput {
-                date: "2026-01-15".into(),
+                date: chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
                 description: "Acme".into(),
                 postings: vec![
                     posting("expenses:supplies", Some("12.34"), "$"),
@@ -306,7 +306,7 @@ async fn posted_transactions_round_trip_through_hledger() {
         (
             "rt-2",
             TransactionInput {
-                date: "2026-02-02".into(),
+                date: chrono::NaiveDate::from_ymd_opt(2026, 2, 2).unwrap(),
                 description: "trip".into(),
                 postings: vec![
                     posting("expenses:travel", Some("40.00"), "EUR"),

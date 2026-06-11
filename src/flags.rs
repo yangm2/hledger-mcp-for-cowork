@@ -67,7 +67,9 @@ pub fn ap_aging_flags(entries: &[ApAgingEntry]) -> Vec<Flag> {
             detail: format!(
                 "outstanding {} since {} (90+ days overdue)",
                 render_amounts(&e.outstanding),
-                e.oldest_invoice_date.as_deref().unwrap_or("(unknown)")
+                e.oldest_invoice_date
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string())
             ),
         })
         .collect()
@@ -165,7 +167,7 @@ mod tests {
                     commodity_left: true,
                     spaced: false,
                 }],
-                oldest_invoice_date: Some("2026-01-01".to_string()),
+                oldest_invoice_date: Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
                 age,
             }
         }

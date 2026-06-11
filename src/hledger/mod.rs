@@ -144,8 +144,8 @@ pub struct Posting {
 /// A transaction as returned by `hledger print`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
-    /// Primary date (`YYYY-MM-DD`).
-    pub date: String,
+    /// Primary date.
+    pub date: chrono::NaiveDate,
     /// Description / payee.
     pub description: String,
     /// hledger's 1-based transaction index within the journal.
@@ -434,7 +434,10 @@ mod tests {
             .expect("print");
         assert_eq!(txns.len(), 1);
         assert_eq!(txns[0].description, "Acme");
-        assert_eq!(txns[0].date, "2026-01-15");
+        assert_eq!(
+            txns[0].date,
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()
+        );
         // Unfiltered lists every transaction in the fixture.
         let all = hl.list_transactions(&[]).await.expect("print all");
         assert_eq!(all.len(), 3);

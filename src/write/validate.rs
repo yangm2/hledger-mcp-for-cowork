@@ -3,7 +3,7 @@
 //! our formatter bug (an internal error), never bad input. Failures are returned as correctable
 //! tool errors (`Err(String)`).
 //!
-//! Checks: well-formed `YYYY-MM-DD` date; ≥2 postings with at most one missing amount; every
+//! Checks: ≥2 postings with at most one missing amount; every
 //! account/commodity **declared** (require-pre-declare); exact-decimal amounts; balanced per
 //! commodity when no posting is left to balance; safe description/tag text; no reserved tags.
 
@@ -20,7 +20,7 @@ const RESERVED_TAGS: [&str; 3] = ["id", "idem", "reverses"];
 /// A validated transaction: parsed amounts, verified balanced & declared, ready to format.
 #[derive(Debug)]
 pub struct ValidatedTxn {
-    pub date: String,
+    pub date: chrono::NaiveDate,
     pub description: String,
     pub postings: Vec<EntryPosting>,
     pub tags: Vec<(String, String)>,
@@ -32,7 +32,6 @@ pub fn validate(
     declared_accounts: &HashSet<String>,
     declared_commodities: &HashSet<String>,
 ) -> Result<ValidatedTxn, String> {
-    validate_date(&input.date)?;
     validate_text("description", &input.description)?;
 
     if input.postings.len() < 2 {
@@ -110,29 +109,11 @@ pub fn validate(
     }
 
     Ok(ValidatedTxn {
-        date: input.date.clone(),
+        date: input.date,
         description: input.description.clone(),
         postings,
         tags,
     })
-}
-
-/// `YYYY-MM-DD` with plausible month/day ranges (hledger's primary date form).
-fn validate_date(date: &str) -> Result<(), String> {
-    let bad = || format!("date must be YYYY-MM-DD: '{date}'");
-    let parts: Vec<&str> = date.split('-').collect();
-    if parts.len() != 3 || parts[0].len() != 4 || parts[1].len() != 2 || parts[2].len() != 2 {
-        return Err(bad());
-    }
-    if !parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())) {
-        return Err(bad());
-    }
-    let month: u32 = parts[1].parse().map_err(|_| bad())?;
-    let day: u32 = parts[2].parse().map_err(|_| bad())?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return Err(format!("date out of range: '{date}'"));
-    }
-    Ok(())
 }
 
 /// Free text that must stay on one line and not open a comment (`;`).
@@ -186,7 +167,7 @@ mod tests {
 
     fn txn(postings: Vec<PostingInput>) -> TransactionInput {
         TransactionInput {
-            date: "2026-01-15".to_string(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
             description: "Acme".to_string(),
             postings,
             tags: vec![],
@@ -268,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_amount_and_date() {
+    fn rejects_bad_amount() {
         let (a, c) = declared();
         let bad_amt = txn(vec![
             posting("expenses:supplies", Some("12.3.4"), "$"),
@@ -278,19 +259,6 @@ mod tests {
             validate(&bad_amt, &a, &c)
                 .unwrap_err()
                 .contains("invalid amount")
-        );
-
-        let mut bad_date = txn(vec![
-            posting("expenses:supplies", Some("1.00"), "$"),
-            posting("assets:checking", None, ""),
-        ]);
-        bad_date.date = "2026-13-40".to_string();
-        assert!(validate(&bad_date, &a, &c).unwrap_err().contains("range"));
-        bad_date.date = "not-a-date".to_string();
-        assert!(
-            validate(&bad_date, &a, &c)
-                .unwrap_err()
-                .contains("YYYY-MM-DD")
         );
     }
 
@@ -307,24 +275,6 @@ mod tests {
         t.tags = vec![];
         t.description = "bad ; comment".to_string();
         assert!(validate(&t, &a, &c).unwrap_err().contains("';'"));
-    }
-
-    #[test]
-    fn validate_date_isolates_each_boundary() {
-        assert!(validate_date("2026-01-15").is_ok());
-        // Each rejects by violating exactly one structural condition (year/month/day length,
-        // or the 3-part shape) so the checks can't collapse into one another.
-        assert!(validate_date("26-01-01").is_err(), "year len");
-        assert!(validate_date("2026-1-01").is_err(), "month len");
-        assert!(validate_date("2026-01-1").is_err(), "day len");
-        assert!(validate_date("2026-01").is_err(), "missing day part");
-        assert!(validate_date("2026-01-01-01").is_err(), "extra part");
-        assert!(validate_date("2026-0a-01").is_err(), "non-digit");
-        // Range: one component bad at a time.
-        assert!(validate_date("2026-13-15").is_err(), "month too high");
-        assert!(validate_date("2026-00-15").is_err(), "month zero");
-        assert!(validate_date("2026-12-40").is_err(), "day too high");
-        assert!(validate_date("2026-12-00").is_err(), "day zero");
     }
 
     #[test]

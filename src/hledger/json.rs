@@ -6,6 +6,7 @@
 //! and that fix lands in this one file. The wire structs (`Json*`) are private; the public
 //! surface is the domain types in [`super`], produced by the `From`/`from_*` conversions here.
 
+use chrono::NaiveDate;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -219,7 +220,7 @@ impl From<JsonPosting> for Posting {
 
 #[derive(Debug, Deserialize)]
 struct JsonTransaction {
-    tdate: String,
+    tdate: NaiveDate,
     tdescription: String,
     tindex: i64,
     #[serde(default)]
@@ -294,7 +295,7 @@ mod tests {
         let txns = parse_print(PRINT_BASIC).expect("parse print_basic");
         assert_eq!(txns.len(), 3);
         let acme = &txns[1];
-        assert_eq!(acme.date, "2026-01-15");
+        assert_eq!(acme.date, NaiveDate::from_ymd_opt(2026, 1, 15).unwrap());
         assert_eq!(acme.description, "Acme");
         assert_eq!(acme.postings.len(), 2);
         assert_eq!(acme.postings[0].account, "expenses:supplies");

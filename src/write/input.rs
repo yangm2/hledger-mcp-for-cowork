@@ -2,6 +2,7 @@
 //! (`#[derive(JsonSchema)]`). They are *unvalidated*; [`super::validate`] turns them into the
 //! checked form the formatter consumes.
 
+use chrono::NaiveDate;
 use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -28,8 +29,9 @@ pub struct PostingInput {
 /// A transaction to post.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct TransactionInput {
-    /// Transaction date, `YYYY-MM-DD`.
-    pub date: String,
+    /// Transaction date (`YYYY-MM-DD`).
+    #[schemars(with = "String")]
+    pub date: NaiveDate,
     /// Description / payee (no newline or `;`).
     pub description: String,
     /// Postings: at least 2; at most one may omit `amount` (the balancing posting).

@@ -80,7 +80,7 @@ impl Conn {
 
 fn txn(description: &str, to: &str, amount: &str, idem: Option<&str>) -> TransactionInput {
     TransactionInput {
-        date: "2026-01-01".into(),
+        date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
         description: description.into(),
         postings: vec![
             PostingInput {

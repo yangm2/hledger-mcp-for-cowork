@@ -3,6 +3,8 @@
 //! Pure module — no I/O. Account path conventions, transaction-input builders, and AP aging
 //! computation are all property-testable without a live hledger.
 
+use chrono::NaiveDate;
+
 use crate::hledger::{Amount, BalanceReport, Transaction};
 use crate::write::input::{PostingAmount, PostingInput, TransactionInput};
 
@@ -59,7 +61,7 @@ fn balancer(account: impl Into<String>) -> PostingInput {
 
 /// `fund_project`: Dr `assets:checking` / Cr `equity:owner capital`.
 pub fn fund_project_input(
-    date: String,
+    date: NaiveDate,
     amount: String,
     commodity: String,
     idem: Option<String>,
@@ -80,7 +82,7 @@ pub fn fund_project_input(
 ///
 /// Tags `invoice:{invoice_ref}` and `vendor:{vendor}` on the transaction.
 pub fn receive_invoice_input(
-    date: String,
+    date: NaiveDate,
     vendor: &str,
     expense_account: String,
     amount: String,
@@ -107,7 +109,7 @@ pub fn receive_invoice_input(
 ///
 /// The `amount` clears (debits) the AP liability; checking is the balancer.
 pub fn pay_invoice_input(
-    date: String,
+    date: NaiveDate,
     vendor: &str,
     amount: String,
     commodity: String,
@@ -127,7 +129,7 @@ pub fn pay_invoice_input(
 
 /// `post_interest`: Dr `assets:checking` / Cr `income:interest`.
 pub fn post_interest_input(
-    date: String,
+    date: NaiveDate,
     amount: String,
     commodity: String,
     idem: Option<String>,
@@ -146,7 +148,7 @@ pub fn post_interest_input(
 
 // ---- Date arithmetic ---------------------------------------------------------------
 
-use chrono::{Local, NaiveDate};
+use chrono::Local;
 
 /// Today's date as `YYYY-MM-DD` (local time).
 pub fn today_iso() -> String {
@@ -207,7 +209,7 @@ pub struct ApAgingEntry {
     /// Outstanding balance (from `hledger balance --flat liabilities:ap`).
     pub outstanding: Vec<Amount>,
     /// Date of the oldest `invoice:`-tagged transaction for this account.
-    pub oldest_invoice_date: Option<String>,
+    pub oldest_invoice_date: Option<NaiveDate>,
     /// Age category based on `oldest_invoice_date` and the `as_of` date.
     pub age: Option<AgeCategory>,
 }
@@ -217,11 +219,11 @@ pub struct ApAgingEntry {
 ///
 /// `balance` — from `hledger balance --flat liabilities:ap -O json`.
 /// `transactions` — from `hledger print liabilities:ap -O json` (all AP transactions).
-/// `as_of` — the reference date for age calculation (`YYYY-MM-DD`).
+/// `as_of` — the reference date for age calculation.
 pub fn compute_ap_aging(
     balance: &BalanceReport,
     transactions: &[Transaction],
-    as_of: &str,
+    as_of: NaiveDate,
 ) -> Vec<ApAgingEntry> {
     balance
         .rows
@@ -233,14 +235,13 @@ pub fn compute_ap_aging(
         .map(|row| {
             let oldest = oldest_invoice_date_for(&row.account, transactions);
             let age = oldest
-                .as_deref()
-                .and_then(|d| days_between(d, as_of))
-                .and_then(|n| {
+                .and_then(|d| {
+                    let n = (as_of - d).num_days();
                     u64::try_from(n)
                         .map_err(|_| {
                             tracing::warn!(
                                 account = %row.account,
-                                days = n,
+                                date = %d,
                                 "invoice date is in the future relative to as_of; age unknown"
                             );
                         })
@@ -259,7 +260,7 @@ pub fn compute_ap_aging(
 
 /// The date of the oldest transaction that (a) has a posting to `account` and (b) carries
 /// an `invoice:` tag at the transaction level.
-fn oldest_invoice_date_for(account: &str, transactions: &[Transaction]) -> Option<String> {
+fn oldest_invoice_date_for(account: &str, transactions: &[Transaction]) -> Option<NaiveDate> {
     transactions
         .iter()
         .filter(|txn| {
@@ -271,9 +272,8 @@ fn oldest_invoice_date_for(account: &str, transactions: &[Transaction]) -> Optio
                     .any(|p| p.account == account && p.tags.iter().any(|(k, _)| k == "invoice"));
             has_account_posting && has_invoice_tag
         })
-        .map(|txn| txn.date.as_str())
+        .map(|txn| txn.date)
         .min()
-        .map(str::to_string)
 }
 
 // ---- Render helpers ----------------------------------------------------------------
@@ -323,7 +323,11 @@ pub fn render_ap_aging(entries: &[ApAgingEntry], as_of: &str) -> String {
             .as_ref()
             .map(|a| a.label())
             .unwrap_or("(no invoice date)");
-        let oldest = e.oldest_invoice_date.as_deref().unwrap_or("(unknown)");
+        let oldest = e
+            .oldest_invoice_date
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let oldest = oldest.as_str();
         lines.push(format!(
             "  {}  {}  oldest invoice: {}  [{}]",
             e.vendor_account,
@@ -383,7 +387,7 @@ mod tests {
 
     #[test]
     fn fund_project_input_structure() {
-        let inp = fund_project_input("2026-01-01".into(), "50000.00".into(), "$".into(), None);
+        let inp = fund_project_input(nd(2026, 1, 1), "50000.00".into(), "$".into(), None);
         assert_eq!(inp.postings.len(), 2);
         assert_eq!(inp.postings[0].account, CHECKING_ACCOUNT);
         assert!(inp.postings[0].amount.is_some());
@@ -394,7 +398,7 @@ mod tests {
     #[test]
     fn receive_invoice_input_structure() {
         let inp = receive_invoice_input(
-            "2026-02-01".into(),
+            nd(2026, 2, 1),
             "Acme",
             "expenses:construction:plumbing".into(),
             "8000.00".into(),
@@ -416,13 +420,7 @@ mod tests {
 
     #[test]
     fn pay_invoice_input_structure() {
-        let inp = pay_invoice_input(
-            "2026-02-20".into(),
-            "Acme",
-            "8000.00".into(),
-            "$".into(),
-            None,
-        );
+        let inp = pay_invoice_input(nd(2026, 2, 20), "Acme", "8000.00".into(), "$".into(), None);
         assert_eq!(inp.postings.len(), 2);
         assert_eq!(inp.postings[0].account, vendor_ap_account("Acme"));
         assert_eq!(inp.postings[1].account, CHECKING_ACCOUNT);
@@ -431,7 +429,7 @@ mod tests {
 
     #[test]
     fn post_interest_input_structure() {
-        let inp = post_interest_input("2026-03-01".into(), "125.00".into(), "$".into(), None);
+        let inp = post_interest_input(nd(2026, 3, 1), "125.00".into(), "$".into(), None);
         assert_eq!(inp.postings.len(), 2);
         assert_eq!(inp.postings[0].account, CHECKING_ACCOUNT);
         assert_eq!(inp.postings[1].account, INTEREST_INCOME_ACCOUNT);
@@ -525,10 +523,14 @@ mod tests {
         }
     }
 
+    fn nd(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
     fn invoice_txn(date: &str, account: &str) -> Transaction {
         use crate::hledger::Posting;
         Transaction {
-            date: date.to_string(),
+            date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
             description: "test invoice".to_string(),
             index: 1,
             status: "Unmarked".to_string(),
@@ -554,13 +556,10 @@ mod tests {
         };
         let txns = vec![invoice_txn("2026-01-01", "liabilities:ap:vendor:Acme")];
         // As-of 2026-04-15 = 104 days from 2026-01-01 → Over90Days
-        let entries = compute_ap_aging(&balance, &txns, "2026-04-15");
+        let entries = compute_ap_aging(&balance, &txns, nd(2026, 4, 15));
         assert_eq!(entries.len(), 1, "zero-balance row excluded");
         assert_eq!(entries[0].vendor_account, "liabilities:ap:vendor:Acme");
-        assert_eq!(
-            entries[0].oldest_invoice_date.as_deref(),
-            Some("2026-01-01")
-        );
+        assert_eq!(entries[0].oldest_invoice_date, Some(nd(2026, 1, 1)));
         assert_eq!(entries[0].age, Some(AgeCategory::Over90Days));
     }
 
@@ -571,7 +570,7 @@ mod tests {
             totals: vec![],
         };
         // No transactions tagged invoice: → oldest_invoice_date = None, age = None
-        let entries = compute_ap_aging(&balance, &[], "2026-06-01");
+        let entries = compute_ap_aging(&balance, &[], nd(2026, 6, 1));
         assert_eq!(entries.len(), 1);
         assert!(entries[0].oldest_invoice_date.is_none());
         assert!(entries[0].age.is_none());
@@ -593,7 +592,7 @@ mod tests {
             totals: vec![],
         };
         let non_invoice = Transaction {
-            date: "2026-01-01".to_string(),
+            date: nd(2026, 1, 1),
             description: "payment".to_string(),
             index: 1,
             status: "Unmarked".to_string(),
@@ -606,7 +605,7 @@ mod tests {
                 tags: vec![],
             }],
         };
-        let entries = compute_ap_aging(&balance, &[non_invoice], "2026-06-01");
+        let entries = compute_ap_aging(&balance, &[non_invoice], nd(2026, 6, 1));
         assert!(
             entries[0].oldest_invoice_date.is_none(),
             "non-invoice txn must not count as invoice date"
@@ -621,7 +620,7 @@ mod tests {
         };
         // Invoice txn for a different account: should not contribute to X's date
         let other = invoice_txn("2026-01-01", "liabilities:ap:vendor:OTHER");
-        let entries = compute_ap_aging(&balance, &[other], "2026-06-01");
+        let entries = compute_ap_aging(&balance, &[other], nd(2026, 6, 1));
         assert!(entries[0].oldest_invoice_date.is_none());
     }
 
@@ -660,7 +659,7 @@ mod tests {
         let entries = vec![ApAgingEntry {
             vendor_account: "liabilities:ap:vendor:Acme".to_string(),
             outstanding: vec![make_amount(-800000)],
-            oldest_invoice_date: Some("2026-01-01".to_string()),
+            oldest_invoice_date: Some(nd(2026, 1, 1)),
             age: Some(AgeCategory::Over90Days),
         }];
         let text = render_ap_aging(&entries, "2026-06-01");

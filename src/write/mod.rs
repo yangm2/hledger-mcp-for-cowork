@@ -505,7 +505,7 @@ pub async fn post_transaction(
     let mut tags = vec![("id".to_string(), id.clone()), ("idem".to_string(), idem)];
     tags.extend(validated.tags.iter().cloned());
     let text = render_entry(
-        &validated.date,
+        &validated.date.to_string(),
         &validated.description,
         &validated.postings,
         &tags,
@@ -571,7 +571,7 @@ pub async fn void_transaction(
         ("reverses".to_string(), target_id.to_string()),
     ];
     // Reversal carries the target's date (period-neutral void).
-    let text = render_entry(&target.date, &description, &postings, &tags);
+    let text = render_entry(&target.date.to_string(), &description, &postings, &tags);
 
     let commit =
         append_and_commit(ctx, &text, &format!("void reverses:{target_id} id:{id}")).await?;
@@ -849,7 +849,7 @@ mod tests {
 
     fn txn(tags: Vec<(String, String)>, postings: Vec<Posting>) -> Transaction {
         Transaction {
-            date: "2026-01-01".into(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             description: "x".into(),
             index: 1,
             status: "Unmarked".into(),
@@ -1073,7 +1073,7 @@ mod tests {
         declare_account(&ctx(&hl), "equity:opening").await.unwrap();
 
         let entry = |idem: &str| TransactionInput {
-            date: "2026-01-01".into(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             description: "x".into(),
             postings: vec![
                 ("assets:checking".to_string(), Some(("10.00", "$"))),
@@ -1120,7 +1120,7 @@ mod tests {
         declare_account(&ctx(&hl), "equity:opening").await.unwrap();
 
         let mk = |postings: Vec<(&str, Option<&str>)>| TransactionInput {
-            date: "2026-01-01".into(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             description: "x".into(),
             postings: postings
                 .into_iter()
