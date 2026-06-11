@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod domain;
 pub mod epoch;
 pub mod flags;
 pub mod git;

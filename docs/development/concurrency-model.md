@@ -83,8 +83,15 @@ the ordering wrongly:
 
 - **Record** (post / void-as-reversal): append-only, *no epoch check* — cannot corrupt
   (transaction-local invariant: postings balance to zero), idempotency-keyed.
-- **Decide** (approve a CO *because there's budget*, release a payment *because cash is
-  positive*): epoch-checked — this is where stale belief actually bites.
+- **Decide** (approve a CO *because there's budget*): epoch-checked — this is where stale
+  belief actually bites. The canonical example is `eco_approve` (M5): the agent approves a
+  change order based on a read of current budget state, and a stale read could approve a CO
+  that busts the budget.
+
+  Note: `pay_invoice` is **Record**, not Decide. The ledger does not release funds — only the
+  human can do that (via bank billpay). The agent records a payment the human has made or
+  authorized; it never makes the payment decision itself. "Release-because-cash-positive" only
+  applies to a hypothetical autonomous payment agent, which is not this workflow.
 
 ## Considered and rejected for this usage model
 

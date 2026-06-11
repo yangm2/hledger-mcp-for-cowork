@@ -57,6 +57,44 @@ pub fn commodities_argv(journal: &Path) -> Vec<String> {
     ]
 }
 
+/// `hledger balancesheet -O json -f <journal>` — assets + liabilities composite report.
+pub fn balancesheet_argv(journal: &Path) -> Vec<String> {
+    vec![
+        "balancesheet".to_string(),
+        "-O".to_string(),
+        "json".to_string(),
+        "-f".to_string(),
+        journal.display().to_string(),
+    ]
+}
+
+/// `hledger incomestatement -O json -f <journal>` — revenues + expenses composite report.
+pub fn incomestatement_argv(journal: &Path) -> Vec<String> {
+    vec![
+        "incomestatement".to_string(),
+        "-O".to_string(),
+        "json".to_string(),
+        "-f".to_string(),
+        journal.display().to_string(),
+    ]
+}
+
+/// `hledger balance [account] --flat -O json -f <journal>` — leaf accounts only.
+///
+/// `--flat` suppresses parent-account subtotal rows; used by AP aging to get one row
+/// per vendor rather than parent subtotals.
+pub fn balance_flat_argv(journal: &Path, account: Option<&str>) -> Vec<String> {
+    let mut argv = vec!["balance".to_string(), "--flat".to_string()];
+    if let Some(account) = account {
+        argv.push(account.to_string());
+    }
+    argv.push("-O".to_string());
+    argv.push("json".to_string());
+    argv.push("-f".to_string());
+    argv.push(journal.display().to_string());
+    argv
+}
+
 /// `hledger balance [account] -O json -f <journal>`.
 ///
 /// `account` is an optional account-name query; `None` reports all accounts.
@@ -98,6 +136,38 @@ mod tests {
     #[test]
     fn version_is_just_the_flag() {
         assert_eq!(version_argv(), vec!["--version"]);
+    }
+
+    #[test]
+    fn balancesheet_and_incomestatement_argv_shapes() {
+        assert_eq!(
+            balancesheet_argv(&journal()),
+            vec!["balancesheet", "-O", "json", "-f", "/x/main.journal"]
+        );
+        assert_eq!(
+            incomestatement_argv(&journal()),
+            vec!["incomestatement", "-O", "json", "-f", "/x/main.journal"]
+        );
+    }
+
+    #[test]
+    fn balance_flat_argv_shape() {
+        assert_eq!(
+            balance_flat_argv(&journal(), Some("liabilities:ap")),
+            vec![
+                "balance",
+                "--flat",
+                "liabilities:ap",
+                "-O",
+                "json",
+                "-f",
+                "/x/main.journal"
+            ]
+        );
+        assert_eq!(
+            balance_flat_argv(&journal(), None),
+            vec!["balance", "--flat", "-O", "json", "-f", "/x/main.journal"]
+        );
     }
 
     #[test]

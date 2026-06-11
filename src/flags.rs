@@ -8,7 +8,8 @@
 //!
 //! Pure (report in, flags out) — unit- and mutation-testable without hledger.
 
-use crate::hledger::BalanceReport;
+use crate::domain::ApAgingEntry;
+use crate::hledger::{BalanceReport, amount::render_amounts};
 
 /// One surfaced soft-invariant violation. Informational only, by design.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,24 @@ pub fn overdraft_flags(report: &BalanceReport) -> Vec<Flag> {
         }
     }
     flags
+}
+
+/// Compute **AP-aging** flags: any vendor AP account with an outstanding balance 90+ days
+/// old is flagged as overdue. Surfaced alongside aging reports, never enforced (C-6).
+pub fn ap_aging_flags(entries: &[ApAgingEntry]) -> Vec<Flag> {
+    entries
+        .iter()
+        .filter(|e| e.age.as_ref().map(|a| a.is_overdue()).unwrap_or(false))
+        .map(|e| Flag {
+            kind: "ap-aging",
+            account: e.vendor_account.clone(),
+            detail: format!(
+                "outstanding {} since {} (90+ days overdue)",
+                render_amounts(&e.outstanding),
+                e.oldest_invoice_date.as_deref().unwrap_or("(unknown)")
+            ),
+        })
+        .collect()
 }
 
 /// Render flags as report-footer lines (empty string when there are none).
@@ -132,5 +151,33 @@ mod tests {
             "flag overdraft: assets:a balance $-1.00\nflag overdraft: assets:b balance $-2.00"
         );
         assert_eq!(render_flags(&[]), "");
+    }
+
+    #[test]
+    fn ap_aging_flags_only_overdue() {
+        use crate::domain::{AgeCategory, ApAgingEntry};
+        fn aging_entry(account: &str, age: Option<AgeCategory>) -> ApAgingEntry {
+            ApAgingEntry {
+                vendor_account: account.to_string(),
+                outstanding: vec![Amount {
+                    commodity: "$".to_string(),
+                    quantity: crate::hledger::Quantity::new(250000, 2),
+                    commodity_left: true,
+                    spaced: false,
+                }],
+                oldest_invoice_date: Some("2026-01-01".to_string()),
+                age,
+            }
+        }
+        let entries = vec![
+            aging_entry("liabilities:ap:vendor:A", Some(AgeCategory::Over90Days)),
+            aging_entry("liabilities:ap:vendor:B", Some(AgeCategory::Current)),
+            aging_entry("liabilities:ap:vendor:C", None),
+        ];
+        let flags = ap_aging_flags(&entries);
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0].kind, "ap-aging");
+        assert_eq!(flags[0].account, "liabilities:ap:vendor:A");
+        assert!(flags[0].detail.contains("overdue"), "{}", flags[0].detail);
     }
 }

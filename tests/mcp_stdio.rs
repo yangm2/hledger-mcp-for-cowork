@@ -108,7 +108,7 @@ fn full_lifecycle_lists_tools_and_echoes() {
         "server_instructions present"
     );
 
-    // tools/list advertises the M0 connectivity tools plus the M1 read tools.
+    // tools/list advertises all tools (M0–M4).
     server.send(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
     let listed = server.recv();
     let mut names: Vec<String> = listed["result"]["tools"]
@@ -125,11 +125,19 @@ fn full_lifecycle_lists_tools_and_echoes() {
             "declare_account".to_string(),
             "declare_commodity".to_string(),
             "echo".to_string(),
+            "fund_project".to_string(),
             "get_account_balance".to_string(),
+            "get_ap_aging".to_string(),
+            "get_project_summary".to_string(),
             "list_transactions".to_string(),
+            "pay_invoice".to_string(),
+            "post_interest".to_string(),
             "post_transaction".to_string(),
+            "receive_invoice".to_string(),
             "status".to_string(),
             "update_transaction".to_string(),
+            "vendor_add".to_string(),
+            "vendor_list".to_string(),
             "void_transaction".to_string(),
         ]
     );

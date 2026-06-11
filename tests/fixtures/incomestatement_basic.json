@@ -1,0 +1,447 @@
+{
+  "cbrDates": [
+    [
+      {
+        "contents": "2026-01-01",
+        "tag": "Exact"
+      },
+      {
+        "contents": "2026-03-02",
+        "tag": "Exact"
+      }
+    ]
+  ],
+  "cbrSubreports": [
+    [
+      "Revenues",
+      {
+        "prDates": [
+          [
+            {
+              "contents": "2026-01-01",
+              "tag": "Exact"
+            },
+            {
+              "contents": "2026-03-02",
+              "tag": "Exact"
+            }
+          ]
+        ],
+        "prRows": [
+          {
+            "prrAmounts": [
+              [
+                {
+                  "acommodity": "$",
+                  "acost": null,
+                  "acostbasis": null,
+                  "aquantity": {
+                    "decimalMantissa": 12500,
+                    "decimalPlaces": 2,
+                    "floatingPoint": 125
+                  },
+                  "astyle": {
+                    "ascommodityside": "L",
+                    "ascommodityspaced": false,
+                    "asdecimalmark": ".",
+                    "asdigitgroups": null,
+                    "asprecision": 2,
+                    "asrounding": "HardRounding"
+                  }
+                }
+              ]
+            ],
+            "prrAverage": [
+              {
+                "acommodity": "$",
+                "acost": null,
+                "acostbasis": null,
+                "aquantity": {
+                  "decimalMantissa": 125,
+                  "decimalPlaces": 0,
+                  "floatingPoint": 125
+                },
+                "astyle": {
+                  "ascommodityside": "L",
+                  "ascommodityspaced": false,
+                  "asdecimalmark": ".",
+                  "asdigitgroups": null,
+                  "asprecision": 2,
+                  "asrounding": "HardRounding"
+                }
+              }
+            ],
+            "prrName": "income:interest",
+            "prrTotal": [
+              {
+                "acommodity": "$",
+                "acost": null,
+                "acostbasis": null,
+                "aquantity": {
+                  "decimalMantissa": 12500,
+                  "decimalPlaces": 2,
+                  "floatingPoint": 125
+                },
+                "astyle": {
+                  "ascommodityside": "L",
+                  "ascommodityspaced": false,
+                  "asdecimalmark": ".",
+                  "asdigitgroups": null,
+                  "asprecision": 2,
+                  "asrounding": "HardRounding"
+                }
+              }
+            ]
+          }
+        ],
+        "prTotals": {
+          "prrAmounts": [
+            [
+              {
+                "acommodity": "$",
+                "acost": null,
+                "acostbasis": null,
+                "aquantity": {
+                  "decimalMantissa": 12500,
+                  "decimalPlaces": 2,
+                  "floatingPoint": 125
+                },
+                "astyle": {
+                  "ascommodityside": "L",
+                  "ascommodityspaced": false,
+                  "asdecimalmark": ".",
+                  "asdigitgroups": null,
+                  "asprecision": 2,
+                  "asrounding": "HardRounding"
+                }
+              }
+            ]
+          ],
+          "prrAverage": [
+            {
+              "acommodity": "$",
+              "acost": null,
+              "acostbasis": null,
+              "aquantity": {
+                "decimalMantissa": 125,
+                "decimalPlaces": 0,
+                "floatingPoint": 125
+              },
+              "astyle": {
+                "ascommodityside": "L",
+                "ascommodityspaced": false,
+                "asdecimalmark": ".",
+                "asdigitgroups": null,
+                "asprecision": 2,
+                "asrounding": "HardRounding"
+              }
+            }
+          ],
+          "prrName": [],
+          "prrTotal": [
+            {
+              "acommodity": "$",
+              "acost": null,
+              "acostbasis": null,
+              "aquantity": {
+                "decimalMantissa": 12500,
+                "decimalPlaces": 2,
+                "floatingPoint": 125
+              },
+              "astyle": {
+                "ascommodityside": "L",
+                "ascommodityspaced": false,
+                "asdecimalmark": ".",
+                "asdigitgroups": null,
+                "asprecision": 2,
+                "asrounding": "HardRounding"
+              }
+            }
+          ]
+        }
+      },
+      true
+    ],
+    [
+      "Expenses",
+      {
+        "prDates": [
+          [
+            {
+              "contents": "2026-01-01",
+              "tag": "Exact"
+            },
+            {
+              "contents": "2026-03-02",
+              "tag": "Exact"
+            }
+          ]
+        ],
+        "prRows": [
+          {
+            "prrAmounts": [
+              [
+                {
+                  "acommodity": "$",
+                  "acost": null,
+                  "acostbasis": null,
+                  "aquantity": {
+                    "decimalMantissa": 250000,
+                    "decimalPlaces": 2,
+                    "floatingPoint": 2500
+                  },
+                  "astyle": {
+                    "ascommodityside": "L",
+                    "ascommodityspaced": false,
+                    "asdecimalmark": ".",
+                    "asdigitgroups": null,
+                    "asprecision": 2,
+                    "asrounding": "HardRounding"
+                  }
+                }
+              ]
+            ],
+            "prrAverage": [
+              {
+                "acommodity": "$",
+                "acost": null,
+                "acostbasis": null,
+                "aquantity": {
+                  "decimalMantissa": 2500,
+                  "decimalPlaces": 0,
+                  "floatingPoint": 2500
+                },
+                "astyle": {
+                  "ascommodityside": "L",
+                  "ascommodityspaced": false,
+                  "asdecimalmark": ".",
+                  "asdigitgroups": null,
+                  "asprecision": 2,
+                  "asrounding": "HardRounding"
+                }
+              }
+            ],
+            "prrName": "expenses:professional - Bob Engineer",
+            "prrTotal": [
+              {
+                "acommodity": "$",
+                "acost": null,
+                "acostbasis": null,
+                "aquantity": {
+                  "decimalMantissa": 250000,
+                  "decimalPlaces": 2,
+                  "floatingPoint": 2500
+                },
+                "astyle": {
+                  "ascommodityside": "L",
+                  "ascommodityspaced": false,
+                  "asdecimalmark": ".",
+                  "asdigitgroups": null,
+                  "asprecision": 2,
+                  "asrounding": "HardRounding"
+                }
+              }
+            ]
+          },
+          {
+            "prrAmounts": [
+              [
+                {
+                  "acommodity": "$",
+                  "acost": null,
+                  "acostbasis": null,
+                  "aquantity": {
+                    "decimalMantissa": 800000,
+                    "decimalPlaces": 2,
+                    "floatingPoint": 8000
+                  },
+                  "astyle": {
+                    "ascommodityside": "L",
+                    "ascommodityspaced": false,
+                    "asdecimalmark": ".",
+                    "asdigitgroups": null,
+                    "asprecision": 2,
+                    "asrounding": "HardRounding"
+                  }
+                }
+              ]
+            ],
+            "prrAverage": [
+              {
+                "acommodity": "$",
+                "acost": null,
+                "acostbasis": null,
+                "aquantity": {
+                  "decimalMantissa": 8000,
+                  "decimalPlaces": 0,
+                  "floatingPoint": 8000
+                },
+                "astyle": {
+                  "ascommodityside": "L",
+                  "ascommodityspaced": false,
+                  "asdecimalmark": ".",
+                  "asdigitgroups": null,
+                  "asprecision": 2,
+                  "asrounding": "HardRounding"
+                }
+              }
+            ],
+            "prrName": "expenses:construction:plumbing",
+            "prrTotal": [
+              {
+                "acommodity": "$",
+                "acost": null,
+                "acostbasis": null,
+                "aquantity": {
+                  "decimalMantissa": 800000,
+                  "decimalPlaces": 2,
+                  "floatingPoint": 8000
+                },
+                "astyle": {
+                  "ascommodityside": "L",
+                  "ascommodityspaced": false,
+                  "asdecimalmark": ".",
+                  "asdigitgroups": null,
+                  "asprecision": 2,
+                  "asrounding": "HardRounding"
+                }
+              }
+            ]
+          }
+        ],
+        "prTotals": {
+          "prrAmounts": [
+            [
+              {
+                "acommodity": "$",
+                "acost": null,
+                "acostbasis": null,
+                "aquantity": {
+                  "decimalMantissa": 1050000,
+                  "decimalPlaces": 2,
+                  "floatingPoint": 10500
+                },
+                "astyle": {
+                  "ascommodityside": "L",
+                  "ascommodityspaced": false,
+                  "asdecimalmark": ".",
+                  "asdigitgroups": null,
+                  "asprecision": 2,
+                  "asrounding": "HardRounding"
+                }
+              }
+            ]
+          ],
+          "prrAverage": [
+            {
+              "acommodity": "$",
+              "acost": null,
+              "acostbasis": null,
+              "aquantity": {
+                "decimalMantissa": 10500,
+                "decimalPlaces": 0,
+                "floatingPoint": 10500
+              },
+              "astyle": {
+                "ascommodityside": "L",
+                "ascommodityspaced": false,
+                "asdecimalmark": ".",
+                "asdigitgroups": null,
+                "asprecision": 2,
+                "asrounding": "HardRounding"
+              }
+            }
+          ],
+          "prrName": [],
+          "prrTotal": [
+            {
+              "acommodity": "$",
+              "acost": null,
+              "acostbasis": null,
+              "aquantity": {
+                "decimalMantissa": 1050000,
+                "decimalPlaces": 2,
+                "floatingPoint": 10500
+              },
+              "astyle": {
+                "ascommodityside": "L",
+                "ascommodityspaced": false,
+                "asdecimalmark": ".",
+                "asdigitgroups": null,
+                "asprecision": 2,
+                "asrounding": "HardRounding"
+              }
+            }
+          ]
+        }
+      },
+      false
+    ]
+  ],
+  "cbrTitle": "Income Statement 2026-01-01..2026-03-01",
+  "cbrTotals": {
+    "prrAmounts": [
+      [
+        {
+          "acommodity": "$",
+          "acost": null,
+          "acostbasis": null,
+          "aquantity": {
+            "decimalMantissa": -1037500,
+            "decimalPlaces": 2,
+            "floatingPoint": -10375
+          },
+          "astyle": {
+            "ascommodityside": "L",
+            "ascommodityspaced": false,
+            "asdecimalmark": ".",
+            "asdigitgroups": null,
+            "asprecision": 2,
+            "asrounding": "HardRounding"
+          }
+        }
+      ]
+    ],
+    "prrAverage": [
+      {
+        "acommodity": "$",
+        "acost": null,
+        "acostbasis": null,
+        "aquantity": {
+          "decimalMantissa": -10375,
+          "decimalPlaces": 0,
+          "floatingPoint": -10375
+        },
+        "astyle": {
+          "ascommodityside": "L",
+          "ascommodityspaced": false,
+          "asdecimalmark": ".",
+          "asdigitgroups": null,
+          "asprecision": 2,
+          "asrounding": "HardRounding"
+        }
+      }
+    ],
+    "prrName": [],
+    "prrTotal": [
+      {
+        "acommodity": "$",
+        "acost": null,
+        "acostbasis": null,
+        "aquantity": {
+          "decimalMantissa": -1037500,
+          "decimalPlaces": 2,
+          "floatingPoint": -10375
+        },
+        "astyle": {
+          "ascommodityside": "L",
+          "ascommodityspaced": false,
+          "asdecimalmark": ".",
+          "asdigitgroups": null,
+          "asprecision": 2,
+          "asrounding": "HardRounding"
+        }
+      }
+    ]
+  }
+}

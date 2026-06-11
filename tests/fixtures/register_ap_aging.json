@@ -1,0 +1,173 @@
+[
+  [
+    "2026-02-01",
+    null,
+    "Acme Plumbing invoice",
+    {
+      "paccount": "liabilities:ap:vendor:Acme",
+      "pamount": [
+        {
+          "acommodity": "$",
+          "acost": null,
+          "acostbasis": null,
+          "aquantity": {
+            "decimalMantissa": -800000,
+            "decimalPlaces": 2,
+            "floatingPoint": -8000
+          },
+          "astyle": {
+            "ascommodityside": "L",
+            "ascommodityspaced": false,
+            "asdecimalmark": ".",
+            "asdigitgroups": null,
+            "asprecision": 2,
+            "asrounding": "HardRounding"
+          }
+        }
+      ],
+      "pbalanceassertion": null,
+      "pcomment": "",
+      "pdate": null,
+      "pdate2": null,
+      "poriginal": null,
+      "pstatus": "Unmarked",
+      "ptags": [],
+      "ptransaction_": "2",
+      "ptype": "RegularPosting"
+    },
+    [
+      {
+        "acommodity": "$",
+        "acost": null,
+        "acostbasis": null,
+        "aquantity": {
+          "decimalMantissa": -800000,
+          "decimalPlaces": 2,
+          "floatingPoint": -8000
+        },
+        "astyle": {
+          "ascommodityside": "L",
+          "ascommodityspaced": false,
+          "asdecimalmark": ".",
+          "asdigitgroups": null,
+          "asprecision": 2,
+          "asrounding": "HardRounding"
+        }
+      }
+    ]
+  ],
+  [
+    "2026-02-15",
+    null,
+    "Bob Engineer invoice",
+    {
+      "paccount": "liabilities:ap:vendor:Bob Engineer",
+      "pamount": [
+        {
+          "acommodity": "$",
+          "acost": null,
+          "acostbasis": null,
+          "aquantity": {
+            "decimalMantissa": -250000,
+            "decimalPlaces": 2,
+            "floatingPoint": -2500
+          },
+          "astyle": {
+            "ascommodityside": "L",
+            "ascommodityspaced": false,
+            "asdecimalmark": ".",
+            "asdigitgroups": null,
+            "asprecision": 2,
+            "asrounding": "HardRounding"
+          }
+        }
+      ],
+      "pbalanceassertion": null,
+      "pcomment": "",
+      "pdate": null,
+      "pdate2": null,
+      "poriginal": null,
+      "pstatus": "Unmarked",
+      "ptags": [],
+      "ptransaction_": "3",
+      "ptype": "RegularPosting"
+    },
+    [
+      {
+        "acommodity": "$",
+        "acost": null,
+        "acostbasis": null,
+        "aquantity": {
+          "decimalMantissa": -1050000,
+          "decimalPlaces": 2,
+          "floatingPoint": -10500
+        },
+        "astyle": {
+          "ascommodityside": "L",
+          "ascommodityspaced": false,
+          "asdecimalmark": ".",
+          "asdigitgroups": null,
+          "asprecision": 2,
+          "asrounding": "HardRounding"
+        }
+      }
+    ]
+  ],
+  [
+    "2026-02-20",
+    null,
+    "Pay Acme",
+    {
+      "paccount": "liabilities:ap:vendor:Acme",
+      "pamount": [
+        {
+          "acommodity": "$",
+          "acost": null,
+          "acostbasis": null,
+          "aquantity": {
+            "decimalMantissa": 800000,
+            "decimalPlaces": 2,
+            "floatingPoint": 8000
+          },
+          "astyle": {
+            "ascommodityside": "L",
+            "ascommodityspaced": false,
+            "asdecimalmark": ".",
+            "asdigitgroups": null,
+            "asprecision": 2,
+            "asrounding": "HardRounding"
+          }
+        }
+      ],
+      "pbalanceassertion": null,
+      "pcomment": "",
+      "pdate": null,
+      "pdate2": null,
+      "poriginal": null,
+      "pstatus": "Unmarked",
+      "ptags": [],
+      "ptransaction_": "4",
+      "ptype": "RegularPosting"
+    },
+    [
+      {
+        "acommodity": "$",
+        "acost": null,
+        "acostbasis": null,
+        "aquantity": {
+          "decimalMantissa": -250000,
+          "decimalPlaces": 2,
+          "floatingPoint": -2500
+        },
+        "astyle": {
+          "ascommodityside": "L",
+          "ascommodityspaced": false,
+          "asdecimalmark": ".",
+          "asdigitgroups": null,
+          "asprecision": 2,
+          "asrounding": "HardRounding"
+        }
+      }
+    ]
+  ]
+]

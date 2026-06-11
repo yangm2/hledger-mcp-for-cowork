@@ -106,6 +106,92 @@ pub struct CloseAccountArgs {
     pub account: String,
 }
 
+/// Arguments for `fund_project`.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct FundProjectArgs {
+    /// Date of the funding (YYYY-MM-DD).
+    pub date: String,
+    /// Amount deposited, e.g. `"50000.00"`.
+    pub amount: String,
+    /// Commodity symbol, e.g. `"$"`.
+    pub commodity: String,
+    /// Optional idempotency key — reuse on retry to avoid a duplicate.
+    #[serde(default)]
+    pub idem: Option<String>,
+}
+
+/// Arguments for `receive_invoice`.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct ReceiveInvoiceArgs {
+    /// Invoice date (YYYY-MM-DD).
+    pub date: String,
+    /// Vendor name, e.g. `"Acme"`.
+    pub vendor: String,
+    /// Expense account, e.g. `"expenses:construction:plumbing"` or
+    /// `"expenses:professional - Bob Engineer"`. Use `vendor_add` to declare it first.
+    pub expense_account: String,
+    /// Invoice amount, e.g. `"8000.00"`.
+    pub amount: String,
+    /// Commodity symbol, e.g. `"$"`.
+    pub commodity: String,
+    /// Vendor-assigned invoice reference, e.g. `"INV-001"`.
+    pub invoice_ref: String,
+    /// Optional idempotency key.
+    #[serde(default)]
+    pub idem: Option<String>,
+}
+
+/// Arguments for `pay_invoice`.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct PayInvoiceArgs {
+    /// Payment date (YYYY-MM-DD).
+    pub date: String,
+    /// Vendor name matching the AP account, e.g. `"Acme"`.
+    pub vendor: String,
+    /// Amount paid, e.g. `"8000.00"`.
+    pub amount: String,
+    /// Commodity symbol, e.g. `"$"`.
+    pub commodity: String,
+    /// Optional idempotency key.
+    #[serde(default)]
+    pub idem: Option<String>,
+}
+
+/// Arguments for `post_interest`.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct PostInterestArgs {
+    /// Date interest was earned (YYYY-MM-DD).
+    pub date: String,
+    /// Interest amount, e.g. `"125.00"`.
+    pub amount: String,
+    /// Commodity symbol, e.g. `"$"`.
+    pub commodity: String,
+    /// Optional idempotency key.
+    #[serde(default)]
+    pub idem: Option<String>,
+}
+
+/// Arguments for `vendor_add`.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct VendorAddArgs {
+    /// Vendor name, e.g. `"Acme"` or `"Bob Engineer"`.
+    pub vendor: String,
+    /// `"trade"` for a shared trade expense account (`expenses:construction:{trade}`), or
+    /// `"professional"` for a dedicated per-vendor account (`expenses:professional - {vendor}`).
+    pub vendor_type: String,
+    /// The trade/sub-trade name (e.g. `"plumbing"`). Required when `vendor_type` is `"trade"`.
+    #[serde(default)]
+    pub trade: Option<String>,
+}
+
+/// Arguments for `get_ap_aging`.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct GetApAgingArgs {
+    /// Reference date for age computation (YYYY-MM-DD). Defaults to today.
+    #[serde(default)]
+    pub as_of: Option<String>,
+}
+
 /// The MCP server handler.
 #[derive(Clone)]
 pub struct HledgerMcp {
@@ -540,6 +626,300 @@ impl HledgerMcp {
             },
         )
         .await
+    }
+
+    // ---- M4 domain tools (all Record) --------------------------------------------------
+
+    /// Fund a construction project: deposit owner capital into `assets:checking`.
+    #[tool(
+        description = "Fund the project: record an owner capital deposit into checking. \
+                      Requires `date` (YYYY-MM-DD), `amount` (e.g. \"50000.00\"), \
+                      `commodity` (e.g. \"$\"). Optional `idem` for idempotent retry. \
+                      One validated write = one git commit.",
+        input_schema = schema_for_type::<FundProjectArgs>()
+    )]
+    async fn fund_project(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: FundProjectArgs = match crate::tools::parse_args(raw) {
+            Ok(a) => a,
+            Err(e) => return Ok(e),
+        };
+        let date = args.date;
+        let amount = args.amount;
+        let commodity = args.commodity;
+        let idem = args.idem;
+        self.guarded_tool(
+            ToolClass::Record,
+            async |ctx| {
+                let input = crate::domain::fund_project_input(date, amount, commodity, idem);
+                write::post_transaction(&ctx, input).await
+            },
+            post_outcome_text,
+        )
+        .await
+    }
+
+    /// Receive a vendor invoice: debit the expense account, credit the vendor AP account.
+    #[tool(
+        description = "Record a received invoice from a vendor. Requires `date` (YYYY-MM-DD), \
+                      `vendor` (name), `expense_account` (e.g. \
+                      \"expenses:construction:plumbing\" or \"expenses:professional - Bob\"), \
+                      `amount`, `commodity`, `invoice_ref` (vendor invoice number). Optional `idem`. \
+                      Declare accounts with `vendor_add` first.",
+        input_schema = schema_for_type::<ReceiveInvoiceArgs>()
+    )]
+    async fn receive_invoice(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: ReceiveInvoiceArgs = match crate::tools::parse_args(raw) {
+            Ok(a) => a,
+            Err(e) => return Ok(e),
+        };
+        let date = args.date;
+        let vendor = args.vendor;
+        let expense_account = args.expense_account;
+        let amount = args.amount;
+        let commodity = args.commodity;
+        let invoice_ref = args.invoice_ref;
+        let idem = args.idem;
+        self.guarded_tool(
+            ToolClass::Record,
+            async |ctx| {
+                let input = crate::domain::receive_invoice_input(
+                    date,
+                    &vendor,
+                    expense_account,
+                    amount,
+                    commodity,
+                    invoice_ref,
+                    idem,
+                );
+                write::post_transaction(&ctx, input).await
+            },
+            post_outcome_text,
+        )
+        .await
+    }
+
+    /// Pay a vendor invoice: debit the vendor AP account, credit `assets:checking`.
+    #[tool(
+        description = "Record a payment to a vendor — clears the AP liability for that vendor. \
+                      Requires `date` (YYYY-MM-DD), `vendor` (name), `amount`, `commodity`. \
+                      Optional `idem`.",
+        input_schema = schema_for_type::<PayInvoiceArgs>()
+    )]
+    async fn pay_invoice(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: PayInvoiceArgs = match crate::tools::parse_args(raw) {
+            Ok(a) => a,
+            Err(e) => return Ok(e),
+        };
+        let date = args.date;
+        let vendor = args.vendor;
+        let amount = args.amount;
+        let commodity = args.commodity;
+        let idem = args.idem;
+        self.guarded_tool(
+            ToolClass::Record,
+            async |ctx| {
+                let input =
+                    crate::domain::pay_invoice_input(date, &vendor, amount, commodity, idem);
+                write::post_transaction(&ctx, input).await
+            },
+            post_outcome_text,
+        )
+        .await
+    }
+
+    /// Post interest earned: debit `assets:checking`, credit `income:interest`.
+    #[tool(
+        description = "Record interest earned on the project checking account. Requires \
+                      `date` (YYYY-MM-DD), `amount`, `commodity`. Optional `idem`.",
+        input_schema = schema_for_type::<PostInterestArgs>()
+    )]
+    async fn post_interest(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: PostInterestArgs = match crate::tools::parse_args(raw) {
+            Ok(a) => a,
+            Err(e) => return Ok(e),
+        };
+        let date = args.date;
+        let amount = args.amount;
+        let commodity = args.commodity;
+        let idem = args.idem;
+        self.guarded_tool(
+            ToolClass::Record,
+            async |ctx| {
+                let input = crate::domain::post_interest_input(date, amount, commodity, idem);
+                write::post_transaction(&ctx, input).await
+            },
+            post_outcome_text,
+        )
+        .await
+    }
+
+    /// Declare a vendor: register both its AP account and its expense account in one commit.
+    #[tool(
+        description = "Declare a vendor — registers the AP account \
+                      (`liabilities:ap:vendor:{vendor}`) and the expense account in one commit. \
+                      Requires `vendor` (name), `vendor_type` (\"trade\" or \"professional\"). \
+                      For \"trade\", also supply `trade` (sub-trade name, e.g. \"plumbing\"); \
+                      shared expense account `expenses:construction:{trade}`. \
+                      For \"professional\", a dedicated `expenses:professional - {vendor}` is used.",
+        input_schema = schema_for_type::<VendorAddArgs>()
+    )]
+    async fn vendor_add(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: VendorAddArgs = match crate::tools::parse_args(raw) {
+            Ok(a) => a,
+            Err(e) => return Ok(e),
+        };
+        let expense_account = match args.vendor_type.as_str() {
+            "trade" => {
+                let trade = match args.trade {
+                    Some(t) => t,
+                    None => {
+                        return Ok(CallToolResult::error(vec![Content::text(
+                            "input error: `trade` is required when vendor_type is \"trade\"",
+                        )]));
+                    }
+                };
+                crate::domain::trade_expense_account(&trade)
+            }
+            "professional" => crate::domain::professional_expense_account(&args.vendor),
+            other => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "input error: vendor_type must be \"trade\" or \"professional\", got \"{other}\""
+                ))]));
+            }
+        };
+        let ap_account = crate::domain::vendor_ap_account(&args.vendor);
+        let vendor = args.vendor;
+        self.guarded_tool(
+            ToolClass::Record,
+            async |ctx| write::vendor_add(&ctx, &vendor, &ap_account, &expense_account).await,
+            |out: &CommitOutcome| {
+                format!(
+                    "declared vendor '{}': AP account + expense account (commit {})",
+                    out.id,
+                    out.commit.short()
+                )
+            },
+        )
+        .await
+    }
+
+    /// List declared vendor AP accounts (`liabilities:ap:vendor:*`). **Read**.
+    #[tool(
+        description = "List all declared vendor AP accounts (liabilities:ap:vendor:*). \
+                      Returns vendor names and their AP account paths. Takes no arguments."
+    )]
+    async fn vendor_list(
+        &self,
+        Parameters(_raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .view
+            .grounded_read(&self.hledger, || self.hledger.declared_accounts())
+            .await;
+        match result {
+            Ok(accounts) => {
+                let vendors: Vec<&str> = accounts
+                    .iter()
+                    .filter(|a| a.starts_with("liabilities:ap:vendor:"))
+                    .map(String::as_str)
+                    .collect();
+                let text = if vendors.is_empty() {
+                    "(no vendors declared — use vendor_add first)".to_string()
+                } else {
+                    vendors.join("\n")
+                };
+                Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
+            Err(err) => Ok(adapter_error(&err)),
+        }
+    }
+
+    /// AP aging report: outstanding payables bucketed by age. **Read** — soft-invariant flags
+    /// (90+ days overdue) are surfaced alongside the report, never enforced (C-6).
+    #[tool(
+        description = "AP aging report: outstanding vendor payables bucketed as current (0-30), \
+                      31-60, 61-90, or 90+ days. Optional `as_of` date (YYYY-MM-DD, defaults to \
+                      today). Flags any 90+-day overdue balances as soft-invariant warnings.",
+        input_schema = schema_for_type::<GetApAgingArgs>()
+    )]
+    async fn get_ap_aging(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: GetApAgingArgs = match crate::tools::parse_args(raw) {
+            Ok(a) => a,
+            Err(e) => return Ok(e),
+        };
+        let as_of = args.as_of.unwrap_or_else(crate::domain::today_iso);
+        let hledger = &self.hledger;
+        let ap_query = "liabilities:ap".to_string();
+        let result = self
+            .view
+            .grounded_read(&self.hledger, || async move {
+                let balance = hledger.balance_flat(Some("liabilities:ap")).await?;
+                let txns = hledger.list_transactions(&[ap_query]).await?;
+                Ok::<_, HledgerError>((balance, txns))
+            })
+            .await;
+        match result {
+            Ok((balance, txns)) => {
+                let entries = crate::domain::compute_ap_aging(&balance, &txns, &as_of);
+                let mut text = crate::domain::render_ap_aging(&entries, &as_of);
+                let flags = crate::flags::ap_aging_flags(&entries);
+                if !flags.is_empty() {
+                    text.push('\n');
+                    text.push_str(&crate::flags::render_flags(&flags));
+                }
+                Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
+            Err(err) => Ok(adapter_error(&err)),
+        }
+    }
+
+    /// Project summary: balance sheet + income statement. **Read**.
+    #[tool(
+        description = "Project financial summary: balance sheet (assets, liabilities, net) and \
+                      income statement (revenues, expenses). Takes no arguments."
+    )]
+    async fn get_project_summary(
+        &self,
+        Parameters(_raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let hledger = &self.hledger;
+        let result = self
+            .view
+            .grounded_read(&self.hledger, || async move {
+                let bs = hledger.balancesheet().await?;
+                let is = hledger.incomestatement().await?;
+                Ok::<_, HledgerError>((bs, is))
+            })
+            .await;
+        match result {
+            Ok((bs, is)) => {
+                let text = format!(
+                    "{}\n\n{}",
+                    crate::domain::render_composite(&bs),
+                    crate::domain::render_composite(&is),
+                );
+                Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
+            Err(err) => Ok(adapter_error(&err)),
+        }
     }
 
     /// Echo a message back unchanged — a minimal tool-invocation connectivity check.

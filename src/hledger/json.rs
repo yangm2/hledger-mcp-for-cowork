@@ -10,7 +10,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::amount::{Amount, Quantity};
-use super::{AccountBalance, BalanceReport, Posting, Transaction};
+use super::{
+    AccountBalance, BalanceReport, CompositeReport, Posting, ReportRow, Subreport, Transaction,
+};
 
 /// hledger `aquantity`: an exact decimal. We read the integer mantissa + place count and
 /// drop `floatingPoint` (lossy — see [`super::amount`]).
@@ -111,6 +113,87 @@ pub fn parse_balance(stdout: &str) -> Result<BalanceReport, serde_json::Error> {
     })
 }
 
+// ---- balancesheet / incomestatement (`hledger balancesheet/incomestatement -O json`) ----
+//
+// Both commands produce the same "composite balance report" (cbr) shape:
+// {
+//   "cbrTitle": "...",
+//   "cbrSubreports": [
+//     ["Assets", { "prRows": [...], "prTotals": { "prrTotal": [...] } }, true],
+//     ...
+//   ],
+//   "cbrTotals": { "prrTotal": [...] }
+// }
+//
+// cbrSubreports is a positional 3-tuple; we index by position for the same reason we
+// index balance rows — a future hledger appending a field stays compatible.
+//
+// prRows entries have "prrName" as a string (account name). The prTotals entry has
+// "prrName": [] (empty array) — we never parse prrName from prTotals, so this doesn't bite.
+
+/// Parse `hledger balancesheet -O json` or `hledger incomestatement -O json` output into
+/// a [`CompositeReport`]. Both commands produce the same `cbr` wire shape.
+pub fn parse_composite_report(stdout: &str) -> Result<CompositeReport, serde_json::Error> {
+    use serde::de::Error as _;
+    let doc: Value = serde_json::from_str(stdout)?;
+
+    let title = doc["cbrTitle"]
+        .as_str()
+        .ok_or_else(|| serde_json::Error::custom("composite: missing cbrTitle string"))?
+        .to_string();
+
+    let subreports_arr = doc["cbrSubreports"]
+        .as_array()
+        .ok_or_else(|| serde_json::Error::custom("composite: cbrSubreports not array"))?;
+
+    let mut subreports = Vec::with_capacity(subreports_arr.len());
+    for entry in subreports_arr {
+        let tuple = entry
+            .as_array()
+            .ok_or_else(|| serde_json::Error::custom("composite: subreport entry not array"))?;
+        let name = tuple
+            .first()
+            .and_then(Value::as_str)
+            .ok_or_else(|| serde_json::Error::custom("composite: subreport missing name"))?
+            .to_string();
+        let pr = tuple.get(1).ok_or_else(|| {
+            serde_json::Error::custom("composite: subreport missing PeriodicReport")
+        })?;
+        let is_positive = tuple
+            .get(2)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| serde_json::Error::custom("composite: subreport missing isPositive"))?;
+
+        let rows_arr = pr["prRows"]
+            .as_array()
+            .ok_or_else(|| serde_json::Error::custom("composite: prRows not array"))?;
+        let mut rows = Vec::with_capacity(rows_arr.len());
+        for row in rows_arr {
+            let account = row["prrName"]
+                .as_str()
+                .ok_or_else(|| serde_json::Error::custom("composite: prrName not string"))?
+                .to_string();
+            let total = amounts_from_value(&row["prrTotal"])?;
+            rows.push(ReportRow { account, total });
+        }
+
+        let totals = amounts_from_value(&pr["prTotals"]["prrTotal"])?;
+        subreports.push(Subreport {
+            name,
+            rows,
+            totals,
+            is_positive,
+        });
+    }
+
+    let totals = amounts_from_value(&doc["cbrTotals"]["prrTotal"])?;
+    Ok(CompositeReport {
+        title,
+        subreports,
+        totals,
+    })
+}
+
 // ---- print (`hledger print -O json`) --------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -172,11 +255,14 @@ pub fn parse_print(stdout: &str) -> Result<Vec<Transaction>, serde_json::Error> 
 mod tests {
     use super::*;
 
-    // Golden fixtures recorded from the pinned hledger 1.52 (`mise run golden`). These prove
-    // the parser tracks the *real* wire shape, not a guess.
+    // Golden fixtures recorded from the pinned hledger 1.52. These prove the parser tracks
+    // the *real* wire shape, not a guess.
     const BALANCE_SINGLE: &str = include_str!("../../tests/fixtures/balance_single.json");
     const BALANCE_ALL: &str = include_str!("../../tests/fixtures/balance_all.json");
     const PRINT_BASIC: &str = include_str!("../../tests/fixtures/print_basic.json");
+    const BALANCESHEET_BASIC: &str = include_str!("../../tests/fixtures/balancesheet_basic.json");
+    const INCOMESTATEMENT_BASIC: &str =
+        include_str!("../../tests/fixtures/incomestatement_basic.json");
 
     #[test]
     fn parses_single_account_balance() {
@@ -259,6 +345,87 @@ mod tests {
     fn parse_error_on_malformed_json() {
         assert!(parse_balance("not json").is_err());
         assert!(parse_print("{}").is_err());
+    }
+
+    #[test]
+    fn parses_balancesheet_golden() {
+        // domain.journal: fund ($50k) - pay Acme ($8k) + interest ($125) = $42,125 checking.
+        // Acme paid; Bob Engineer still owes $2,500 AP. Net equity = $39,625.
+        let report = parse_composite_report(BALANCESHEET_BASIC).expect("parse balancesheet");
+        assert_eq!(report.title, "Balance Sheet 2026-03-01");
+        assert_eq!(report.subreports.len(), 2);
+
+        let assets = &report.subreports[0];
+        assert_eq!(assets.name, "Assets");
+        assert!(assets.is_positive);
+        assert_eq!(assets.rows.len(), 1);
+        assert_eq!(assets.rows[0].account, "assets:checking");
+        assert_eq!(assets.rows[0].total[0].render(), "$42125.00");
+        assert_eq!(assets.totals[0].render(), "$42125.00");
+
+        let liabilities = &report.subreports[1];
+        assert_eq!(liabilities.name, "Liabilities");
+        assert!(!liabilities.is_positive);
+        assert_eq!(liabilities.rows.len(), 1);
+        assert_eq!(
+            liabilities.rows[0].account,
+            "liabilities:ap:vendor:Bob Engineer"
+        );
+        assert_eq!(liabilities.rows[0].total[0].render(), "$2500.00");
+
+        assert_eq!(report.totals[0].render(), "$39625.00");
+    }
+
+    #[test]
+    fn parses_incomestatement_golden() {
+        // domain.journal: $125 interest income, $8000 plumbing + $2500 professional expenses.
+        let report = parse_composite_report(INCOMESTATEMENT_BASIC).expect("parse incomestatement");
+        assert!(
+            report.title.starts_with("Income Statement"),
+            "title: {}",
+            report.title
+        );
+        assert_eq!(report.subreports.len(), 2);
+
+        let revenues = &report.subreports[0];
+        assert_eq!(revenues.name, "Revenues");
+        assert!(revenues.is_positive);
+        assert_eq!(revenues.rows.len(), 1);
+        assert_eq!(revenues.rows[0].account, "income:interest");
+        assert_eq!(revenues.rows[0].total[0].render(), "$125.00");
+
+        let expenses = &report.subreports[1];
+        assert_eq!(expenses.name, "Expenses");
+        assert!(!expenses.is_positive);
+        assert_eq!(expenses.rows.len(), 2);
+        let accounts: Vec<&str> = expenses.rows.iter().map(|r| r.account.as_str()).collect();
+        assert!(
+            accounts.contains(&"expenses:construction:plumbing"),
+            "{accounts:?}"
+        );
+        assert!(
+            accounts.contains(&"expenses:professional - Bob Engineer"),
+            "{accounts:?}"
+        );
+    }
+
+    #[test]
+    fn composite_ignores_extra_subreport_tuple_elements() {
+        // A future hledger appends a 4th element to the subreport tuple — must still parse.
+        let doc = r#"{
+          "cbrTitle":"T","cbrTotals":{"prrTotal":[]},"cbrSubreports":[
+            ["Assets",{"prRows":[],"prTotals":{"prrTotal":[]},"prDates":[]},true,"FUTURE"]
+          ]}"#;
+        let report = parse_composite_report(doc).expect("extra tuple element ignored");
+        assert_eq!(report.subreports[0].name, "Assets");
+    }
+
+    #[test]
+    fn composite_rejects_missing_fields() {
+        assert!(
+            parse_composite_report(r#"{"cbrSubreports":[],"cbrTotals":{"prrTotal":[]}}"#).is_err()
+        );
+        assert!(parse_composite_report(r#"{"cbrTitle":"T","cbrTotals":{"prrTotal":[]}}"#).is_err());
     }
 
     #[test]

@@ -78,13 +78,12 @@ Unlocks: M5 (tiering/profiles organize *this* catalog; budget + ECO extend it).
 - **e2e (real hledger):** the canonical lifecycle — `fund_project` → `receive_invoice` →
   `pay_invoice` → `get_ap_aging`/`get_project_summary` — produces correct balances and commits.
 - **Correction path:** `void_transaction` on a domain entry posts a correct reversing txn.
-- **Partition tests:** record tools never `STALE`; any decide-classified tool is epoch-checked
-  (ties to M3 C-1). **M3 shipped only the in-process C-1** (no MCP decide tool existed) — the
-  first tool here classified decide (candidate: `pay_invoice`, the
-  "release-because-cash-positive" example from
-  [concurrency-model.md](../concurrency-model.md); revisit its *(record)* marking above when
-  classifying) must add the **end-to-end** C-1 through the MCP surface. If everything in M4
-  stays record, that obligation rolls to M5's `eco_approve`.
+- **Partition tests:** record tools never `STALE`. All M4 tools are classified **record** —
+  `pay_invoice` is record because the ledger records a payment the human has made or authorized;
+  the agent never releases funds (only the human can do that via bank billpay). The end-to-end
+  C-1 MCP CAS test therefore rolls to **M5's `eco_approve`**, which is the first genuine decide
+  tool (approve a CO *because within budget* — a consequential agent action on a belief about
+  current budget state).
 - **Golden tests:** new report JSON shapes.
 - **Coverage: ≥ 85% lines.**
 

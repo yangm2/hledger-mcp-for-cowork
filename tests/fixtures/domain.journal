@@ -1,0 +1,32 @@
+; Synthetic M4 domain fixture journal — no PII, placeholder vendors/amounts (CLAUDE.md).
+; Covers: fund_project, receive_invoice (trade + professional), pay_invoice, post_interest.
+; Used by balancesheet_basic.json, incomestatement_basic.json, register_ap_aging.json.
+commodity $1000.00
+
+account assets:checking
+account equity:owner capital
+account liabilities:ap:vendor:Acme
+account liabilities:ap:vendor:Bob Engineer
+account expenses:construction:plumbing
+account expenses:professional - Bob Engineer
+account income:interest
+
+2026-01-01 Fund project ; fund_project
+    assets:checking             $50000.00
+    equity:owner capital
+
+2026-02-01 Acme Plumbing invoice ; invoice:INV-001, vendor:Acme
+    expenses:construction:plumbing   $8000.00
+    liabilities:ap:vendor:Acme
+
+2026-02-15 Bob Engineer invoice ; invoice:INV-002, vendor:Bob Engineer
+    expenses:professional - Bob Engineer   $2500.00
+    liabilities:ap:vendor:Bob Engineer
+
+2026-02-20 Pay Acme ; idem:pay-001
+    liabilities:ap:vendor:Acme   $8000.00
+    assets:checking
+
+2026-03-01 Interest earned
+    assets:checking    $125.00
+    income:interest

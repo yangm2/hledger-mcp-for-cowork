@@ -75,6 +75,41 @@ fn parse_version(raw: &str) -> Result<Version, HledgerError> {
     }
 }
 
+/// One account row in a [`Subreport`] from `balancesheet` / `incomestatement`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportRow {
+    /// Full account name, e.g. `"assets:checking"`.
+    pub account: String,
+    /// The total amount(s) across all periods in the report.
+    pub total: Vec<Amount>,
+}
+
+/// One named section of a [`CompositeReport`] (e.g. "Assets", "Revenues").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subreport {
+    /// Section label as returned by hledger (e.g. `"Assets"`, `"Liabilities"`).
+    pub name: String,
+    /// Per-account rows in this section.
+    pub rows: Vec<ReportRow>,
+    /// Section subtotal.
+    pub totals: Vec<Amount>,
+    /// Sign convention: `true` = positive is normal (assets, revenues);
+    /// `false` = inverted (liabilities, expenses).
+    pub is_positive: bool,
+}
+
+/// The result of `hledger balancesheet` or `hledger incomestatement` — both produce the
+/// same `cbr` (composite balance report) shape with named sub-sections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeReport {
+    /// Report title, e.g. `"Balance Sheet 2026-03-01"`.
+    pub title: String,
+    /// The sub-sections in order (Assets + Liabilities, or Revenues + Expenses).
+    pub subreports: Vec<Subreport>,
+    /// Grand totals across all sub-sections.
+    pub totals: Vec<Amount>,
+}
+
 /// A single account's balance (one [`BalanceReport`] row).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountBalance {
@@ -187,6 +222,27 @@ impl Hledger {
             })
             .await
             .cloned()
+    }
+
+    /// `hledger balancesheet -O json` → a [`CompositeReport`] with Assets + Liabilities sections.
+    pub async fn balancesheet(&self) -> Result<CompositeReport, HledgerError> {
+        let out = runner::run(&self.bin, &cli::balancesheet_argv(self.journal()?)).await?;
+        json::parse_composite_report(&out).map_err(HledgerError::from)
+    }
+
+    /// `hledger incomestatement -O json` → a [`CompositeReport`] with Revenues + Expenses sections.
+    pub async fn incomestatement(&self) -> Result<CompositeReport, HledgerError> {
+        let out = runner::run(&self.bin, &cli::incomestatement_argv(self.journal()?)).await?;
+        json::parse_composite_report(&out).map_err(HledgerError::from)
+    }
+
+    /// `hledger balance [account] --flat -O json` → a [`BalanceReport`] with leaf accounts only.
+    ///
+    /// `--flat` suppresses parent-account subtotal rows. Used by AP aging so each vendor
+    /// appears as its own row rather than being aggregated into parent `liabilities:ap:vendor`.
+    pub async fn balance_flat(&self, account: Option<&str>) -> Result<BalanceReport, HledgerError> {
+        let out = runner::run(&self.bin, &cli::balance_flat_argv(self.journal()?, account)).await?;
+        json::parse_balance(&out).map_err(HledgerError::from)
     }
 
     /// `hledger balance [account] -O json` → a [`BalanceReport`].
@@ -333,6 +389,19 @@ mod tests {
         }
     }
 
+    /// Adapter for the M4 domain fixture journal (fund → invoice → pay → interest).
+    async fn domain_adapter() -> Option<Hledger> {
+        let journal = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/domain.journal"
+        ));
+        let hl = Hledger::from_env(Some(journal));
+        match hl.version().await {
+            Ok(_) => Some(hl),
+            Err(_) => None,
+        }
+    }
+
     #[tokio::test]
     async fn version_detects_hledger() {
         let Some(hl) = fixture_adapter().await else {
@@ -382,5 +451,50 @@ mod tests {
             .await
             .expect_err("bad query should fail");
         assert!(matches!(err, HledgerError::NonZero { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn balancesheet_reads_domain_fixture() {
+        let Some(hl) = domain_adapter().await else {
+            return;
+        };
+        let report = hl.balancesheet().await.expect("balancesheet");
+        assert!(report.title.contains("Balance Sheet"), "{}", report.title);
+        let assets = report
+            .subreports
+            .iter()
+            .find(|s| s.name == "Assets")
+            .expect("Assets subreport");
+        assert!(
+            assets.rows.iter().any(|r| r.account == "assets:checking"),
+            "rows: {:?}",
+            assets.rows.iter().map(|r| &r.account).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn incomestatement_reads_domain_fixture() {
+        let Some(hl) = domain_adapter().await else {
+            return;
+        };
+        let report = hl.incomestatement().await.expect("incomestatement");
+        assert!(
+            report.title.contains("Income Statement"),
+            "{}",
+            report.title
+        );
+        let expenses = report
+            .subreports
+            .iter()
+            .find(|s| s.name == "Expenses")
+            .expect("Expenses subreport");
+        assert!(
+            expenses
+                .rows
+                .iter()
+                .any(|r| r.account.contains("construction")),
+            "rows: {:?}",
+            expenses.rows.iter().map(|r| &r.account).collect::<Vec<_>>()
+        );
     }
 }

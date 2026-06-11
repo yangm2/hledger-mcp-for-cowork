@@ -608,11 +608,7 @@ pub async fn declare_account(
     ctx: &WriteContext<'_>,
     name: &str,
 ) -> Result<CommitOutcome, WriteError> {
-    let name = name.trim();
-    if name.is_empty() || name.contains(['\n', ';']) || name.starts_with(':') || name.ends_with(':')
-    {
-        return Err(WriteError::Input(format!("invalid account name: '{name}'")));
-    }
+    let name = validate_account_name(name)?;
     let commit = append_and_commit(ctx, &format!("account {name}\n"), "declare account").await?;
     Ok(CommitOutcome {
         id: name.to_string(),
@@ -651,6 +647,42 @@ pub async fn declare_commodity(
     let commit = append_and_commit(ctx, &directive, "declare commodity").await?;
     Ok(CommitOutcome {
         id: symbol.to_string(),
+        commit,
+    })
+}
+
+/// Validate that `name` is an acceptable account name for a directive.
+fn validate_account_name(name: &str) -> Result<&str, WriteError> {
+    let name = name.trim();
+    if name.is_empty() || name.contains(['\n', ';']) || name.starts_with(':') || name.ends_with(':')
+    {
+        return Err(WriteError::Input(format!("invalid account name: '{name}'")));
+    }
+    Ok(name)
+}
+
+/// `vendor_add`: declare the vendor's AP account **and** their expense account in one commit.
+///
+/// `ap_account` — `liabilities:ap:vendor:{name}`.
+/// `expense_account` — `expenses:construction:{trade}` (shared) or
+/// `expenses:professional - {name}` (dedicated), resolved by the caller from
+/// [`crate::domain`] conventions.
+///
+/// Both account names are validated before any write; the two directives land in a single
+/// `hledger check --strict`-validated commit. Idempotent: re-declaring an already-declared
+/// account appends a harmless duplicate directive (valid in hledger 1.52).
+pub async fn vendor_add(
+    ctx: &WriteContext<'_>,
+    vendor: &str,
+    ap_account: &str,
+    expense_account: &str,
+) -> Result<CommitOutcome, WriteError> {
+    let ap = validate_account_name(ap_account)?;
+    let expense = validate_account_name(expense_account)?;
+    let text = format!("account {ap}\naccount {expense}\n");
+    let commit = append_and_commit(ctx, &text, &format!("vendor add {vendor}")).await?;
+    Ok(CommitOutcome {
+        id: vendor.to_string(),
         commit,
     })
 }
