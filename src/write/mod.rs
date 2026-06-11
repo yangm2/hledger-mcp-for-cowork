@@ -360,21 +360,34 @@ async fn append_and_commit(
     addition: &str,
     commit_message: &str,
 ) -> Result<CommitOid, WriteError> {
-    let journal = ctx.journal();
-    ensure_journal_exists(journal)?;
-    let live = std::fs::read_to_string(journal).map_err(WriteError::io("read journal"))?;
+    let journal = ctx.journal().to_path_buf();
+    let dir = repo_dir(&journal);
 
-    let mut candidate = live;
-    if !candidate.is_empty() && !candidate.ends_with('\n') {
-        candidate.push('\n');
-    }
-    candidate.push('\n');
-    candidate.push_str(addition);
+    // Both synchronous sections (O(journal-size) fs work, the libgit2 commit) run on the
+    // blocking pool so they never stall the async worker threads — split in two around the
+    // async `check_strict` subprocess call.
+    let tmp = {
+        let journal = journal.clone();
+        let dir = dir.clone();
+        let addition = addition.to_string();
+        tokio::task::spawn_blocking(move || -> Result<PathBuf, WriteError> {
+            ensure_journal_exists(&journal)?;
+            let mut candidate =
+                std::fs::read_to_string(&journal).map_err(WriteError::io("read journal"))?;
+            if !candidate.is_empty() && !candidate.ends_with('\n') {
+                candidate.push('\n');
+            }
+            candidate.push('\n');
+            candidate.push_str(&addition);
 
-    // Same-directory temp so the rename is atomic (a cross-device rename fails).
-    let dir = repo_dir(journal);
-    let tmp = dir.join(format!("{CANDIDATE_PREFIX}{}.journal", Uuid::new_v4()));
-    std::fs::write(&tmp, &candidate).map_err(WriteError::io("write candidate"))?;
+            // Same-directory temp so the rename is atomic (a cross-device rename fails).
+            let tmp = dir.join(format!("{CANDIDATE_PREFIX}{}.journal", Uuid::new_v4()));
+            std::fs::write(&tmp, &candidate).map_err(WriteError::io("write candidate"))?;
+            Ok(tmp)
+        })
+        .await
+        .map_err(|e| WriteError::Internal(format!("candidate task: {e}")))??
+    };
 
     if let Err(err) = ctx.hledger.check_strict(&tmp).await {
         let _ = std::fs::remove_file(&tmp);
@@ -392,11 +405,15 @@ async fn append_and_commit(
         )));
     }
 
-    std::fs::rename(&tmp, journal).map_err(WriteError::io("atomic replace journal"))?;
-
-    let repo = GitRepo::open_or_init(&dir)?;
-    let oid = repo.commit_path(&journal_relpath(journal)?, commit_message)?;
-    Ok(oid)
+    let relpath = journal_relpath(&journal)?;
+    let message = commit_message.to_string();
+    tokio::task::spawn_blocking(move || -> Result<CommitOid, WriteError> {
+        std::fs::rename(&tmp, &journal).map_err(WriteError::io("atomic replace journal"))?;
+        let repo = GitRepo::open_or_init(&dir)?;
+        Ok(repo.commit_path(&relpath, &message)?)
+    })
+    .await
+    .map_err(|e| WriteError::Internal(format!("commit task: {e}")))?
 }
 
 /// Read a transaction-level tag value.
