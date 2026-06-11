@@ -108,13 +108,14 @@ pub struct CloseAccountArgs {
     pub account: String,
 }
 
-/// Arguments for `fund_project`.
+/// The money-write argument block shared by every M4 domain tool, inlined into each tool's
+/// arg struct via `#[serde(flatten)]` — on the wire (and in the advertised schema) the fields
+/// stay flat. `date` deliberately stays **outside** this struct, per-tool: its doc comment
+/// becomes the schema description the model reads, and "Invoice date" vs "Payment date" is
+/// load-bearing guidance.
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
-pub struct FundProjectArgs {
-    /// Date of the funding (YYYY-MM-DD).
-    #[schemars(with = "String")]
-    pub date: chrono::NaiveDate,
-    /// Amount deposited, e.g. `"50000.00"`.
+pub struct MoneyArgs {
+    /// Exact decimal amount as a string, e.g. `"8000.00"` (never a JSON number).
     pub amount: String,
     /// Commodity symbol, e.g. `"$"`.
     #[schemars(with = "String")]
@@ -122,6 +123,16 @@ pub struct FundProjectArgs {
     /// Optional idempotency key — reuse on retry to avoid a duplicate.
     #[serde(default)]
     pub idem: Option<String>,
+}
+
+/// Arguments for `fund_project`.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct FundProjectArgs {
+    /// Date of the funding (YYYY-MM-DD).
+    #[schemars(with = "String")]
+    pub date: chrono::NaiveDate,
+    #[serde(flatten)]
+    pub money: MoneyArgs,
 }
 
 /// Arguments for `receive_invoice`.
@@ -135,16 +146,10 @@ pub struct ReceiveInvoiceArgs {
     /// Expense account, e.g. `"expenses:construction:plumbing"` or
     /// `"expenses:professional - Bob Engineer"`. Use `vendor_add` to declare it first.
     pub expense_account: String,
-    /// Invoice amount, e.g. `"8000.00"`.
-    pub amount: String,
-    /// Commodity symbol, e.g. `"$"`.
-    #[schemars(with = "String")]
-    pub commodity: crate::hledger::amount::Commodity,
     /// Vendor-assigned invoice reference, e.g. `"INV-001"`.
     pub invoice_ref: String,
-    /// Optional idempotency key.
-    #[serde(default)]
-    pub idem: Option<String>,
+    #[serde(flatten)]
+    pub money: MoneyArgs,
 }
 
 /// Arguments for `pay_invoice`.
@@ -155,14 +160,8 @@ pub struct PayInvoiceArgs {
     pub date: chrono::NaiveDate,
     /// Vendor name matching the AP account, e.g. `"Acme"`.
     pub vendor: String,
-    /// Amount paid, e.g. `"8000.00"`.
-    pub amount: String,
-    /// Commodity symbol, e.g. `"$"`.
-    #[schemars(with = "String")]
-    pub commodity: crate::hledger::amount::Commodity,
-    /// Optional idempotency key.
-    #[serde(default)]
-    pub idem: Option<String>,
+    #[serde(flatten)]
+    pub money: MoneyArgs,
 }
 
 /// Arguments for `post_interest`.
@@ -171,14 +170,8 @@ pub struct PostInterestArgs {
     /// Date interest was earned (YYYY-MM-DD).
     #[schemars(with = "String")]
     pub date: chrono::NaiveDate,
-    /// Interest amount, e.g. `"125.00"`.
-    pub amount: String,
-    /// Commodity symbol, e.g. `"$"`.
-    #[schemars(with = "String")]
-    pub commodity: crate::hledger::amount::Commodity,
-    /// Optional idempotency key.
-    #[serde(default)]
-    pub idem: Option<String>,
+    #[serde(flatten)]
+    pub money: MoneyArgs,
 }
 
 /// Arguments for `vendor_add`.
@@ -698,9 +691,9 @@ impl HledgerMcp {
             async |ctx, args: FundProjectArgs| {
                 let input = crate::domain::fund_project_input(
                     args.date,
-                    args.amount,
-                    args.commodity,
-                    args.idem,
+                    args.money.amount,
+                    args.money.commodity,
+                    args.money.idem,
                 );
                 write::post_transaction(&ctx, input).await
             },
@@ -730,10 +723,10 @@ impl HledgerMcp {
                     args.date,
                     &args.vendor,
                     args.expense_account,
-                    args.amount,
-                    args.commodity,
+                    args.money.amount,
+                    args.money.commodity,
                     args.invoice_ref,
-                    args.idem,
+                    args.money.idem,
                 );
                 write::post_transaction(&ctx, input).await
             },
@@ -772,9 +765,9 @@ impl HledgerMcp {
                 let input = crate::domain::pay_invoice_input(
                     args.date,
                     vendor,
-                    args.amount,
-                    args.commodity,
-                    args.idem,
+                    args.money.amount,
+                    args.money.commodity,
+                    args.money.idem,
                 );
                 write::post_transaction(&ctx, input).await
             },
@@ -799,9 +792,9 @@ impl HledgerMcp {
             async |ctx, args: PostInterestArgs| {
                 let input = crate::domain::post_interest_input(
                     args.date,
-                    args.amount,
-                    args.commodity,
-                    args.idem,
+                    args.money.amount,
+                    args.money.commodity,
+                    args.money.idem,
                 );
                 write::post_transaction(&ctx, input).await
             },
@@ -1089,6 +1082,43 @@ mod tests {
     /// don't touch hledger (`echo`) and for exercising the `NoJournal` error path.
     fn test_server() -> HledgerMcp {
         HledgerMcp::new(Hledger::new("hledger", None))
+    }
+
+    /// The `#[serde(flatten)]` of [`MoneyArgs`] must keep the advertised schema **flat** —
+    /// the model sees `amount`/`commodity`/`idem` as top-level properties beside the
+    /// per-tool `date`, never nested under a `money` key.
+    #[test]
+    fn money_args_flatten_keeps_schema_flat() {
+        let schema =
+            serde_json::to_value(schema_for_type::<PayInvoiceArgs>()).expect("schema to json");
+        let props = schema["properties"]
+            .as_object()
+            .expect("schema has properties");
+        for field in ["date", "vendor", "amount", "commodity", "idem"] {
+            assert!(
+                props.contains_key(field),
+                "{field} missing from flattened schema: {props:?}"
+            );
+        }
+        assert!(
+            !props.contains_key("money"),
+            "flatten must not nest a 'money' object: {props:?}"
+        );
+    }
+
+    /// Flatten switches serde to buffered deserialization; the parse-error contract
+    /// (accurate, field-naming messages — the model's self-correction loop) must survive it.
+    #[test]
+    fn money_args_flatten_keeps_parse_errors_field_accurate() {
+        let missing = crate::tools::parse_args::<PayInvoiceArgs>(
+            serde_json::json!({ "date": "2026-01-01", "vendor": "Acme", "commodity": "$" })
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap_err();
+        let text = &missing.content[0].as_text().expect("text").text;
+        assert!(text.contains("amount"), "names the missing field: {text}");
     }
 
     /// Resolve a runnable hledger for write-path tests, else `None` (test skips).
