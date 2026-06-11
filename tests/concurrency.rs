@@ -248,7 +248,7 @@ async fn c3_epoch_monotonic_writes_advance_reads_dont() {
             )
             .await
             .expect("write");
-        epochs.push(outcome.base.commit.clone());
+        epochs.push(outcome.base.commit.to_string());
     }
 
     // Strictly advancing: all distinct, and each commit's parent is its predecessor.

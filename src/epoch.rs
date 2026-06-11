@@ -12,6 +12,45 @@
 //! TOCTOU discipline (the check must run **inside** the write locks) live in
 //! [`crate::write::ConnectionView::guarded`]; the formal model is `proofs/tla/Ledger.tla`.
 
+/// A git commit oid — the epoch identifier and the outcome stamp on every write.
+///
+/// Wraps the 40-char hex string produced by libgit2. `short()` trims to 12 chars for
+/// human-facing messages; `Display` emits the full oid.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct CommitOid(String);
+
+impl CommitOid {
+    pub fn new(s: String) -> Self {
+        debug_assert!(
+            s.chars().all(|c| c.is_ascii_hexdigit()),
+            "CommitOid must contain only hex digits, got: {s:?}"
+        );
+        Self(s)
+    }
+
+    /// First 12 hex chars — enough to identify a commit in human-facing messages.
+    pub fn short(&self) -> &str {
+        &self.0[..self.0.len().min(12)]
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CommitOid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::ops::Deref for CommitOid {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The record-vs-decide partition (`concurrency-model.md`). Every write tool declares
 /// which class it is in; only [`Decide`](ToolClass::Decide) calls are epoch-checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,32 +69,26 @@ pub enum ToolClass {
 /// Sampled fresh per use (never cached process-wide the way the hledger version is —
 /// the version is process-constant, the epoch changes on every write).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Epoch(Option<String>);
+pub struct Epoch(Option<CommitOid>);
 
 impl Epoch {
     /// Wrap a `HEAD` oid (`None` for an unborn `HEAD`).
-    pub fn new(oid: Option<String>) -> Self {
+    pub fn new(oid: Option<CommitOid>) -> Self {
         Self(oid)
     }
 
-    /// The underlying commit oid, if `HEAD` is born.
+    /// The underlying commit oid as a `&str`, if `HEAD` is born.
     pub fn oid(&self) -> Option<&str> {
-        self.0.as_deref()
+        self.0.as_ref().map(CommitOid::as_str)
     }
 
     /// Short (12-char) form for human-facing messages.
     pub fn short(&self) -> String {
         match &self.0 {
-            Some(oid) => short_oid(oid).to_string(),
+            Some(oid) => oid.short().to_string(),
             None => "(unborn)".to_string(),
         }
     }
-}
-
-/// Short (12-char) form of a commit oid for human-facing messages — the one shortening
-/// implementation (tool responses and `status` use it too).
-pub fn short_oid(oid: &str) -> &str {
-    &oid[..oid.len().min(12)]
 }
 
 /// A decide call was built on a stale read: the connection's last-seen epoch (if it
@@ -106,7 +139,7 @@ mod tests {
     use super::*;
 
     fn epoch(oid: &str) -> Epoch {
-        Epoch::new(Some(oid.to_string()))
+        Epoch::new(Some(CommitOid::new(oid.to_string())))
     }
 
     #[test]

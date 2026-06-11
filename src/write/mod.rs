@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::epoch::{Epoch, Stale, ToolClass};
+use crate::epoch::{CommitOid, Epoch, Stale, ToolClass};
 use crate::git::{GitError, GitRepo};
 use crate::hledger::{Hledger, HledgerError, Transaction};
 
@@ -44,7 +44,7 @@ pub struct CommitOutcome {
     /// Stable identifier: the transaction's `id:` UUID, or the account/commodity name.
     pub id: String,
     /// The new (or current, for a dedup) `HEAD` commit oid.
-    pub commit: String,
+    pub commit: CommitOid,
 }
 
 /// Outcome of a successful transaction write (`post`, `void`, `update`). Composes
@@ -359,7 +359,7 @@ async fn append_and_commit(
     ctx: &WriteContext<'_>,
     addition: &str,
     commit_message: &str,
-) -> Result<String, WriteError> {
+) -> Result<CommitOid, WriteError> {
     let journal = ctx.journal();
     ensure_journal_exists(journal)?;
     let live = std::fs::read_to_string(journal).map_err(WriteError::io("read journal"))?;
@@ -685,9 +685,15 @@ pub async fn tombstone_account(
         .await
         .map_err(|e| WriteError::Internal(format!("read tombstoned accounts: {e}")))?;
     if tombstoned.iter().any(|a| a == name) {
-        // Already tombstoned — idempotent no-op at the current epoch.
+        // Already tombstoned — idempotent no-op at the current epoch. HEAD must be born
+        // here: a tombstone requires a prior commit, so an unborn repo is impossible.
         let epoch = current_epoch(journal)?;
-        let commit = epoch.oid().map_or_else(|| epoch.short(), str::to_string);
+        let commit = CommitOid::new(
+            epoch
+                .oid()
+                .expect("idempotent tombstone implies a prior commit")
+                .to_string(),
+        );
         return Ok(CommitOutcome {
             id: name.to_string(),
             commit,
@@ -721,7 +727,7 @@ pub fn git_status_line(journal: &Path) -> String {
                 .unwrap_or(false);
             let state = if dirty { "dirty" } else { "clean" };
             match repo.head_oid() {
-                Ok(Some(oid)) => format!("git: {} ({state})", &oid[..oid.len().min(12)]),
+                Ok(Some(oid)) => format!("git: {} ({state})", oid.short()),
                 Ok(None) => format!("git: (no commits yet, {state})"),
                 Err(err) => format!("git: error ({err})"),
             }
@@ -754,7 +760,7 @@ fn sweep_candidate_temps(dir: &Path) {
 /// HEAD** — so `HEAD` is always a `check`-valid journal. Returns the new commit oid if it
 /// committed. Scoped to the journal path so an unrelated untracked file (e.g. a swept-too-late
 /// candidate temp) never triggers a spurious empty reconcile commit.
-pub async fn reconcile(hledger: &Hledger) -> Result<Option<String>, WriteError> {
+pub async fn reconcile(hledger: &Hledger) -> Result<Option<CommitOid>, WriteError> {
     let Some(journal) = hledger.journal_path() else {
         return Ok(None);
     };

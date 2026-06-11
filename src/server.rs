@@ -18,7 +18,7 @@ use rmcp::model::{
 use rmcp::service::{Peer, RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
-use crate::epoch::{Epoch, ToolClass, short_oid};
+use crate::epoch::{Epoch, ToolClass};
 use crate::hledger::amount::render_amounts;
 use crate::hledger::{BalanceReport, Hledger, HledgerError, PINNED_VERSION, Transaction};
 use std::ops::AsyncFnOnce;
@@ -378,7 +378,7 @@ impl HledgerMcp {
                 format!(
                     "declared account '{}' (commit {})",
                     out.id,
-                    short_oid(&out.commit)
+                    out.commit.short()
                 )
             },
         )
@@ -410,7 +410,7 @@ impl HledgerMcp {
                 format!(
                     "closed (tombstoned) account '{}' (commit {})",
                     out.id,
-                    short_oid(&out.commit)
+                    out.commit.short()
                 )
             },
         )
@@ -442,7 +442,7 @@ impl HledgerMcp {
                     "declared commodity '{}' ({} dp, commit {})",
                     out.id,
                     places,
-                    short_oid(&out.commit)
+                    out.commit.short()
                 )
             },
         )
@@ -501,7 +501,7 @@ impl HledgerMcp {
                     "voided '{}' with reversing entry id:{} (commit {})",
                     args.id,
                     outcome.base.id,
-                    short_oid(&outcome.base.commit)
+                    outcome.base.commit.short()
                 )
             },
         )
@@ -535,7 +535,7 @@ impl HledgerMcp {
                     "updated: voided '{}', posted replacement id:{} (commit {})",
                     args.id,
                     outcome.base.id,
-                    short_oid(&outcome.base.commit)
+                    outcome.base.commit.short()
                 )
             },
         )
@@ -579,13 +579,13 @@ fn post_outcome_text(outcome: &WriteOutcome) -> String {
         format!(
             "already posted (idempotent): transaction id:{} — no new commit (HEAD {})",
             outcome.base.id,
-            short_oid(&outcome.base.commit)
+            outcome.base.commit.short()
         )
     } else {
         format!(
             "posted transaction id:{} (commit {})",
             outcome.base.id,
-            short_oid(&outcome.base.commit)
+            outcome.base.commit.short()
         )
     }
 }
@@ -1012,17 +1012,12 @@ mod tests {
     }
 
     #[test]
-    fn short_truncates_oid() {
-        assert_eq!(short_oid("0123456789abcdef0123"), "0123456789ab");
-        assert_eq!(short_oid("abc"), "abc");
-    }
-
-    #[test]
     fn post_outcome_text_distinguishes_deduped() {
+        use crate::epoch::CommitOid;
         let fresh = WriteOutcome {
             base: CommitOutcome {
                 id: "i1".into(),
-                commit: "deadbeefcafe0000".into(),
+                commit: CommitOid::new("deadbeefcafe0000".into()),
             },
             deduped: false,
         };

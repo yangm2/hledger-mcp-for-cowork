@@ -10,6 +10,8 @@ use std::path::Path;
 
 use git2::{ErrorCode, IndexAddOption, Repository, Signature};
 
+use crate::epoch::CommitOid;
+
 /// Synthetic commit identity — never a real person (public repo, no PII).
 const AUTHOR_NAME: &str = "hledger-mcp";
 const AUTHOR_EMAIL: &str = "hledger-mcp@localhost";
@@ -48,11 +50,11 @@ impl GitRepo {
         Ok(Self { repo })
     }
 
-    /// The current `HEAD` commit oid as a hex string, or `None` when `HEAD` is unborn (a freshly
+    /// The current `HEAD` commit oid, or `None` when `HEAD` is unborn (a freshly
     /// `init`-ed repo with no commits yet). This **is the epoch**.
-    pub fn head_oid(&self) -> Result<Option<String>, GitError> {
+    pub fn head_oid(&self) -> Result<Option<CommitOid>, GitError> {
         match self.repo.head() {
-            Ok(head) => Ok(head.target().map(|oid| oid.to_string())),
+            Ok(head) => Ok(head.target().map(|oid| CommitOid::new(oid.to_string()))),
             // Unborn branch (no commits yet) / no HEAD ref.
             Err(err)
                 if err.code() == ErrorCode::UnbornBranch || err.code() == ErrorCode::NotFound =>
@@ -87,7 +89,7 @@ impl GitRepo {
 
     /// Stage `relpath` (relative to the repo workdir) and commit it onto `HEAD`, returning the
     /// new commit oid. Handles the unborn-HEAD (first commit) case.
-    pub fn commit_path(&self, relpath: &Path, message: &str) -> Result<String, GitError> {
+    pub fn commit_path(&self, relpath: &Path, message: &str) -> Result<CommitOid, GitError> {
         let mut index = self.repo.index()?;
         index.add_all([relpath].iter(), IndexAddOption::DEFAULT, None)?;
         index.write()?;
@@ -111,7 +113,7 @@ impl GitRepo {
         let oid = self
             .repo
             .commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)?;
-        Ok(oid.to_string())
+        Ok(CommitOid::new(oid.to_string()))
     }
 
     /// Restore the working tree to `HEAD` (force checkout), discarding uncommitted changes —
@@ -165,7 +167,11 @@ mod tests {
         let oid2 = repo
             .commit_path(Path::new("main.journal"), "second")
             .expect("second commit");
-        assert_ne!(oid1, oid2, "each write is a distinct epoch");
+        assert_ne!(
+            oid1.as_str(),
+            oid2.as_str(),
+            "each write is a distinct epoch"
+        );
         assert!(!repo.is_dirty().unwrap());
     }
 
