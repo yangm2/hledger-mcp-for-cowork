@@ -359,26 +359,20 @@ impl HledgerMcp {
         &self,
         Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let args: AccountBalanceArgs = match crate::tools::parse_args(raw) {
-            Ok(args) => args,
-            Err(err) => return Ok(err),
-        };
-        let result = self
-            .view
-            .grounded_read(&self.hledger, || self.hledger.balance(Some(&args.account)))
-            .await;
-        match result {
-            Ok(report) => {
-                let mut text = render_balance(&report);
-                let flags = crate::flags::overdraft_flags(&report);
+        self.read_args_tool(
+            raw,
+            async |hledger, args: AccountBalanceArgs| hledger.balance(Some(&args.account)).await,
+            |report: &BalanceReport| {
+                let mut text = render_balance(report);
+                let flags = crate::flags::overdraft_flags(report);
                 if !flags.is_empty() {
                     text.push('\n');
                     text.push_str(&crate::flags::render_flags(&flags));
                 }
-                Ok(CallToolResult::success(vec![Content::text(text)]))
-            }
-            Err(err) => Ok(adapter_error(&err)),
-        }
+                text
+            },
+        )
+        .await
     }
 
     /// List transactions matching an optional hledger query via `hledger print -O json`.
@@ -394,21 +388,16 @@ impl HledgerMcp {
         &self,
         Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let args: ListTransactionsArgs = match crate::tools::parse_args(raw) {
-            Ok(args) => args,
-            Err(err) => return Ok(err),
-        };
-        let terms = args.query.unwrap_or_default();
-        let result = self
-            .view
-            .grounded_read(&self.hledger, || self.hledger.list_transactions(&terms))
-            .await;
-        match result {
-            Ok(txns) => Ok(CallToolResult::success(vec![Content::text(
-                render_transactions(&txns),
-            )])),
-            Err(err) => Ok(adapter_error(&err)),
-        }
+        self.read_args_tool(
+            raw,
+            async |hledger, args: ListTransactionsArgs| {
+                hledger
+                    .list_transactions(&args.query.unwrap_or_default())
+                    .await
+            },
+            |txns: &Vec<Transaction>| render_transactions(txns),
+        )
+        .await
     }
 
     /// Run a write tool through this connection's [`ConnectionView::guarded`], rendering the
@@ -451,6 +440,70 @@ impl HledgerMcp {
         }
     }
 
+    /// [`Self::guarded_tool`] with argument parsing folded in: deserialize `raw` into `A`
+    /// (a malformed call returns the uniform `isError` **before** any write machinery runs),
+    /// then dispatch `op` with the owned args. The frame every write tool shares.
+    async fn guarded_args_tool<A, T, F>(
+        &self,
+        raw: JsonObject,
+        class: ToolClass,
+        op: F,
+        render: impl FnOnce(&T) -> String,
+    ) -> Result<CallToolResult, McpError>
+    where
+        A: serde::de::DeserializeOwned,
+        F: AsyncFnOnce(WriteContext<'_>, A) -> Result<T, WriteError>,
+    {
+        let args: A = match crate::tools::parse_args(raw) {
+            Ok(args) => args,
+            Err(err) => return Ok(err),
+        };
+        self.guarded_tool(class, async |ctx| op(ctx, args).await, render)
+            .await
+    }
+
+    /// The read-side sibling of [`Self::guarded_args_tool`]: parse `raw` into `A`, run `op`
+    /// through this connection's [`ConnectionView::grounded_read`] (pre-read epoch sample,
+    /// bump on success), and render the result — adapter failures become tool-level
+    /// `isError` results via [`adapter_error`].
+    async fn read_args_tool<A, T, F>(
+        &self,
+        raw: JsonObject,
+        op: F,
+        render: impl FnOnce(&T) -> String,
+    ) -> Result<CallToolResult, McpError>
+    where
+        A: serde::de::DeserializeOwned,
+        F: AsyncFnOnce(&Hledger, A) -> Result<T, HledgerError>,
+    {
+        let args: A = match crate::tools::parse_args(raw) {
+            Ok(args) => args,
+            Err(err) => return Ok(err),
+        };
+        self.read_tool(async |hledger| op(hledger, args).await, render)
+            .await
+    }
+
+    /// The zero-argument read frame ([`Self::read_args_tool`] without the parse step):
+    /// run `op` through [`ConnectionView::grounded_read`] and render the result.
+    async fn read_tool<T, F>(
+        &self,
+        op: F,
+        render: impl FnOnce(&T) -> String,
+    ) -> Result<CallToolResult, McpError>
+    where
+        F: AsyncFnOnce(&Hledger) -> Result<T, HledgerError>,
+    {
+        let result = self
+            .view
+            .grounded_read(&self.hledger, || op(&self.hledger))
+            .await;
+        match result {
+            Ok(out) => Ok(CallToolResult::success(vec![Content::text(render(&out))])),
+            Err(err) => Ok(adapter_error(&err)),
+        }
+    }
+
     /// Declare an account so transactions may post to it (require-pre-declare). **Record** —
     /// append-only directive, no epoch check.
     #[tool(
@@ -463,14 +516,10 @@ impl HledgerMcp {
         &self,
         Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let args: DeclareAccountArgs = match crate::tools::parse_args(raw) {
-            Ok(args) => args,
-            Err(err) => return Ok(err),
-        };
-        let account = args.account;
-        self.guarded_tool(
+        self.guarded_args_tool(
+            raw,
             ToolClass::Record,
-            async |ctx| write::declare_account(&ctx, &account).await,
+            async |ctx, args: DeclareAccountArgs| write::declare_account(&ctx, &args.account).await,
             |out: &CommitOutcome| {
                 format!(
                     "declared account '{}' (commit {})",
@@ -495,14 +544,10 @@ impl HledgerMcp {
         &self,
         Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let args: CloseAccountArgs = match crate::tools::parse_args(raw) {
-            Ok(args) => args,
-            Err(err) => return Ok(err),
-        };
-        let account = args.account;
-        self.guarded_tool(
+        self.guarded_args_tool(
+            raw,
             ToolClass::Record,
-            async |ctx| write::tombstone_account(&ctx, &account).await,
+            async |ctx, args: CloseAccountArgs| write::tombstone_account(&ctx, &args.account).await,
             |out: &CommitOutcome| {
                 format!(
                     "closed (tombstoned) account '{}' (commit {})",
@@ -525,16 +570,15 @@ impl HledgerMcp {
         &self,
         Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let args: DeclareCommodityArgs = match crate::tools::parse_args(raw) {
-            Ok(args) => args,
-            Err(err) => return Ok(err),
-        };
-        let places = args.decimal_places.unwrap_or(2);
-        let commodity = args.commodity;
-        self.guarded_tool(
+        self.guarded_args_tool(
+            raw,
             ToolClass::Record,
-            async |ctx| write::declare_commodity(&ctx, &commodity, places).await,
-            |out: &CommitOutcome| {
+            async |ctx, args: DeclareCommodityArgs| {
+                let places = args.decimal_places.unwrap_or(2);
+                let out = write::declare_commodity(&ctx, &args.commodity, places).await?;
+                Ok((places, out))
+            },
+            |(places, out): &(u8, CommitOutcome)| {
                 format!(
                     "declared commodity '{}' ({} dp, commit {})",
                     out.id,
@@ -561,13 +605,10 @@ impl HledgerMcp {
         &self,
         Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let input: TransactionInput = match crate::tools::parse_args(raw) {
-            Ok(input) => input,
-            Err(err) => return Ok(err),
-        };
-        self.guarded_tool(
+        self.guarded_args_tool(
+            raw,
             ToolClass::Record,
-            async |ctx| write::post_transaction(&ctx, input).await,
+            async |ctx, input: TransactionInput| write::post_transaction(&ctx, input).await,
             post_outcome_text,
         )
         .await
@@ -585,18 +626,17 @@ impl HledgerMcp {
         &self,
         Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let args: VoidTransactionArgs = match crate::tools::parse_args(raw) {
-            Ok(args) => args,
-            Err(err) => return Ok(err),
-        };
-        let id = args.id.clone();
-        self.guarded_tool(
+        self.guarded_args_tool(
+            raw,
             ToolClass::Record,
-            async |ctx| write::void_transaction(&ctx, &id).await,
-            |outcome: &WriteOutcome| {
+            async |ctx, args: VoidTransactionArgs| {
+                let outcome = write::void_transaction(&ctx, &args.id).await?;
+                Ok((args.id, outcome))
+            },
+            |(target, outcome): &(String, WriteOutcome)| {
                 format!(
                     "voided '{}' with reversing entry id:{} (commit {})",
-                    args.id,
+                    target,
                     outcome.base.id,
                     outcome.base.commit.short()
                 )
@@ -619,18 +659,17 @@ impl HledgerMcp {
         &self,
         Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let args: UpdateTransactionArgs = match crate::tools::parse_args(raw) {
-            Ok(args) => args,
-            Err(err) => return Ok(err),
-        };
-        let id = args.id.clone();
-        self.guarded_tool(
+        self.guarded_args_tool(
+            raw,
             ToolClass::Record,
-            async |ctx| write::update_transaction(&ctx, &id, args.transaction).await,
-            |outcome: &WriteOutcome| {
+            async |ctx, args: UpdateTransactionArgs| {
+                let outcome = write::update_transaction(&ctx, &args.id, args.transaction).await?;
+                Ok((args.id, outcome))
+            },
+            |(target, outcome): &(String, WriteOutcome)| {
                 format!(
                     "updated: voided '{}', posted replacement id:{} (commit {})",
-                    args.id,
+                    target,
                     outcome.base.id,
                     outcome.base.commit.short()
                 )
@@ -653,13 +692,10 @@ impl HledgerMcp {
         &self,
         Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let args: FundProjectArgs = match crate::tools::parse_args(raw) {
-            Ok(a) => a,
-            Err(e) => return Ok(e),
-        };
-        self.guarded_tool(
+        self.guarded_args_tool(
+            raw,
             ToolClass::Record,
-            async |ctx| {
+            async |ctx, args: FundProjectArgs| {
                 let input = crate::domain::fund_project_input(
                     args.date,
                     args.amount,
@@ -686,13 +722,10 @@ impl HledgerMcp {
         &self,
         Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let args: ReceiveInvoiceArgs = match crate::tools::parse_args(raw) {
-            Ok(a) => a,
-            Err(e) => return Ok(e),
-        };
-        self.guarded_tool(
+        self.guarded_args_tool(
+            raw,
             ToolClass::Record,
-            async |ctx| {
+            async |ctx, args: ReceiveInvoiceArgs| {
                 let input = crate::domain::receive_invoice_input(
                     args.date,
                     &args.vendor,
@@ -720,13 +753,10 @@ impl HledgerMcp {
         &self,
         Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let args: PayInvoiceArgs = match crate::tools::parse_args(raw) {
-            Ok(a) => a,
-            Err(e) => return Ok(e),
-        };
-        self.guarded_tool(
+        self.guarded_args_tool(
+            raw,
             ToolClass::Record,
-            async |ctx| {
+            async |ctx, args: PayInvoiceArgs| {
                 let vendor = &args.vendor;
                 let ap_account = crate::domain::vendor_ap_account(vendor);
                 let balance = ctx
@@ -763,13 +793,10 @@ impl HledgerMcp {
         &self,
         Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let args: PostInterestArgs = match crate::tools::parse_args(raw) {
-            Ok(a) => a,
-            Err(e) => return Ok(e),
-        };
-        self.guarded_tool(
+        self.guarded_args_tool(
+            raw,
             ToolClass::Record,
-            async |ctx| {
+            async |ctx, args: PostInterestArgs| {
                 let input = crate::domain::post_interest_input(
                     args.date,
                     args.amount,
@@ -797,27 +824,19 @@ impl HledgerMcp {
         &self,
         Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let args: VendorAddArgs = match crate::tools::parse_args(raw) {
-            Ok(a) => a,
-            Err(e) => return Ok(e),
-        };
-        let expense_account = match crate::domain::vendor_expense_account(
-            args.vendor_type,
-            &args.vendor,
-            args.trade.as_deref(),
-        ) {
-            Ok(account) => account,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "input error: {e}"
-                ))]));
-            }
-        };
-        let ap_account = crate::domain::vendor_ap_account(&args.vendor);
-        let vendor = args.vendor;
-        self.guarded_tool(
+        self.guarded_args_tool(
+            raw,
             ToolClass::Record,
-            async |ctx| write::vendor_add(&ctx, &vendor, &ap_account, &expense_account).await,
+            async |ctx, args: VendorAddArgs| {
+                let expense_account = crate::domain::vendor_expense_account(
+                    args.vendor_type,
+                    &args.vendor,
+                    args.trade.as_deref(),
+                )
+                .map_err(WriteError::Input)?;
+                let ap_account = crate::domain::vendor_ap_account(&args.vendor);
+                write::vendor_add(&ctx, &args.vendor, &ap_account, &expense_account).await
+            },
             |out: &CommitOutcome| {
                 format!(
                     "declared vendor '{}': AP account + expense account (commit {})",
@@ -838,26 +857,22 @@ impl HledgerMcp {
         &self,
         Parameters(_raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let result = self
-            .view
-            .grounded_read(&self.hledger, || self.hledger.declared_accounts())
-            .await;
-        match result {
-            Ok(accounts) => {
+        self.read_tool(
+            async |hledger| hledger.declared_accounts().await,
+            |accounts: &Vec<String>| {
                 let vendors: Vec<&str> = accounts
                     .iter()
                     .filter(|a| a.starts_with(crate::domain::VENDOR_AP_PREFIX))
                     .map(String::as_str)
                     .collect();
-                let text = if vendors.is_empty() {
+                if vendors.is_empty() {
                     "(no vendors declared — use vendor_add first)".to_string()
                 } else {
                     vendors.join("\n")
-                };
-                Ok(CallToolResult::success(vec![Content::text(text)]))
-            }
-            Err(err) => Ok(adapter_error(&err)),
-        }
+                }
+            },
+        )
+        .await
     }
 
     /// AP aging report: outstanding payables bucketed by age. **Read** — soft-invariant flags
@@ -872,35 +887,29 @@ impl HledgerMcp {
         &self,
         Parameters(raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let args: GetApAgingArgs = match crate::tools::parse_args(raw) {
-            Ok(a) => a,
-            Err(e) => return Ok(e),
-        };
-        let as_of = args.as_of.unwrap_or_else(crate::domain::today);
-        let hledger = &self.hledger;
-        let result = self
-            .view
-            .grounded_read(&self.hledger, || async move {
+        self.read_args_tool(
+            raw,
+            async |hledger, args: GetApAgingArgs| {
+                let as_of = args.as_of.unwrap_or_else(crate::domain::today);
                 let ap_query = [crate::domain::AP_ROOT.to_string()];
-                tokio::try_join!(
+                let (balance, txns) = tokio::try_join!(
                     hledger.balance_flat(Some(crate::domain::AP_ROOT)),
                     hledger.list_transactions(&ap_query),
-                )
-            })
-            .await;
-        match result {
-            Ok((balance, txns)) => {
-                let entries = crate::domain::compute_ap_aging(&balance, &txns, as_of);
-                let mut text = crate::domain::render_ap_aging(&entries, as_of);
+                )?;
+                Ok((as_of, balance, txns))
+            },
+            |(as_of, balance, txns): &(NaiveDate, BalanceReport, Vec<Transaction>)| {
+                let entries = crate::domain::compute_ap_aging(balance, txns, *as_of);
+                let mut text = crate::domain::render_ap_aging(&entries, *as_of);
                 let flags = crate::flags::ap_aging_flags(&entries);
                 if !flags.is_empty() {
                     text.push('\n');
                     text.push_str(&crate::flags::render_flags(&flags));
                 }
-                Ok(CallToolResult::success(vec![Content::text(text)]))
-            }
-            Err(err) => Ok(adapter_error(&err)),
-        }
+                text
+            },
+        )
+        .await
     }
 
     /// Project summary: balance sheet + income statement. **Read**.
@@ -912,24 +921,17 @@ impl HledgerMcp {
         &self,
         Parameters(_raw): Parameters<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        let hledger = &self.hledger;
-        let result = self
-            .view
-            .grounded_read(&self.hledger, || async move {
-                tokio::try_join!(hledger.balancesheet(), hledger.incomestatement())
-            })
-            .await;
-        match result {
-            Ok((bs, is)) => {
-                let text = format!(
+        self.read_tool(
+            async |hledger| tokio::try_join!(hledger.balancesheet(), hledger.incomestatement()),
+            |(bs, is)| {
+                format!(
                     "{}\n\n{}",
-                    crate::domain::render_composite(&bs),
-                    crate::domain::render_composite(&is),
-                );
-                Ok(CallToolResult::success(vec![Content::text(text)]))
-            }
-            Err(err) => Ok(adapter_error(&err)),
-        }
+                    crate::domain::render_composite(bs),
+                    crate::domain::render_composite(is),
+                )
+            },
+        )
+        .await
     }
 
     /// Echo a message back unchanged — a minimal tool-invocation connectivity check.
