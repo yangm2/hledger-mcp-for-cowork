@@ -485,10 +485,12 @@ fn m4_domain_tools_work_end_to_end() {
     let aging = call(&mut server, "get_ap_aging", json!({}));
     assert!(aging.contains("AP aging"), "get_ap_aging header: {aging}");
     assert!(aging.contains("Acme"), "get_ap_aging has vendor: {aging}");
-    // The invoice is from 2020 — definitely Over90Days; the ap-aging flag must appear
+    // The invoice is from 2020 — definitely Over90Days; the ap-aging soft-invariant flag
+    // must appear as a separate "flag ap-aging: …" footer line (distinct from the age
+    // label in the entry row, which also says "overdue").
     assert!(
-        aging.contains("overdue"),
-        "get_ap_aging must surface overdue flag: {aging}"
+        aging.contains("flag ap-aging"),
+        "get_ap_aging must surface ap-aging flag footer: {aging}"
     );
 
     // pay_invoice — clears Acme's AP balance
