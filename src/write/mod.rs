@@ -350,6 +350,18 @@ fn ensure_journal_exists(journal: &Path) -> Result<(), WriteError> {
     Ok(())
 }
 
+/// The candidate journal text: `live` (newline-terminated if it wasn't), a blank separator
+/// line, then `addition`. Pure — the testable half of [`append_and_commit`].
+fn build_candidate(live: &str, addition: &str) -> String {
+    let mut candidate = live.to_string();
+    if !candidate.is_empty() && !candidate.ends_with('\n') {
+        candidate.push('\n');
+    }
+    candidate.push('\n');
+    candidate.push_str(addition);
+    candidate
+}
+
 /// The core: append `addition` to the live journal, validate the candidate with `check --strict`
 /// in a same-directory temp file, atomically swap it in, and commit. Fail-closed.
 ///
@@ -372,13 +384,8 @@ async fn append_and_commit(
         let addition = addition.to_string();
         tokio::task::spawn_blocking(move || -> Result<PathBuf, WriteError> {
             ensure_journal_exists(&journal)?;
-            let mut candidate =
-                std::fs::read_to_string(&journal).map_err(WriteError::io("read journal"))?;
-            if !candidate.is_empty() && !candidate.ends_with('\n') {
-                candidate.push('\n');
-            }
-            candidate.push('\n');
-            candidate.push_str(&addition);
+            let live = std::fs::read_to_string(&journal).map_err(WriteError::io("read journal"))?;
+            let candidate = build_candidate(&live, &addition);
 
             // Same-directory temp so the rename is atomic (a cross-device rename fails).
             let tmp = dir.join(format!("{CANDIDATE_PREFIX}{}.journal", Uuid::new_v4()));
@@ -941,6 +948,36 @@ mod tests {
     #[test]
     fn sanitize_strips_newlines_and_semicolons() {
         assert_eq!(sanitize("a;b\nc"), "a b c");
+    }
+
+    #[test]
+    fn build_candidate_terminates_and_separates_exactly() {
+        // Empty journal: just the separator, no spurious terminator.
+        assert_eq!(build_candidate("", "e\n"), "\ne\n");
+        // Already newline-terminated: separator only.
+        assert_eq!(build_candidate("a\n", "e\n"), "a\n\ne\n");
+        // Missing terminator: terminator + separator.
+        assert_eq!(build_candidate("a", "e\n"), "a\n\ne\n");
+    }
+
+    /// Each invalid commodity symbol violates exactly one rejection condition, so the
+    /// `||` chain can't collapse — and rejection happens before any hledger/git I/O,
+    /// so a bogus adapter proves the fail-closed ordering.
+    #[tokio::test]
+    async fn declare_commodity_rejects_each_invalid_symbol_form() {
+        let hl = Hledger::new(
+            "/nonexistent/hledger",
+            Some(PathBuf::from("/nonexistent/main.journal")),
+        );
+        for bad in ["", "  ", "U S", "x1", "a;b", "a\nb"] {
+            let err = declare_commodity(&ctx(&hl), bad, 2)
+                .await
+                .expect_err("must reject");
+            assert!(
+                matches!(&err, WriteError::Input(msg) if msg.contains("invalid commodity symbol")),
+                "symbol {bad:?} → {err:?}"
+            );
+        }
     }
 
     #[test]

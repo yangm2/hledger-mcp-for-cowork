@@ -324,6 +324,35 @@ mod tests {
     }
 
     #[test]
+    fn commodity_as_str_and_display_expose_the_symbol() {
+        let c = Commodity::new("EUR");
+        assert_eq!(c.as_str(), "EUR");
+        assert_eq!(format!("{c}"), "EUR");
+    }
+
+    #[test]
+    fn commodity_set_is_probed_by_str_via_borrow() {
+        let set: std::collections::HashSet<Commodity> =
+            ["$", "EUR"].into_iter().map(Commodity::from).collect();
+        assert!(set.contains("EUR"), "Borrow<str> lookup hits");
+        assert!(!set.contains("GBP"), "absent symbol misses");
+    }
+
+    #[test]
+    // The owned comparison IS the subject under test (`PartialEq<String>`), not a slip.
+    #[allow(clippy::cmp_owned)]
+    fn commodity_eq_against_str_forms() {
+        let c = Commodity::new("$");
+        // &str (both arms), str, and String — each with a hit and a miss.
+        assert!(c == "$");
+        assert!(c != "EUR");
+        assert!(c == *"$");
+        assert!(c != *"EUR");
+        assert!(c == String::from("$"));
+        assert!(c != String::from("EUR"));
+    }
+
+    #[test]
     fn render_amounts_joins_and_handles_empty() {
         assert_eq!(render_amounts(&[]), "0");
         let amts = vec![

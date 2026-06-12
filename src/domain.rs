@@ -611,6 +611,84 @@ mod tests {
         assert!(entries[0].oldest_invoice_date.is_none());
     }
 
+    /// Build a two-posting txn with **no** transaction-level tags: one untagged posting to
+    /// `account`, plus a posting to `other_account` carrying `(tag_key: INV-001)`.
+    /// Exercises the posting-level half of the invoice-tag check in isolation.
+    fn posting_tagged_txn(account: &str, other_account: &str, tag_key: &str) -> Transaction {
+        use crate::hledger::Posting;
+        let posting = |acct: &str, tags: Vec<(String, String)>| Posting {
+            account: acct.to_string(),
+            amounts: vec![make_amount(-5000)],
+            comment: String::new(),
+            tags,
+        };
+        Transaction {
+            date: nd(2026, 1, 1),
+            description: "posting-tagged".to_string(),
+            index: 1,
+            status: crate::hledger::Status::Unmarked,
+            comment: String::new(),
+            tags: vec![],
+            postings: vec![
+                posting(account, vec![]),
+                posting(
+                    other_account,
+                    vec![(tag_key.to_string(), "INV-001".to_string())],
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn posting_level_invoice_tag_counts_only_on_the_target_account() {
+        let balance = BalanceReport {
+            rows: vec![ap_balance("liabilities:ap:vendor:X", -5000)],
+            totals: vec![],
+        };
+        let x = "liabilities:ap:vendor:X";
+
+        // Invoice tag on X's own posting → counted.
+        let on_target = posting_tagged_txn("expenses:misc", x, "invoice");
+        let entries = compute_ap_aging(&balance, &[on_target], nd(2026, 6, 1));
+        assert_eq!(entries[0].oldest_invoice_date, Some(nd(2026, 1, 1)));
+
+        // Invoice tag on a *different* account's posting (X's posting untagged) → excluded.
+        let on_other = posting_tagged_txn(x, "expenses:misc", "invoice");
+        let entries = compute_ap_aging(&balance, &[on_other], nd(2026, 6, 1));
+        assert!(entries[0].oldest_invoice_date.is_none());
+
+        // A non-invoice posting-level tag on X's posting → excluded.
+        let wrong_tag = posting_tagged_txn("expenses:misc", x, "vendor");
+        let entries = compute_ap_aging(&balance, &[wrong_tag], nd(2026, 6, 1));
+        assert!(entries[0].oldest_invoice_date.is_none());
+    }
+
+    #[test]
+    fn is_ap_account_requires_a_subtree_segment() {
+        assert!(is_ap_account("liabilities:ap:vendor:Acme"));
+        assert!(is_ap_account("liabilities:ap:other"));
+        // Bare root, sibling prefix, and unrelated accounts are all outside the subtree.
+        assert!(!is_ap_account("liabilities:ap"));
+        assert!(!is_ap_account("liabilities:apx:foo"));
+        assert!(!is_ap_account("assets:checking"));
+    }
+
+    #[test]
+    fn has_outstanding_ap_requires_a_strictly_negative_amount() {
+        let report = |mantissa: i128| BalanceReport {
+            rows: vec![ap_balance("liabilities:ap:vendor:X", mantissa)],
+            totals: vec![],
+        };
+        assert!(has_outstanding_ap(&report(-1)));
+        // Zero is settled, not outstanding; positive (overpayment) isn't outstanding either.
+        assert!(!has_outstanding_ap(&report(0)));
+        assert!(!has_outstanding_ap(&report(100)));
+        assert!(!has_outstanding_ap(&BalanceReport {
+            rows: vec![],
+            totals: vec![]
+        }));
+    }
+
     #[test]
     fn render_composite_basic() {
         use crate::hledger::{CompositeReport, ReportRow, Subreport};
