@@ -278,16 +278,7 @@ impl HledgerMcp {
     async fn backend_block(&self) -> String {
         let detected = self.hledger.version().await; // one subprocess; reused below
         let pinned = matches!(&detected, Ok(v) if v.pin_matches());
-        let version = match &detected {
-            Ok(v) if v.pin_matches() => {
-                format!("hledger: {}.{} (pinned) — {:?}", v.major, v.minor, v.raw)
-            }
-            Ok(v) => format!(
-                "hledger: {}.{} (MISMATCH — expected {}.{}) — {:?}",
-                v.major, v.minor, PINNED_VERSION.0, PINNED_VERSION.1, v.raw
-            ),
-            Err(err) => format!("hledger: unavailable ({err})"),
-        };
+        let version = version_line(&detected);
         let binary = format!("binary: {}", self.hledger.bin().display());
         let (journal, git) = match self.hledger.journal_path() {
             Some(path) => (
@@ -301,15 +292,7 @@ impl HledgerMcp {
         };
         // The epoch story (M3): current HEAD vs what this connection last read.
         let epoch = match self.sample_epoch() {
-            Some(head) => {
-                let seen = self.view.last_seen().await;
-                let connection = match &seen {
-                    Some(seen) if *seen == head => format!("last-seen {} (fresh)", seen.short()),
-                    Some(seen) => format!("last-seen {} (STALE — re-read)", seen.short()),
-                    None => "no read yet this connection".to_string(),
-                };
-                format!("epoch: {} — {connection}", head.short())
-            }
+            Some(head) => epoch_line(&head, self.view.last_seen().await.as_ref()),
             None => "epoch: (no journal configured)".to_string(),
         };
         // Writes need the pinned hledger, a journal, and a reconciled tree.
@@ -355,15 +338,7 @@ impl HledgerMcp {
         self.read_args_tool(
             raw,
             async |hledger, args: AccountBalanceArgs| hledger.balance(Some(&args.account)).await,
-            |report: &BalanceReport| {
-                let mut text = render_balance(report);
-                let flags = crate::flags::overdraft_flags(report);
-                if !flags.is_empty() {
-                    text.push('\n');
-                    text.push_str(&crate::flags::render_flags(&flags));
-                }
-                text
-            },
+            balance_text,
         )
         .await
     }
@@ -985,6 +960,44 @@ fn write_error_result(err: WriteError) -> CallToolResult {
     CallToolResult::error(vec![Content::text(err.to_string())])
 }
 
+/// The hledger-version line of `status`: pinned / MISMATCH / unavailable verdict plus the
+/// raw `--version` banner. Pure — unit-testable against a mismatched [`Version`].
+fn version_line(detected: &Result<crate::hledger::Version, HledgerError>) -> String {
+    match detected {
+        Ok(v) if v.pin_matches() => {
+            format!("hledger: {}.{} (pinned) — {:?}", v.major, v.minor, v.raw)
+        }
+        Ok(v) => format!(
+            "hledger: {}.{} (MISMATCH — expected {}.{}) — {:?}",
+            v.major, v.minor, PINNED_VERSION.0, PINNED_VERSION.1, v.raw
+        ),
+        Err(err) => format!("hledger: unavailable ({err})"),
+    }
+}
+
+/// The epoch line of `status`: current `HEAD` vs this connection's last-seen
+/// (fresh / STALE / no read yet). Pure.
+fn epoch_line(head: &Epoch, seen: Option<&Epoch>) -> String {
+    let connection = match seen {
+        Some(seen) if seen == head => format!("last-seen {} (fresh)", seen.short()),
+        Some(seen) => format!("last-seen {} (STALE — re-read)", seen.short()),
+        None => "no read yet this connection".to_string(),
+    };
+    format!("epoch: {} — {connection}", head.short())
+}
+
+/// Body of `get_account_balance`: the rendered report plus the overdraft-flag footer
+/// (present only when an asset balance is negative — C-6: surfaced, never enforced).
+fn balance_text(report: &BalanceReport) -> String {
+    let mut text = render_balance(report);
+    let flags = crate::flags::overdraft_flags(report);
+    if !flags.is_empty() {
+        text.push('\n');
+        text.push_str(&crate::flags::render_flags(&flags));
+    }
+    text
+}
+
 /// Render a [`BalanceReport`] as a compact text table: one `account  amount` line per row,
 /// then a `total  amount` line.
 fn render_balance(report: &BalanceReport) -> String {
@@ -1082,6 +1095,68 @@ mod tests {
     /// don't touch hledger (`echo`) and for exercising the `NoJournal` error path.
     fn test_server() -> HledgerMcp {
         HledgerMcp::new(Hledger::new("hledger", None))
+    }
+
+    #[test]
+    fn version_line_distinguishes_pinned_mismatch_and_unavailable() {
+        use crate::hledger::Version;
+        let v = |major, minor| Version {
+            raw: format!("hledger {major}.{minor}"),
+            major,
+            minor,
+        };
+        let pinned = version_line(&Ok(v(PINNED_VERSION.0, PINNED_VERSION.1)));
+        assert!(pinned.contains("(pinned)"), "{pinned}");
+        assert!(!pinned.contains("MISMATCH"), "{pinned}");
+
+        let mismatch = version_line(&Ok(v(1, 99)));
+        assert!(mismatch.contains("MISMATCH"), "{mismatch}");
+        assert!(!mismatch.contains("(pinned)"), "{mismatch}");
+
+        let unavailable = version_line(&Err(crate::hledger::HledgerError::BadVersion(
+            "garbage".to_string(),
+        )));
+        assert!(unavailable.contains("unavailable"), "{unavailable}");
+    }
+
+    #[test]
+    fn epoch_line_distinguishes_fresh_stale_and_unread() {
+        use crate::epoch::CommitOid;
+        let epoch = |c: char| Epoch::new(Some(CommitOid::new(c.to_string().repeat(40))));
+        let head = epoch('a');
+
+        let fresh = epoch_line(&head, Some(&epoch('a')));
+        assert!(fresh.contains("(fresh)"), "{fresh}");
+        assert!(!fresh.contains("STALE"), "{fresh}");
+
+        let stale = epoch_line(&head, Some(&epoch('b')));
+        assert!(stale.contains("STALE"), "{stale}");
+        assert!(!stale.contains("(fresh)"), "{stale}");
+
+        let unread = epoch_line(&head, None);
+        assert!(unread.contains("no read yet"), "{unread}");
+    }
+
+    #[test]
+    fn balance_text_appends_flag_footer_only_on_overdraft() {
+        let report = |mantissa: i128| BalanceReport {
+            rows: vec![AccountBalance {
+                account: "assets:checking".to_string(),
+                amounts: vec![Amount {
+                    commodity: "$".into(),
+                    quantity: Quantity::new(mantissa, 2),
+                    commodity_left: true,
+                    spaced: false,
+                }],
+            }],
+            totals: vec![],
+        };
+        let clean = balance_text(&report(100));
+        assert!(!clean.contains("flag"), "{clean}");
+        assert!(!clean.ends_with('\n'), "no dangling newline: {clean:?}");
+
+        let overdrawn = balance_text(&report(-100));
+        assert!(overdrawn.contains("flag overdraft:"), "{overdrawn}");
     }
 
     /// The `#[serde(flatten)]` of [`MoneyArgs`] must keep the advertised schema **flat** —
