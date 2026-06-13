@@ -90,8 +90,15 @@ impl GitRepo {
     /// Stage `relpath` (relative to the repo workdir) and commit it onto `HEAD`, returning the
     /// new commit oid. Handles the unborn-HEAD (first commit) case.
     pub fn commit_path(&self, relpath: &Path, message: &str) -> Result<CommitOid, GitError> {
+        self.commit_paths(&[relpath], message)
+    }
+
+    /// Stage several paths (relative to the repo workdir) and commit them as **one** commit —
+    /// the multi-file epoch step (e.g. the budget file plus the `include` line added to the
+    /// journal must land atomically: one validated write = one commit).
+    pub fn commit_paths(&self, relpaths: &[&Path], message: &str) -> Result<CommitOid, GitError> {
         let mut index = self.repo.index()?;
-        index.add_all([relpath].iter(), IndexAddOption::DEFAULT, None)?;
+        index.add_all(relpaths.iter(), IndexAddOption::DEFAULT, None)?;
         index.write()?;
         let tree_oid = index.write_tree()?;
         let tree = self.repo.find_tree(tree_oid)?;

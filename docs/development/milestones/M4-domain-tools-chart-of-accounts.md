@@ -21,8 +21,9 @@ Unlocks: M5 (tiering/profiles organize *this* catalog; budget + ECO extend it).
     a **shared** `expenses:construction:{trade}`, **professional** vendors get a **dedicated**
     `expenses:{category} — {vendor}`.
   - **Permits** are prepaid (`expenses:permits and fees`, no AP); the jurisdiction is never a
-    vendor; an expediter is a professional vendor.
+    vendor; an expediter is a professional vendor. *(Deferred to M5 — see exit review.)*
   - **GC pass-through** — the GC stays the vendor; expense splits to the trade account(s).
+    *(Deferred to M5 — see exit review.)*
   - Fixed accounts known up front; `expenses:construction:*` children created from the GC
     line-item budget; **change orders** as a parallel hierarchy.
 - **Domain tools (§9 mapping)** — each built on the M2 pipeline / M1 adapter:
@@ -89,20 +90,50 @@ Unlocks: M5 (tiering/profiles organize *this* catalog; budget + ECO extend it).
 
 ## Exit criteria
 
-- [ ] `mise run check` green; **`mise run cov` ≥ 85% lines**.
-- [ ] All §9 domain tools implemented and callable from a Cowork session.
-- [ ] Vendor model honors trade (shared expense acct) vs professional (dedicated) — tested.
+- [x] `mise run check` green; **`mise run cov` ≥ 85% lines**.
+- [x] All §9 domain tools implemented and callable from a Cowork session.
+- [x] Vendor model honors trade (shared expense acct) vs professional (dedicated) — tested.
 - [ ] Permits post prepaid with no AP; GC pass-through keeps GC as vendor (tested).
-- [ ] Full lifecycle (fund → invoice → pay → summary/aging) works e2e with correct balances.
-- [ ] Each tool is classified record/decide and behaves accordingly.
-- [ ] New report JSON shapes have golden fixtures, updated in the same change.
-- [ ] **Mutation testing: zero surviving mutants** in the AP-aging bucketing + vendor-resolution
+      **Deferred to M5, 2026-06-11** — see the review below.
+- [x] Full lifecycle (fund → invoice → pay → summary/aging) works e2e with correct balances.
+- [x] Each tool is classified record/decide and behaves accordingly.
+- [x] New report JSON shapes have golden fixtures, updated in the same change.
+- [x] **Mutation testing: zero surviving mutants** in the AP-aging bucketing + vendor-resolution
       logic (`mise run mutants`).
-- [ ] No PII — all vendors/accounts/amounts in tests are synthetic placeholders.
+- [x] No PII — all vendors/accounts/amounts in tests are synthetic placeholders.
 
 ## Exit-criteria review
 
-> Fill in when closing M4. Demonstrate the end-to-end domain lifecycle e2e (the fund→invoice→
-> pay→summary chain) as the headline proof. Verify the trade-vs-professional vendor rule and
-> the permit/pass-through special cases against [chart-of-accounts.md](../chart-of-accounts.md).
-> Confirm every new tool declares its record/decide partition. Record the verdict.
+**Reviewed 2026-06-11 — verdict: done-with-deferrals.**
+
+- **Gate:** `mise run check` green (181 tests, fmt clean, clippy zero warnings);
+  `mise run cov` = **90.46% lines** (main.rs reads 0% as documented; the total clears the bar).
+- **§9 tools:** all eight implemented (`fund_project`, `receive_invoice`, `pay_invoice`,
+  `post_interest`, `vendor_add`, `vendor_list`, `get_ap_aging`, `get_project_summary`);
+  callability proven at the wire level by the stdio e2e in `tests/mcp_stdio.rs` — the same
+  stdio surface Cowork bridges (demonstrated in M0).
+- **Headline proof — lifecycle e2e:** declare → `vendor_add` (trade) → `fund_project` →
+  `receive_invoice` (old date) → `get_ap_aging` (entry overdue + `flag ap-aging` footer) →
+  `pay_invoice` → aging reports *(no outstanding payables)* → `post_interest` →
+  `get_account_balance` asserts checking at exactly **$42010.00** ($50000 − $8000 + $10) →
+  `get_project_summary` (balance sheet + income statement). One commit per write.
+- **Vendor rule:** `vendor_expense_account` unit-tests both arms (trade → shared
+  `expenses:construction:{trade}`, professional → dedicated) plus the missing-`trade` input
+  error; a property test pins trade accounts under `expenses:construction:`.
+- **Record/decide:** every write tool dispatches as `ToolClass::Record`, per the partition
+  rationale above (`pay_invoice` records a human-authorized payment; the first genuine decide
+  is M5's `eco_approve`).
+- **Mutants:** the full-run misses were closed; a scoped re-run over `domain.rs` (aging
+  bucketing + vendor resolution) reports zero survivors (16/16 caught).
+- **Review pass found 4 real bugs** before close (posting-level `invoice:` tags missed,
+  future-dated invoice age, missing `pay_invoice` outstanding-AP precondition, bogus
+  `CommitOid: Default`) — all fixed and pinned by tests.
+
+**Deferral (dated 2026-06-11, lands in M5):** the **permit** (prepaid, no AP; jurisdiction is
+never a vendor) and **GC pass-through** (GC stays the vendor; expense splits across trade
+accounts) special cases are unimplemented and untested. `receive_invoice` accepts a single
+`expense_account`, so a GC invoice cannot split, and nothing posts a permit without AP.
+M5 closes this alongside the vendor-guide resource that must document both rules anyway —
+per chart-of-accounts.md the existing tools already carry both paths (single-line
+pass-through via `receive_invoice`; multi-line and permits via `post_transaction`), so the
+deferred work is tests + guide prose, not a new mechanism. See the M5 scope/work items.

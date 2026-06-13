@@ -89,6 +89,20 @@ pub fn balance_flat_argv(journal: &Path, account: Option<&str>) -> Vec<String> {
     argv
 }
 
+/// `hledger balance --budget --flat -M [account] -O json -f <journal>` — budget-vs-actual.
+///
+/// `--budget` pairs each cell as `[actual, goal]` (goals from the journal's `~` periodic
+/// rules); `--flat` keeps full leaf account names (tree mode would elide a single-child
+/// chain to its parent); `-M` makes the goal periods monthly (matching the rules we
+/// write), and the report's `prrTotal` then sums actual and goal across the months in range.
+pub fn balance_budget_argv(journal: &Path, account: Option<&str>) -> Vec<String> {
+    let mut argv = balance_argv(journal, account);
+    argv.insert(1, "--budget".to_string());
+    argv.insert(2, "--flat".to_string());
+    argv.insert(3, "-M".to_string());
+    argv
+}
+
 /// `hledger balance [account] -O json -f <journal>`.
 ///
 /// `account` is an optional account-name query; `None` reports all accounts.
@@ -219,6 +233,25 @@ mod tests {
         assert_eq!(
             check_strict_argv(&journal()),
             vec!["check", "--strict", "-f", "/x/main.journal"]
+        );
+    }
+
+    #[test]
+    fn balance_budget_argv_shape() {
+        let argv = balance_budget_argv(&journal(), Some("expenses"));
+        assert_eq!(
+            argv,
+            vec![
+                "balance",
+                "--budget",
+                "--flat",
+                "-M",
+                "expenses",
+                "-O",
+                "json",
+                "-f",
+                "/x/main.journal",
+            ]
         );
     }
 

@@ -12,8 +12,8 @@ use serde_json::Value;
 
 use super::amount::{Amount, Quantity};
 use super::{
-    AccountBalance, BalanceReport, CompositeReport, Posting, ReportRow, Status, Subreport,
-    Transaction,
+    AccountBalance, BalanceReport, BudgetReport, BudgetRow, CompositeReport, Posting, ReportRow,
+    Status, Subreport, Transaction,
 };
 
 /// hledger `aquantity`: an exact decimal. We read the integer mantissa + place count and
@@ -196,6 +196,58 @@ pub fn parse_composite_report(stdout: &str) -> Result<CompositeReport, serde_jso
     })
 }
 
+// ---- balance --budget (`hledger balance --budget -M -O json`) --------------------------
+//
+// Budget mode emits a bare PeriodicReport `{ "prRows": [...], "prTotals": {...} }` where
+// every amounts cell is the positional pair `[actual_amounts, goal_amounts]` (goal absent
+// or null for unbudgeted rows). Same index-navigation rationale as `parse_balance`:
+// positions we use are read, anything appended later is ignored.
+
+/// Read one `[actual, goal]` budget cell. A missing/null goal (unbudgeted row) is empty.
+fn budget_pair(cell: &Value) -> Result<(Vec<Amount>, Vec<Amount>), serde_json::Error> {
+    use serde::de::Error as _;
+    let pair = cell
+        .as_array()
+        .ok_or_else(|| serde_json::Error::custom("budget: cell is not an [actual, goal] pair"))?;
+    let actual = match pair.first() {
+        Some(v) if !v.is_null() => amounts_from_value(v)?,
+        _ => Vec::new(),
+    };
+    let goal = match pair.get(1) {
+        Some(v) if !v.is_null() => amounts_from_value(v)?,
+        _ => Vec::new(),
+    };
+    Ok((actual, goal))
+}
+
+/// Parse `hledger balance --budget -M -O json` output into a [`BudgetReport`].
+pub fn parse_budget(stdout: &str) -> Result<BudgetReport, serde_json::Error> {
+    use serde::de::Error as _;
+    let doc: Value = serde_json::from_str(stdout)?;
+    let rows_arr = doc["prRows"]
+        .as_array()
+        .ok_or_else(|| serde_json::Error::custom("budget: prRows not array"))?;
+    let mut rows = Vec::with_capacity(rows_arr.len());
+    for row in rows_arr {
+        let account = row["prrName"]
+            .as_str()
+            .ok_or_else(|| serde_json::Error::custom("budget: prrName not string"))?
+            .to_string();
+        let (actual, goal) = budget_pair(&row["prrTotal"])?;
+        rows.push(BudgetRow {
+            account,
+            actual,
+            goal,
+        });
+    }
+    let (total_actual, total_goal) = budget_pair(&doc["prTotals"]["prrTotal"])?;
+    Ok(BudgetReport {
+        rows,
+        total_actual,
+        total_goal,
+    })
+}
+
 // ---- print (`hledger print -O json`) --------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +317,7 @@ mod tests {
     const BALANCESHEET_BASIC: &str = include_str!("../../tests/fixtures/balancesheet_basic.json");
     const INCOMESTATEMENT_BASIC: &str =
         include_str!("../../tests/fixtures/incomestatement_basic.json");
+    const BUDGET_BASIC: &str = include_str!("../../tests/fixtures/budget_basic.json");
 
     #[test]
     fn parses_single_account_balance() {
@@ -376,6 +429,33 @@ mod tests {
         assert_eq!(liabilities.rows[0].total[0].render(), "$2500.00");
 
         assert_eq!(report.totals[0].render(), "$39625.00");
+    }
+
+    #[test]
+    fn parses_budget_golden() {
+        // budget fixture: $300 actual against a $500 monthly goal on the plumbing account.
+        let report = parse_budget(BUDGET_BASIC).expect("parse budget_basic");
+        assert_eq!(report.rows.len(), 1);
+        let row = &report.rows[0];
+        assert_eq!(row.account, "expenses:construction:plumbing");
+        assert_eq!(row.actual[0].render(), "300.00 $");
+        assert_eq!(row.goal[0].render(), "500.00 $");
+        assert_eq!(report.total_actual[0].render(), "300.00 $");
+        assert_eq!(report.total_goal[0].render(), "500.00 $");
+    }
+
+    #[test]
+    fn budget_cell_tolerates_missing_or_null_goal() {
+        // An unbudgeted row's goal cell may be null (or absent in a future shape) — empty, not
+        // an error (parse-only-what-we-use tolerance for the additive/optional case).
+        let (actual, goal) = budget_pair(&serde_json::json!([[], null])).expect("null goal");
+        assert!(actual.is_empty() && goal.is_empty());
+        // A null ACTUAL cell must also read as empty, not be fed to the amounts parser.
+        let (actual, goal) = budget_pair(&serde_json::json!([null, []])).expect("null actual");
+        assert!(actual.is_empty() && goal.is_empty());
+        let (_, goal) = budget_pair(&serde_json::json!([[]])).expect("absent goal");
+        assert!(goal.is_empty());
+        assert!(budget_pair(&serde_json::json!("x")).is_err(), "non-array");
     }
 
     #[test]

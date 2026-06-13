@@ -119,6 +119,28 @@ pub struct AccountBalance {
     pub amounts: Vec<Amount>,
 }
 
+/// One `balance --budget` row: an account's actual posted amounts vs its budget goal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetRow {
+    /// Full account name.
+    pub account: String,
+    /// Actual amounts posted in range (per commodity).
+    pub actual: Vec<Amount>,
+    /// Budget goal from the `~` periodic rules; empty for an unbudgeted row.
+    pub goal: Vec<Amount>,
+}
+
+/// The result of `hledger balance --budget -M`: actual-vs-goal rows plus the grand totals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetReport {
+    /// One row per account with activity or a goal.
+    pub rows: Vec<BudgetRow>,
+    /// Grand-total actuals.
+    pub total_actual: Vec<Amount>,
+    /// Grand-total goals.
+    pub total_goal: Vec<Amount>,
+}
+
 /// The result of `hledger balance`: per-account rows plus the column totals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BalanceReport {
@@ -253,6 +275,17 @@ impl Hledger {
     pub async fn balance_flat(&self, account: Option<&str>) -> Result<BalanceReport, HledgerError> {
         let out = runner::run(&self.bin, &cli::balance_flat_argv(self.journal()?, account)).await?;
         json::parse_balance(&out).map_err(HledgerError::from)
+    }
+
+    /// `hledger balance --budget -M [account] -O json` → a [`BudgetReport`] (actual vs the
+    /// journal's `~` periodic budget goals, summed across the months in range).
+    pub async fn budget_report(&self, account: Option<&str>) -> Result<BudgetReport, HledgerError> {
+        let out = runner::run(
+            &self.bin,
+            &cli::balance_budget_argv(self.journal()?, account),
+        )
+        .await?;
+        json::parse_budget(&out).map_err(HledgerError::from)
     }
 
     /// `hledger balance [account] -O json` → a [`BalanceReport`].

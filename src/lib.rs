@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod catalog;
 pub mod domain;
 pub mod epoch;
 pub mod flags;
@@ -13,6 +14,7 @@ pub mod git;
 pub mod hledger;
 pub mod logging;
 pub mod protocol;
+pub mod resources;
 pub mod server;
 pub mod tools;
 pub mod write;

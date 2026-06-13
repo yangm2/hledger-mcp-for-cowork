@@ -5,11 +5,20 @@ plain-text ledger to Claude, designed to run inside a **Claude Cowork** project.
 **Rust** rewrite of the GnuCash-backed predecessor; hledger replaces GnuCash because
 append-only / immutable / diffable / git-backed is hledger's native idiom.
 
-> **Current phase: foundations complete (M0–M3).** The server runs: read tools (M1), the
-> fail-closed write path with git-commit epochs (M2), and the concurrency layer (M3 — epoch
-> CAS, record/decide partition, cross-process flock, tombstones, soft-invariant flags, the
-> TLA+ model). Next up: **M4 domain tools** (chart of accounts, invoice/pay/vendor surface) —
-> see `docs/development/milestones/`.
+> **Current phase: M0–M5 complete.** The server runs: read tools (M1), the fail-closed write
+> path with git-commit epochs (M2), the concurrency layer (M3 — epoch CAS, record/decide
+> partition, cross-process flock, tombstones, soft-invariant flags, the TLA+ model), the M4
+> domain surface (chart of accounts, vendor/invoice/pay/fund/interest tools, AP aging,
+> project summary), and the M5 ergonomics + domain round-out (MC-8 two-tier `tools/list`,
+> `ledger://` resources with `server_instructions` → `session-context`, the MC-10 `--profile`
+> flag, budget via a wholesale-replaced included `budget.journal`, and the ECO lifecycle —
+> `eco_approve` is the first **decide** tool, epoch-checked end-to-end; M4's permits/GC
+> pass-through deferrals closed). M5 closed *done* (2026-06-12). Next up: **M6 live GUI,
+> HTTP/Linux, packaging** — see `docs/development/milestones/`. **A milestone is not
+> "complete" until its Exit-criteria review is run and recorded** (tick demonstrated items,
+> date-stamp deferrals into the receiving milestone, write the verdict — the ritual in
+> `milestones/README.md`); updating this banner is part of that review, never a substitute
+> for it.
 
 > ⚠️ **This is a PUBLIC repository — never leak PII.** No real names, emails, account
 > numbers, addresses, vendor identities, balances, or other personal/financial data in
@@ -227,8 +236,10 @@ TLC-compatible (`tla2tools.jar` is a drop-in fallback). The C-1…C-6 suite live
 ## Repository map
 
 - `src/` — the Rust crate: `hledger/` (the adapter seam), `write/` (the fail-closed pipeline +
-  `ConnectionView`), `epoch.rs` (the pure CAS), `flags.rs` (soft invariants), `git.rs`,
-  `server.rs` (MCP tools), `protocol.rs`, `logging.rs`.
+  `ConnectionView`; `write/budget.rs` is the wholesale-replace budget-file pipeline),
+  `epoch.rs` (the pure CAS), `flags.rs` (soft invariants), `git.rs`, `server.rs` (MCP tools),
+  `catalog.rs` (MC-8 tiers + MC-10 profiles), `resources.rs` + `resources/*.md` (the
+  `ledger://` guides), `protocol.rs`, `logging.rs`.
 - `tests/smoke.rs` — real-hledger e2e (write → `check --strict` → read → `git commit`);
   `tests/concurrency.rs` — the C-1…C-6 suite; `tests/mcp_stdio.rs` — wire-level e2e incl. the
   two-process contention test. All skip gracefully when hledger is absent.

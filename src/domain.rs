@@ -81,6 +81,150 @@ pub fn vendor_expense_account(
     }
 }
 
+// ---- Change orders (ECO, M5) ---------------------------------------------------------
+//
+// The CO lifecycle is a pure account-and-tag state machine over existing write primitives —
+// no new journal grammar:
+//   - `eco_create` posts the CO amount into the **pending** subtree
+//     (`expenses:change orders:pending:{trade}`) against the vendor's AP — committed
+//     exposure is visible immediately, but outside the budget-tracked per-trade account.
+//   - `eco_approve` (the **decide** call) transfers pending → the budget-tracked
+//     `expenses:change orders:{trade}`.
+//   - `eco_void` reverses the CO's unreversed transactions (append-only, as ever).
+// State is queryable by tag: every CO transaction carries `eco:{id}` and an
+// `eco_event:created|approved` marker.
+
+/// Root of the change-order (parallel) expense hierarchy.
+pub const CO_ROOT: &str = "expenses:change orders";
+
+/// Prefix of the **pending** (created, not yet approved) CO subtree. `pending` is therefore
+/// a reserved trade name under `change orders` (documented in `ledger://eco-guide`).
+pub const CO_PENDING_PREFIX: &str = "expenses:change orders:pending:";
+
+/// The budget-tracked CO account for a trade: `expenses:change orders:{trade}`.
+pub fn eco_account(trade: &str) -> String {
+    format!("{CO_ROOT}:{trade}")
+}
+
+/// The pending CO account for a trade: `expenses:change orders:pending:{trade}`.
+pub fn eco_pending_account(trade: &str) -> String {
+    format!("{CO_PENDING_PREFIX}{trade}")
+}
+
+/// The `eco_event` tag values marking each lifecycle step.
+pub const ECO_EVENT_CREATED: &str = "created";
+pub const ECO_EVENT_APPROVED: &str = "approved";
+
+/// `eco_create`: Dr `expenses:change orders:pending:{trade}` / Cr the vendor's AP.
+// One arg per CO field, mirroring the other input builders — a param struct would just
+// rename the same eight fields.
+#[allow(clippy::too_many_arguments)]
+pub fn eco_create_input(
+    date: NaiveDate,
+    eco: &str,
+    trade: &str,
+    vendor: &str,
+    description: &str,
+    amount: String,
+    commodity: Commodity,
+    idem: Option<String>,
+) -> TransactionInput {
+    TransactionInput {
+        date,
+        description: format!("ECO {eco}: {description}"),
+        postings: vec![
+            posting(eco_pending_account(trade), amount, commodity),
+            balancer(vendor_ap_account(vendor)),
+        ],
+        tags: vec![
+            ("eco".to_string(), eco.to_string()),
+            ("eco_event".to_string(), ECO_EVENT_CREATED.to_string()),
+            ("vendor".to_string(), vendor.to_string()),
+        ],
+        idem,
+    }
+}
+
+/// `eco_approve`: transfer the CO amount pending → budget-tracked.
+/// Dr `expenses:change orders:{trade}` / Cr `expenses:change orders:pending:{trade}`.
+pub fn eco_approve_input(
+    date: NaiveDate,
+    eco: &str,
+    trade: &str,
+    amount: String,
+    commodity: Commodity,
+) -> TransactionInput {
+    TransactionInput {
+        date,
+        description: format!("ECO {eco}: approved"),
+        postings: vec![
+            posting(eco_account(trade), amount, commodity),
+            balancer(eco_pending_account(trade)),
+        ],
+        tags: vec![
+            ("eco".to_string(), eco.to_string()),
+            ("eco_event".to_string(), ECO_EVENT_APPROVED.to_string()),
+        ],
+        idem: None,
+    }
+}
+
+/// The CO details recoverable from a created transaction: the trade (from the pending
+/// account path) and the posted amount. `None` if the transaction has no pending-CO posting
+/// with an amount (not a CO create transaction).
+pub fn eco_details(txn: &Transaction) -> Option<(String, &Amount)> {
+    txn.postings.iter().find_map(|p| {
+        let trade = p.account.strip_prefix(CO_PENDING_PREFIX)?;
+        let amount = p.amounts.first()?;
+        Some((trade.to_string(), amount))
+    })
+}
+
+// ---- Budget vs actual (M5) -----------------------------------------------------------
+
+/// Whether `actual` strictly exceeds `goal`, aligning the two quantities' decimal places
+/// (`300.00` vs `500` compares 30000 vs 50000 at 2 places). The over-budget predicate.
+pub fn exceeds(actual: &crate::hledger::Quantity, goal: &crate::hledger::Quantity) -> bool {
+    let places = actual.places.max(goal.places);
+    let scale =
+        |q: &crate::hledger::Quantity| q.mantissa * 10i128.pow(u32::from(places - q.places));
+    scale(actual) > scale(goal)
+}
+
+/// Render a [`BudgetReport`] as text: one `account  actual <amts> | budget <amts>` line per
+/// row, then the totals line. Unbudgeted rows show `budget (none)`.
+pub fn render_budget(report: &crate::hledger::BudgetReport) -> String {
+    use crate::hledger::amount::render_amounts;
+    let budget_cell = |goal: &[Amount]| {
+        if goal.is_empty() {
+            "(none)".to_string()
+        } else {
+            render_amounts(goal)
+        }
+    };
+    let mut lines: Vec<String> = report
+        .rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{}  actual {} | budget {}",
+                row.account,
+                render_amounts(&row.actual),
+                budget_cell(&row.goal)
+            )
+        })
+        .collect();
+    if report.rows.is_empty() {
+        lines.push("(no budgeted accounts and no activity)".to_string());
+    }
+    lines.push(format!(
+        "total  actual {} | budget {}",
+        render_amounts(&report.total_actual),
+        budget_cell(&report.total_goal)
+    ));
+    lines.join("\n")
+}
+
 // ---- Transaction-input builders (pure) ---------------------------------------------
 //
 // Each function returns a `TransactionInput` ready to pass to `write::post_transaction`.
@@ -765,5 +909,163 @@ mod tests {
             let acct = vendor_ap_account(&vendor);
             prop_assert!(acct.starts_with("liabilities:ap:vendor:"));
         }
+    }
+
+    // ---- M5: change orders + budget ------------------------------------------------
+
+    #[test]
+    fn eco_account_paths() {
+        assert_eq!(
+            eco_account("electrical"),
+            "expenses:change orders:electrical"
+        );
+        assert_eq!(
+            eco_pending_account("electrical"),
+            "expenses:change orders:pending:electrical"
+        );
+    }
+
+    #[test]
+    fn eco_create_input_posts_pending_against_vendor_ap_with_lifecycle_tags() {
+        let input = eco_create_input(
+            nd(2026, 2, 1),
+            "7",
+            "electrical",
+            "GC",
+            "add outlets",
+            "1500.00".to_string(),
+            "$".into(),
+            None,
+        );
+        assert_eq!(input.description, "ECO 7: add outlets");
+        assert_eq!(input.postings.len(), 2);
+        assert_eq!(
+            input.postings[0].account,
+            "expenses:change orders:pending:electrical"
+        );
+        assert_eq!(input.postings[1].account, "liabilities:ap:vendor:GC");
+        assert!(input.postings[1].amount.is_none(), "AP is the balancer");
+        assert!(input.tags.contains(&("eco".to_string(), "7".to_string())));
+        assert!(
+            input
+                .tags
+                .contains(&("eco_event".to_string(), "created".to_string()))
+        );
+    }
+
+    #[test]
+    fn eco_approve_input_transfers_pending_to_tracked() {
+        let input = eco_approve_input(
+            nd(2026, 2, 5),
+            "7",
+            "electrical",
+            "1500.00".to_string(),
+            "$".into(),
+        );
+        assert_eq!(
+            input.postings[0].account,
+            "expenses:change orders:electrical"
+        );
+        assert_eq!(
+            input.postings[1].account,
+            "expenses:change orders:pending:electrical"
+        );
+        assert!(input.postings[1].amount.is_none());
+        assert!(
+            input
+                .tags
+                .contains(&("eco_event".to_string(), "approved".to_string()))
+        );
+    }
+
+    #[test]
+    fn eco_details_finds_the_pending_posting_or_nothing() {
+        use crate::hledger::Posting;
+        let pending = Posting {
+            account: "expenses:change orders:pending:hvac".to_string(),
+            amounts: vec![make_amount(200000)],
+            comment: String::new(),
+            tags: vec![],
+        };
+        let other = Posting {
+            account: "liabilities:ap:vendor:GC".to_string(),
+            amounts: vec![make_amount(-200000)],
+            comment: String::new(),
+            tags: vec![],
+        };
+        let txn = |postings: Vec<Posting>| Transaction {
+            date: nd(2026, 2, 1),
+            description: "ECO 9".to_string(),
+            index: 1,
+            status: crate::hledger::Status::Unmarked,
+            comment: String::new(),
+            tags: vec![],
+            postings,
+        };
+        let create = txn(vec![other.clone(), pending]);
+        let (trade, amount) = eco_details(&create).expect("pending posting found");
+        assert_eq!(trade, "hvac");
+        assert_eq!(amount.quantity.mantissa, 200000);
+        assert!(
+            eco_details(&txn(vec![other])).is_none(),
+            "no pending-CO posting → not a CO create txn"
+        );
+    }
+
+    #[test]
+    fn exceeds_aligns_decimal_places_and_is_strict() {
+        use crate::hledger::Quantity;
+        // 300.00 (mantissa 30000, 2dp) vs 500 (mantissa 500, 0dp).
+        assert!(!exceeds(&Quantity::new(30000, 2), &Quantity::new(500, 0)));
+        assert!(exceeds(&Quantity::new(80000, 2), &Quantity::new(500, 0)));
+        // Equal after alignment → NOT exceeding (strict).
+        assert!(!exceeds(&Quantity::new(50000, 2), &Quantity::new(500, 0)));
+        assert!(!exceeds(&Quantity::new(500, 0), &Quantity::new(50000, 2)));
+        // Mirrored places on the other side.
+        assert!(exceeds(&Quantity::new(501, 0), &Quantity::new(50000, 2)));
+    }
+
+    #[test]
+    fn render_budget_lists_rows_unbudgeted_and_totals() {
+        use crate::hledger::{BudgetReport, BudgetRow};
+        let report = BudgetReport {
+            rows: vec![
+                BudgetRow {
+                    account: "expenses:construction:plumbing".to_string(),
+                    actual: vec![make_amount(80000)],
+                    goal: vec![make_amount(50000)],
+                },
+                BudgetRow {
+                    account: "<unbudgeted>".to_string(),
+                    actual: vec![make_amount(100)],
+                    goal: vec![],
+                },
+            ],
+            total_actual: vec![make_amount(80100)],
+            total_goal: vec![make_amount(50000)],
+        };
+        let text = render_budget(&report);
+        assert!(
+            text.contains("expenses:construction:plumbing  actual $800.00 | budget $500.00"),
+            "{text}"
+        );
+        assert!(
+            text.contains("<unbudgeted>  actual $1.00 | budget (none)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("total  actual $801.00 | budget $500.00"),
+            "{text}"
+        );
+
+        let empty = render_budget(&BudgetReport {
+            rows: vec![],
+            total_actual: vec![],
+            total_goal: vec![],
+        });
+        assert!(
+            empty.contains("(no budgeted accounts and no activity)"),
+            "{empty}"
+        );
     }
 }

@@ -196,11 +196,64 @@ pub struct GetApAgingArgs {
     pub as_of: Option<NaiveDate>,
 }
 
+/// Arguments for `budget_set`.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct BudgetSetArgs {
+    /// The (declared) account the goal applies to, e.g. `expenses:construction:plumbing`.
+    pub account: String,
+    /// Goal period: `daily` | `weekly` | `monthly` | `quarterly` | `yearly`.
+    pub period: write::budget::BudgetPeriod,
+    /// Exact decimal goal amount as a string, e.g. `"500.00"`.
+    pub amount: String,
+    /// Commodity symbol, e.g. `"$"`.
+    #[schemars(with = "String")]
+    pub commodity: crate::hledger::amount::Commodity,
+}
+
+/// Arguments for `get_budget_vs_actual`.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct BudgetVsActualArgs {
+    /// Optional account query scoping the report (e.g. `expenses:construction`); omit for all.
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// Arguments for `eco_create`.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct EcoCreateArgs {
+    /// Your change-order number/id, e.g. `"7"` or `"ECO-7"` — the `eco:` tag value.
+    pub eco: String,
+    /// The trade the CO belongs to, e.g. `"electrical"` (`pending` is reserved).
+    pub trade: String,
+    /// The vendor billing the CO (usually the GC) — must be declared via `vendor_add`.
+    pub vendor: String,
+    /// What the change order covers.
+    pub description: String,
+    /// CO date (YYYY-MM-DD).
+    #[schemars(with = "String")]
+    pub date: chrono::NaiveDate,
+    #[serde(flatten)]
+    pub money: MoneyArgs,
+}
+
+/// Arguments for `eco_approve` / `eco_void`.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct EcoRefArgs {
+    /// The change-order id used at `eco_create` (the `eco:` tag value).
+    pub eco: String,
+    /// Event date (YYYY-MM-DD).
+    #[schemars(with = "String")]
+    pub date: chrono::NaiveDate,
+}
+
 /// The MCP server handler.
 #[derive(Clone)]
 pub struct HledgerMcp {
     started: Instant,
     hledger: Hledger,
+    /// The advertising profile (`--profile`, MC-10): filters `tools/list` only — dispatch
+    /// always runs against the full catalog.
+    profile: crate::catalog::Profile,
     /// This connection's [`ConnectionView`] (M3): the per-connection last-seen epoch paired
     /// with the process-wide writer lock. Over stdio there is exactly one connection per server
     /// process, so one standalone view (the multi-connection directory — one `WriterLock`, one
@@ -228,9 +281,16 @@ impl HledgerMcp {
         Self {
             started: Instant::now(),
             hledger,
+            profile: crate::catalog::Profile::default(),
             view: Arc::new(ConnectionView::default()),
             write_block: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    /// Select the advertising profile (builder; `main` passes `--profile`). Filters what
+    /// `tools/list` advertises — every tool stays callable regardless (MC-10).
+    pub fn with_profile(self, profile: crate::catalog::Profile) -> Self {
+        Self { profile, ..self }
     }
 
     /// Block writes with `reason` until a reconcile retry succeeds (builder, for startup:
@@ -315,8 +375,9 @@ impl HledgerMcp {
     /// block from [`Self::backend_block`].
     fn status_text(&self, negotiated: &ProtocolVersion, backend: &str) -> String {
         format!(
-            "{SERVER_NAME} {}\nprotocol: {negotiated}\n{backend}\nuptime: {}s",
+            "{SERVER_NAME} {}\nprotocol: {negotiated}\nprofile: {}\n{backend}\nuptime: {}s",
             env!("CARGO_PKG_VERSION"),
+            self.profile,
             self.started.elapsed().as_secs(),
         )
     }
@@ -902,6 +963,332 @@ impl HledgerMcp {
         .await
     }
 
+    // ---- M5: budget (record/read) + change orders (the first decide tool) --------------
+
+    /// Set (or replace) one account's per-period budget goal. **Record** — rewrites the
+    /// dedicated budget file wholesale inside the epoch-commit pipeline (see
+    /// [`write::budget`] for why replace, not append).
+    #[tool(
+        description = "Set or replace the budget goal for one account and period. Requires \
+                      `account` (declared), `period` (daily|weekly|monthly|quarterly|yearly), \
+                      `amount` (e.g. \"500.00\"), `commodity` (e.g. \"$\"). Setting the same \
+                      account+period again replaces the goal. One call = one git commit.",
+        input_schema = schema_for_type::<BudgetSetArgs>()
+    )]
+    async fn budget_set(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        self.guarded_args_tool(
+            raw,
+            ToolClass::Record,
+            async |ctx, args: BudgetSetArgs| {
+                let quantity = crate::hledger::Quantity::parse(&args.amount).ok_or_else(|| {
+                    WriteError::Input(format!("invalid amount '{}'", args.amount))
+                })?;
+                let out = write::budget::set_budget(
+                    &ctx,
+                    &args.account,
+                    args.period,
+                    quantity,
+                    args.commodity.clone(),
+                )
+                .await?;
+                Ok((args, out))
+            },
+            |(args, out): &(BudgetSetArgs, CommitOutcome)| {
+                format!(
+                    "budget set: {} {} = {} {} (commit {})",
+                    out.id,
+                    args.period,
+                    args.amount,
+                    args.commodity,
+                    out.commit.short()
+                )
+            },
+        )
+        .await
+    }
+
+    /// List the current budget rules. **Read**.
+    #[tool(
+        description = "List the current budget rules (account, period, goal amount). \
+                      Takes no arguments."
+    )]
+    async fn budget_list(
+        &self,
+        Parameters(_raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        self.read_tool(
+            async |hledger| {
+                let journal = hledger.journal_path().ok_or(HledgerError::NoJournal)?;
+                write::budget::read_budget_rules(journal)
+                    .map_err(|e| HledgerError::BadVersion(e.to_string()))
+            },
+            |rules: &Vec<write::budget::BudgetRule>| {
+                if rules.is_empty() {
+                    "(no budget rules set — use budget_set first)".to_string()
+                } else {
+                    rules
+                        .iter()
+                        .map(|r| {
+                            format!(
+                                "{}  {} = {} {}",
+                                r.account,
+                                r.period,
+                                r.quantity.render(),
+                                r.commodity
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            },
+        )
+        .await
+    }
+
+    /// Budget vs actual via `hledger balance --budget`. **Read** — over-budget surfaces as a
+    /// soft-invariant flag, never a rejection (C-6).
+    #[tool(
+        description = "Budget vs actual per account, from the journal's budget rules. \
+                      Optional `account` query to scope the report. Accounts whose actual \
+                      exceeds the goal are flagged over-budget (informational, never \
+                      enforced).",
+        input_schema = schema_for_type::<BudgetVsActualArgs>()
+    )]
+    async fn get_budget_vs_actual(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        self.read_args_tool(
+            raw,
+            async |hledger, args: BudgetVsActualArgs| {
+                hledger.budget_report(args.account.as_deref()).await
+            },
+            budget_text,
+        )
+        .await
+    }
+
+    /// Record a **pending** change order: the CO amount posts to the pending CO subtree
+    /// against the vendor's AP. **Record**.
+    #[tool(
+        description = "Record a change order as PENDING: posts the amount to \
+                      `expenses:change orders:pending:{trade}` against the vendor's AP \
+                      account. Requires `eco` (your CO id), `trade`, `vendor` (declared), \
+                      `description`, `date` (YYYY-MM-DD), `amount`, `commodity`. Optional \
+                      `idem`. Approve later with eco_approve. See ledger://eco-guide.",
+        input_schema = schema_for_type::<EcoCreateArgs>()
+    )]
+    async fn eco_create(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        self.guarded_args_tool(
+            raw,
+            ToolClass::Record,
+            async |ctx, args: EcoCreateArgs| {
+                if args.trade == "pending" || args.trade.starts_with("pending:") {
+                    return Err(WriteError::Input(
+                        "'pending' is a reserved trade name under change orders".to_string(),
+                    ));
+                }
+                if !write::find_by_exact_tag(ctx.hledger, "eco", &args.eco)
+                    .await
+                    .map_err(|e| WriteError::Internal(format!("eco lookup: {e}")))?
+                    .is_empty()
+                {
+                    return Err(WriteError::Input(format!(
+                        "change order '{}' already exists",
+                        args.eco
+                    )));
+                }
+                // Auto-declare the CO accounts (the vendor_add precedent) — one commit, only
+                // when missing.
+                write::ensure_declared_accounts(
+                    &ctx,
+                    &[
+                        &crate::domain::eco_pending_account(&args.trade),
+                        &crate::domain::eco_account(&args.trade),
+                    ],
+                )
+                .await?;
+                let input = crate::domain::eco_create_input(
+                    args.date,
+                    &args.eco,
+                    &args.trade,
+                    &args.vendor,
+                    &args.description,
+                    args.money.amount,
+                    args.money.commodity,
+                    args.money.idem,
+                );
+                let outcome = write::post_transaction(&ctx, input).await?;
+                Ok((args.eco, outcome))
+            },
+            |(eco, outcome): &(String, WriteOutcome)| {
+                format!(
+                    "ECO {eco} recorded as pending, id:{} (commit {})",
+                    outcome.base.id,
+                    outcome.base.commit.short()
+                )
+            },
+        )
+        .await
+    }
+
+    /// Approve a pending change order — the first **decide** tool: it acts on a belief about
+    /// the current budget state, so it is **epoch-checked** inside the write locks (M3 CAS).
+    /// A `STALE` rejection means the ledger moved since this connection's last read: re-read,
+    /// re-evaluate the budget, retry.
+    #[tool(
+        description = "Approve a pending change order: transfers its amount from the pending \
+                      subtree into the budget-tracked `expenses:change orders:{trade}`. \
+                      EPOCH-CHECKED (decide): fails with STALE if the ledger changed since \
+                      your last read — re-read, re-evaluate, retry. Requires `eco` and `date`. \
+                      The response includes the account's budget-vs-actual standing.",
+        input_schema = schema_for_type::<EcoRefArgs>()
+    )]
+    async fn eco_approve(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        self.guarded_args_tool(
+            raw,
+            ToolClass::Decide,
+            async |ctx, args: EcoRefArgs| {
+                let events = eco_events(ctx.hledger, &args.eco).await?;
+                let created = events.created()?;
+                if events.approved {
+                    return Err(WriteError::Input(format!(
+                        "change order '{}' is already approved",
+                        args.eco
+                    )));
+                }
+                let (trade, amount) = crate::domain::eco_details(created).ok_or_else(|| {
+                    WriteError::Internal(format!(
+                        "ECO '{}' create transaction has no pending-CO posting",
+                        args.eco
+                    ))
+                })?;
+                let input = crate::domain::eco_approve_input(
+                    args.date,
+                    &args.eco,
+                    &trade,
+                    amount.quantity.render(),
+                    amount.commodity.clone(),
+                );
+                let outcome = write::post_transaction(&ctx, input).await?;
+                // Ground the decision in the response: this trade's budget standing now.
+                let account = crate::domain::eco_account(&trade);
+                let budget = ctx.hledger.budget_report(Some(&account)).await.ok();
+                Ok((args.eco, outcome, budget))
+            },
+            |(eco, outcome, budget): &(
+                String,
+                WriteOutcome,
+                Option<crate::hledger::BudgetReport>,
+            )| {
+                let mut text = format!(
+                    "ECO {eco} approved, id:{} (commit {})",
+                    outcome.base.id,
+                    outcome.base.commit.short()
+                );
+                if let Some(report) = budget {
+                    text.push('\n');
+                    text.push_str(&budget_text(report));
+                }
+                text
+            },
+        )
+        .await
+    }
+
+    /// Void a change order: reverse its unreversed transactions (append-only). **Record**.
+    #[tool(
+        description = "Void a change order: posts reversing entries for its create (and \
+                      approval, if approved) transactions. Append-only — nothing is edited \
+                      or removed. Requires `eco` and `date`.",
+        input_schema = schema_for_type::<EcoRefArgs>()
+    )]
+    async fn eco_void(
+        &self,
+        Parameters(raw): Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        self.guarded_args_tool(
+            raw,
+            ToolClass::Record,
+            async |ctx, args: EcoRefArgs| {
+                let events = eco_events(ctx.hledger, &args.eco).await?;
+                events.created()?; // unknown ECO → correctable input error
+                let targets = events.unreversed;
+                if targets.is_empty() {
+                    return Err(WriteError::Input(format!(
+                        "change order '{}' is already fully voided",
+                        args.eco
+                    )));
+                }
+                let mut last = None;
+                let count = targets.len();
+                for id in targets {
+                    last = Some(write::void_transaction(&ctx, &id).await?);
+                }
+                let last = last.expect("targets is non-empty");
+                Ok((args.eco, count, last))
+            },
+            |(eco, count, outcome): &(String, usize, WriteOutcome)| {
+                format!(
+                    "ECO {eco} voided: {count} reversing entr{} posted (last commit {})",
+                    if *count == 1 { "y" } else { "ies" },
+                    outcome.base.commit.short()
+                )
+            },
+        )
+        .await
+    }
+
+    /// The dynamic `ledger://vendors` body: declared vendor AP accounts, each with its
+    /// outstanding balance. A grounded read (bumps last-seen), like any other ledger read —
+    /// the one resource that touches hledger, and only when actually fetched.
+    async fn vendors_resource_text(&self) -> Result<String, HledgerError> {
+        self.view
+            .grounded_read(&self.hledger, || async {
+                let (accounts, balance) = tokio::try_join!(
+                    self.hledger.declared_accounts(),
+                    self.hledger.balance_flat(Some(crate::domain::AP_ROOT)),
+                )?;
+                Ok(vendors_text(&accounts, &balance))
+            })
+            .await
+    }
+
+    /// The `resources/read` payload for `uri`: static guides come from the compiled-in
+    /// markdown (no hledger); `ledger://vendors` is the dynamic exception; anything else is
+    /// the MCP resource-not-found error.
+    async fn resource_contents(
+        &self,
+        uri: &str,
+    ) -> Result<rmcp::model::ReadResourceResult, McpError> {
+        if let Some(resource) = crate::resources::find_static(uri) {
+            return Ok(rmcp::model::ReadResourceResult::new(vec![
+                rmcp::model::ResourceContents::text(resource.content, uri),
+            ]));
+        }
+        if uri == crate::resources::VENDORS_URI {
+            let text = self.vendors_resource_text().await.map_err(|err| {
+                McpError::internal_error(format!("vendors resource: {err}"), None)
+            })?;
+            return Ok(rmcp::model::ReadResourceResult::new(vec![
+                rmcp::model::ResourceContents::text(text, uri),
+            ]));
+        }
+        Err(McpError::resource_not_found(
+            format!("unknown resource '{uri}' — see ledger://session-context for the index"),
+            None,
+        ))
+    }
+
     /// Echo a message back unchanged — a minimal tool-invocation connectivity check.
     ///
     /// Extracts arguments via [`crate::tools::parse_args`] so a bad call yields a
@@ -998,6 +1385,103 @@ fn balance_text(report: &BalanceReport) -> String {
     text
 }
 
+/// Body of the dynamic `ledger://vendors` resource: each **declared vendor** AP account with
+/// its outstanding balance — `0` when the AP balance report has no row for it (a paid-up
+/// vendor drops out of the report; it must not drop out of the list). Pure.
+fn vendors_text(accounts: &[String], balance: &BalanceReport) -> String {
+    let mut lines: Vec<String> = accounts
+        .iter()
+        .filter(|a| a.starts_with(crate::domain::VENDOR_AP_PREFIX))
+        .map(|account| {
+            let outstanding = balance
+                .rows
+                .iter()
+                .find(|r| &r.account == account)
+                .map(|r| render_amounts(&r.amounts))
+                .unwrap_or_else(|| "0".to_string());
+            format!("{account}  outstanding {outstanding}")
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push("(no vendors declared — use vendor_add first)".to_string());
+    }
+    lines.join("\n")
+}
+
+/// Body of `get_budget_vs_actual` (and the `eco_approve` footer): the rendered budget report
+/// plus the over-budget flag footer (C-6: surfaced, never enforced).
+fn budget_text(report: &crate::hledger::BudgetReport) -> String {
+    let mut text = crate::domain::render_budget(report);
+    let flags = crate::flags::over_budget_flags(report);
+    if !flags.is_empty() {
+        text.push('\n');
+        text.push_str(&crate::flags::render_flags(&flags));
+    }
+    text
+}
+
+/// One change order's recorded lifecycle, as read back from its `eco:`-tagged transactions.
+struct EcoEvents {
+    /// The id passed by the caller (for error text).
+    eco: String,
+    /// The `eco_event:created` transaction, if the CO exists.
+    created: Option<Transaction>,
+    /// Whether an `eco_event:approved` transaction exists.
+    approved: bool,
+    /// `id:` tag values of the CO's transactions not yet reversed (void targets).
+    unreversed: Vec<String>,
+}
+
+impl EcoEvents {
+    /// The create transaction, or the correctable unknown-ECO input error.
+    fn created(&self) -> Result<&Transaction, WriteError> {
+        self.created.as_ref().ok_or_else(|| {
+            WriteError::Input(format!(
+                "unknown change order '{}' — record it first with eco_create",
+                self.eco
+            ))
+        })
+    }
+}
+
+/// Read one CO's transactions (exact `eco:` tag match) and classify them. Reversals don't
+/// carry the `eco:` tag, so reversed-ness is resolved per transaction via its `reverses:<id>`
+/// back-reference (the same belt-and-suspenders exact-tag query as the dedup path).
+async fn eco_events(hledger: &Hledger, eco: &str) -> Result<EcoEvents, WriteError> {
+    let internal = |e: HledgerError| WriteError::Internal(format!("eco lookup: {e}"));
+    let txns = write::find_by_exact_tag(hledger, "eco", eco)
+        .await
+        .map_err(internal)?;
+    let event =
+        |txn: &Transaction, ev: &str| txn.tags.iter().any(|(k, v)| k == "eco_event" && v == ev);
+    let created = txns
+        .iter()
+        .find(|t| event(t, crate::domain::ECO_EVENT_CREATED))
+        .cloned();
+    let approved = txns
+        .iter()
+        .any(|t| event(t, crate::domain::ECO_EVENT_APPROVED));
+    let mut unreversed = Vec::new();
+    for txn in &txns {
+        let Some(id) = txn.tags.iter().find(|(k, _)| k == "id").map(|(_, v)| v) else {
+            continue;
+        };
+        if write::find_by_exact_tag(hledger, "reverses", id)
+            .await
+            .map_err(internal)?
+            .is_empty()
+        {
+            unreversed.push(id.clone());
+        }
+    }
+    Ok(EcoEvents {
+        eco: eco.to_string(),
+        created,
+        approved,
+        unreversed,
+    })
+}
+
 /// Render a [`BalanceReport`] as a compact text table: one `account  amount` line per row,
 /// then a `total  amount` line.
 fn render_balance(report: &BalanceReport) -> String {
@@ -1033,13 +1517,61 @@ fn render_transactions(txns: &[Transaction]) -> String {
     lines.join("\n")
 }
 
+/// The `resources/list` payload (pure): the static `ledger://` guides plus the dynamic
+/// `vendors` entry. Listing never touches hledger.
+fn resource_listing() -> Vec<rmcp::model::Resource> {
+    use rmcp::model::AnnotateAble as _;
+    let mut resources: Vec<rmcp::model::Resource> = crate::resources::STATIC
+        .iter()
+        .map(|r| {
+            rmcp::model::RawResource::new(r.uri, r.name)
+                .with_title(r.title)
+                .with_description(r.description)
+                .no_annotation()
+        })
+        .collect();
+    resources.push(
+        rmcp::model::RawResource::new(crate::resources::VENDORS_URI, "vendors")
+            .with_title("Vendors (live)")
+            .with_description(
+                "Declared vendor AP accounts with outstanding balances — dynamic: \
+                     reads the ledger when fetched.",
+            )
+            .no_annotation(),
+    );
+    resources
+}
+
+/// Filter + reshape the advertised tool list for a profile (MC-8/MC-10, pure): drop tools
+/// the profile doesn't advertise, and replace each Tier-2 tool's description with its
+/// one-line summary (the detail lives in a `ledger://` resource). Dispatch is untouched —
+/// this transforms only what `tools/list` returns.
+fn advertised_tools(
+    profile: crate::catalog::Profile,
+    tools: Vec<rmcp::model::Tool>,
+) -> Vec<rmcp::model::Tool> {
+    tools
+        .into_iter()
+        .filter(|t| crate::catalog::advertised(profile, &t.name))
+        .map(|mut t| {
+            if let Some(meta) = crate::catalog::meta(&t.name)
+                && meta.tier == crate::catalog::Tier::Administrative
+            {
+                t.description = Some(std::borrow::Cow::Borrowed(meta.summary));
+            }
+            t
+        })
+        .collect()
+}
+
 #[tool_handler]
 impl ServerHandler for HledgerMcp {
     fn get_info(&self) -> ServerInfo {
-        // Only the `tools` capability is enabled (M0). `InitializeResult` is
+        // `tools` + `resources` (M5; M0 declared tools only). `InitializeResult` is
         // `#[non_exhaustive]`, so build it via its constructor + builder methods.
         let capabilities = rmcp::model::ServerCapabilities::builder()
             .enable_tools()
+            .enable_resources()
             .build();
         ServerInfo::new(capabilities)
             .with_server_info(rmcp::model::Implementation::new(
@@ -1047,6 +1579,42 @@ impl ServerHandler for HledgerMcp {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(INSTRUCTIONS)
+    }
+
+    /// `tools/list` under the active profile: the full router list, profile-filtered, with
+    /// Tier-2 descriptions reduced to one line. (`call_tool`/`get_tool` come from
+    /// `#[tool_handler]` over the **full** router — a non-advertised tool still dispatches.)
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, McpError> {
+        Ok(rmcp::model::ListToolsResult::with_all_items(
+            advertised_tools(self.profile, Self::tool_router().list_all()),
+        ))
+    }
+
+    /// `resources/list`: the static `ledger://` guides plus the dynamic `vendors` resource.
+    /// **Never touches hledger** — discovery stays off the cold-start path (asserted by the
+    /// bogus-binary e2e).
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, McpError> {
+        Ok(rmcp::model::ListResourcesResult::with_all_items(
+            resource_listing(),
+        ))
+    }
+
+    /// `resources/read`: static guides are served from the compiled-in markdown (no hledger);
+    /// the one dynamic resource, `ledger://vendors`, is a grounded read of the live ledger.
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResult, McpError> {
+        self.resource_contents(request.uri.as_str()).await
     }
 
     /// Handle `initialize`: emit the diagnostic handshake wire-log (the signal that
@@ -1135,6 +1703,38 @@ mod tests {
 
         let unread = epoch_line(&head, None);
         assert!(unread.contains("no read yet"), "{unread}");
+    }
+
+    #[test]
+    fn vendors_text_pairs_each_declared_vendor_with_its_own_balance_row() {
+        let accounts = vec![
+            "assets:checking".to_string(), // not a vendor — filtered out
+            "liabilities:ap:vendor:Acme".to_string(),
+            "liabilities:ap:vendor:PaidUp".to_string(), // no balance row → 0
+        ];
+        let balance = BalanceReport {
+            rows: vec![AccountBalance {
+                account: "liabilities:ap:vendor:Acme".to_string(),
+                amounts: vec![Amount {
+                    commodity: "$".into(),
+                    quantity: Quantity::new(-250000, 2),
+                    commodity_left: true,
+                    spaced: false,
+                }],
+            }],
+            totals: vec![],
+        };
+        let text = vendors_text(&accounts, &balance);
+        assert_eq!(
+            text,
+            "liabilities:ap:vendor:Acme  outstanding $-2500.00\n\
+             liabilities:ap:vendor:PaidUp  outstanding 0",
+            "each vendor must get ITS row's amount (and 0 only when rowless)"
+        );
+        assert!(!text.contains("assets:checking"), "{text}");
+
+        let none = vendors_text(&["assets:checking".to_string()], &balance);
+        assert!(none.contains("no vendors declared"), "{none}");
     }
 
     #[test]
@@ -1319,17 +1919,82 @@ mod tests {
     }
 
     #[test]
-    fn get_info_declares_tools_only_and_instructions() {
+    fn get_info_declares_tools_and_resources_and_points_at_session_context() {
         let info = test_server().get_info();
         assert!(
             info.capabilities.tools.is_some(),
             "tools capability declared"
         );
         assert!(
-            info.capabilities.resources.is_none(),
-            "resources NOT declared in M0"
+            info.capabilities.resources.is_some(),
+            "resources capability declared (M5)"
         );
-        assert!(info.instructions.is_some(), "server_instructions present");
+        let instructions = info.instructions.expect("server_instructions present");
+        assert!(
+            instructions.contains(crate::resources::SESSION_CONTEXT_URI),
+            "server_instructions must direct clients to session-context: {instructions}"
+        );
+    }
+
+    /// The catalog must classify **exactly** the router's tools — adding a tool without
+    /// classifying it (or classifying a phantom) fails here, keeping MC-8/MC-10 exhaustive.
+    #[test]
+    fn catalog_matches_the_tool_router_exactly() {
+        let mut router: Vec<String> = HledgerMcp::tool_router()
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let mut catalog: Vec<String> = crate::catalog::TOOLS
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        router.sort();
+        catalog.sort();
+        assert_eq!(catalog, router);
+    }
+
+    /// MC-8: under `full`, Tier-2 tools advertise their one-line summary while Tier-1 tools
+    /// keep their full descriptions; under a filtered profile the list shrinks but the full
+    /// router still resolves everything for dispatch (MC-10 at the unit level).
+    #[test]
+    fn advertised_tools_rewrites_tier_two_and_filters_by_profile() {
+        use crate::catalog::Profile;
+        let all = advertised_tools(Profile::Full, HledgerMcp::tool_router().list_all());
+        let vendor_add = all
+            .iter()
+            .find(|t| t.name == "vendor_add")
+            .expect("vendor_add");
+        assert_eq!(
+            vendor_add.description.as_deref(),
+            crate::catalog::meta("vendor_add").map(|m| m.summary),
+            "tier-2 description is the one-line summary"
+        );
+        let post = all
+            .iter()
+            .find(|t| t.name == "post_transaction")
+            .expect("post");
+        let full_desc = post.description.as_deref().unwrap_or_default();
+        assert!(
+            full_desc.contains("postings"),
+            "tier-1 keeps its full description: {full_desc}"
+        );
+
+        let operational =
+            advertised_tools(Profile::Operational, HledgerMcp::tool_router().list_all());
+        assert!(operational.iter().all(|t| {
+            crate::catalog::meta(&t.name)
+                .is_some_and(|m| m.tier == crate::catalog::Tier::Operational)
+        }));
+        assert!(operational.len() < all.len(), "filtering actually filters");
+        assert!(
+            !operational.iter().any(|t| t.name == "vendor_add"),
+            "vendor_add not advertised under operational"
+        );
+        assert!(
+            HledgerMcp::tool_router().get("vendor_add").is_some(),
+            "…but still dispatchable from the full router"
+        );
     }
 
     #[test]
@@ -1712,5 +2377,229 @@ mod tests {
             "{:?}",
             result.content[0]
         );
+    }
+
+    /// One in-process pass over the M4+M5 domain handlers against real hledger. This is what
+    /// gives the handlers line *coverage* — the wire e2e spawns a separate server process
+    /// that llvm-cov cannot see, so every handler is also driven directly here.
+    #[tokio::test]
+    async fn domain_and_m5_handlers_in_process_lifecycle() {
+        use serde_json::json;
+        let Some(bin) = hledger_bin() else { return };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = dir.path().join("main.journal");
+        let server = HledgerMcp::new(Hledger::new(bin, Some(journal)));
+
+        fn ok(result: CallToolResult) -> String {
+            assert_eq!(result.is_error, Some(false), "{result:?}");
+            result.content[0].as_text().expect("text").text.clone()
+        }
+        fn err_text(result: CallToolResult) -> String {
+            assert_eq!(result.is_error, Some(true), "{result:?}");
+            result.content[0].as_text().expect("text").text.clone()
+        }
+
+        // Bootstrap declarations + vendor.
+        ok(server
+            .declare_commodity(args(json!({"commodity": "$"})))
+            .await
+            .unwrap());
+        for account in [
+            "assets:checking",
+            "equity:owner capital",
+            "income:interest",
+            "expenses:construction:plumbing",
+        ] {
+            ok(server
+                .declare_account(args(json!({"account": account})))
+                .await
+                .unwrap());
+        }
+        ok(server
+            .vendor_add(args(
+                json!({"vendor": "GC", "vendor_type": "trade", "trade": "general"}),
+            ))
+            .await
+            .unwrap());
+
+        // Money writes.
+        ok(server
+            .fund_project(args(
+                json!({"date": "2020-01-01", "amount": "50000.00", "commodity": "$"}),
+            ))
+            .await
+            .unwrap());
+        ok(server
+            .receive_invoice(args(json!({
+                "date": "2020-01-10", "vendor": "GC",
+                "expense_account": "expenses:construction:plumbing",
+                "amount": "800.00", "commodity": "$", "invoice_ref": "INV-1"
+            })))
+            .await
+            .unwrap());
+        ok(server
+            .post_interest(args(
+                json!({"date": "2020-01-15", "amount": "10.00", "commodity": "$"}),
+            ))
+            .await
+            .unwrap());
+
+        // Reads.
+        assert!(
+            ok(server
+                .get_account_balance(args(json!({"account": "assets:checking"})))
+                .await
+                .unwrap())
+            .contains("assets:checking")
+        );
+        assert!(
+            ok(server.list_transactions(args(json!({}))).await.unwrap()).contains("GC invoice")
+        );
+        assert!(ok(server.get_ap_aging(args(json!({}))).await.unwrap()).contains("GC"));
+        assert!(
+            ok(server.get_project_summary(args(json!({}))).await.unwrap())
+                .contains("Balance Sheet")
+        );
+        assert!(
+            ok(server.vendor_list(args(json!({}))).await.unwrap())
+                .contains("liabilities:ap:vendor:GC")
+        );
+        ok(server
+            .pay_invoice(args(
+                json!({"date": "2020-02-01", "vendor": "GC", "amount": "800.00", "commodity": "$"}),
+            ))
+            .await
+            .unwrap());
+
+        // Budget: set → list → over-budget flag (actual 800 > goal 500).
+        ok(server
+            .budget_set(args(json!({
+                "account": "expenses:construction:plumbing",
+                "period": "monthly", "amount": "300.00", "commodity": "$"
+            })))
+            .await
+            .unwrap());
+        assert!(
+            ok(server.budget_list(args(json!({}))).await.unwrap()).contains("monthly = 300.00 $")
+        );
+        let report = ok(server.get_budget_vs_actual(args(json!({}))).await.unwrap());
+        assert!(report.contains("flag over-budget"), "{report}");
+
+        // ECO lifecycle incl. every correctable-error branch.
+        ok(server
+            .eco_create(args(json!({
+                "eco": "7", "trade": "electrical", "vendor": "GC", "description": "outlets",
+                "date": "2020-02-10", "amount": "1500.00", "commodity": "$"
+            })))
+            .await
+            .unwrap());
+        let dup = err_text(
+            server
+                .eco_create(args(json!({
+                    "eco": "7", "trade": "electrical", "vendor": "GC", "description": "again",
+                    "date": "2020-02-10", "amount": "1.00", "commodity": "$"
+                })))
+                .await
+                .unwrap(),
+        );
+        assert!(dup.contains("already exists"), "{dup}");
+        let reserved = err_text(
+            server
+                .eco_create(args(json!({
+                    "eco": "8", "trade": "pending", "vendor": "GC", "description": "x",
+                    "date": "2020-02-10", "amount": "1.00", "commodity": "$"
+                })))
+                .await
+                .unwrap(),
+        );
+        assert!(reserved.contains("reserved"), "{reserved}");
+        let unknown = err_text(
+            server
+                .eco_approve(args(json!({"eco": "404", "date": "2020-02-11"})))
+                .await
+                .unwrap(),
+        );
+        assert!(unknown.contains("unknown change order"), "{unknown}");
+        let approved = ok(server
+            .eco_approve(args(json!({"eco": "7", "date": "2020-02-11"})))
+            .await
+            .unwrap());
+        assert!(approved.contains("approved"), "{approved}");
+        let again = err_text(
+            server
+                .eco_approve(args(json!({"eco": "7", "date": "2020-02-12"})))
+                .await
+                .unwrap(),
+        );
+        assert!(again.contains("already approved"), "{again}");
+        let voided = ok(server
+            .eco_void(args(json!({"eco": "7", "date": "2020-03-01"})))
+            .await
+            .unwrap());
+        assert!(voided.contains("2 reversing"), "{voided}");
+        let fully = err_text(
+            server
+                .eco_void(args(json!({"eco": "7", "date": "2020-03-02"})))
+                .await
+                .unwrap(),
+        );
+        assert!(fully.contains("already fully voided"), "{fully}");
+
+        // Corrections: post → update (void + repost) → close (tombstone).
+        let posted = ok(server
+            .post_transaction(args(json!({
+                "date": "2020-03-05", "description": "misc",
+                "postings": [
+                    {"account": "expenses:construction:plumbing",
+                     "amount": {"quantity": "5.00", "commodity": "$"}},
+                    {"account": "assets:checking"}
+                ]
+            })))
+            .await
+            .unwrap());
+        let id = posted
+            .split("id:")
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .expect("posted id")
+            .to_string();
+        ok(server
+            .update_transaction(args(json!({
+                "id": id,
+                "transaction": {
+                    "date": "2020-03-05", "description": "misc fixed",
+                    "postings": [
+                        {"account": "expenses:construction:plumbing",
+                         "amount": {"quantity": "6.00", "commodity": "$"}},
+                        {"account": "assets:checking"}
+                    ]
+                }
+            })))
+            .await
+            .unwrap());
+        ok(server
+            .close_account(args(json!({"account": "income:interest"})))
+            .await
+            .unwrap());
+
+        // Resources: the ctx-free payloads (the rmcp wrappers are wire-tested in e2e).
+        assert_eq!(resource_listing().len(), 7);
+        let read_text = |result: rmcp::model::ReadResourceResult| -> String {
+            match result.contents.into_iter().next().expect("contents") {
+                rmcp::model::ResourceContents::TextResourceContents { text, .. } => text,
+                other => panic!("expected text contents: {other:?}"),
+            }
+        };
+        let session = server
+            .resource_contents(crate::resources::SESSION_CONTEXT_URI)
+            .await
+            .expect("static read");
+        assert!(read_text(session).contains("Tool groups"));
+        let vendors = server
+            .resource_contents(crate::resources::VENDORS_URI)
+            .await
+            .expect("vendors read");
+        assert!(read_text(vendors).contains("liabilities:ap:vendor:GC"));
+        assert!(server.resource_contents("ledger://nope").await.is_err());
     }
 }

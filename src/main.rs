@@ -29,6 +29,11 @@ struct Cli {
     /// variable (hledger's own convention); read tools error until one is set.
     #[arg(long, env = "LEDGER_FILE")]
     journal: Option<PathBuf>,
+
+    /// Tool-advertising profile: full, operational, readonly, setup, construction, or
+    /// reconcile. Filters what `tools/list` advertises; every tool stays callable (MC-10).
+    #[arg(long, default_value = "full")]
+    profile: hledger_mcp_for_cowork::catalog::Profile,
 }
 
 #[tokio::main]
@@ -94,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
 
     let service = HledgerMcp::new(hledger)
         .with_write_block(write_block)
+        .with_profile(cli.profile)
         .serve_with_ct(stdio(), ct)
         .await
         .context("failed to start MCP stdio service")?;

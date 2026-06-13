@@ -15,6 +15,7 @@
 //!   live in [`ConnectionView`]; every write op runs under [`ConnectionView::guarded`], which
 //!   holds both locks across the whole dedup→append→commit sequence.
 
+pub mod budget;
 pub mod format;
 pub mod input;
 pub mod validate;
@@ -453,7 +454,7 @@ fn regex_escape(s: &str) -> String {
 /// query (whose tag-value match is an unanchored regex) and then re-checks exact equality in
 /// Rust — belt-and-suspenders against any remaining regex surprise. `name` is always a literal
 /// system tag (`id`/`idem`), so only the value needs escaping.
-async fn find_by_exact_tag(
+pub(crate) async fn find_by_exact_tag(
     hledger: &Hledger,
     name: &str,
     value: &str,
@@ -753,6 +754,32 @@ pub async fn vendor_add(
     })
 }
 
+/// Declare whichever of `accounts` are not yet declared, as **one** appended directive block
+/// (= one commit). `Ok(None)` when everything was already declared — no commit. The
+/// auto-declare convenience behind `eco_create` (the `vendor_add` precedent: a domain tool
+/// declares the accounts its postings need).
+pub async fn ensure_declared_accounts(
+    ctx: &WriteContext<'_>,
+    accounts: &[&str],
+) -> Result<Option<CommitOutcome>, WriteError> {
+    let declared = declared_account_set(ctx.hledger).await?;
+    let missing: Vec<&str> = accounts
+        .iter()
+        .copied()
+        .filter(|a| !declared.contains(*a))
+        .collect();
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    let mut text = String::new();
+    for account in &missing {
+        text.push_str(&format!("account {}\n", validate_account_name(account)?));
+    }
+    let joined = missing.join(", ");
+    let commit = append_and_commit(ctx, &text, &format!("declare accounts: {joined}")).await?;
+    Ok(Some(CommitOutcome { id: joined, commit }))
+}
+
 /// `tombstone_account`: **soft-delete** an account by appending a duplicate `account` directive
 /// carrying a `tombstoned:` tag (verified on 1.52: a later duplicate directive's tag registers,
 /// and `accounts --declared tag:^tombstoned$` filters on it). The account stays declared, so
@@ -841,11 +868,13 @@ fn sweep_candidate_temps(dir: &Path) {
     }
 }
 
-/// Startup crash reconciliation: if the working tree **journal** is uncommitted (a crash between
-/// the atomic swap and the commit), **commit it if `check --strict` passes, else restore to
-/// HEAD** — so `HEAD` is always a `check`-valid journal. Returns the new commit oid if it
-/// committed. Scoped to the journal path so an unrelated untracked file (e.g. a swept-too-late
-/// candidate temp) never triggers a spurious empty reconcile commit.
+/// Startup crash reconciliation: if the working tree **journal or budget file** is uncommitted
+/// (a crash between an atomic swap and its commit), **commit if `check --strict` passes, else
+/// restore to HEAD** — so `HEAD` is always a `check`-valid journal. Returns the new commit oid
+/// if it committed. Scoped to exactly the two files the write path swaps (the M2 lesson, now
+/// ×3: dirty-check granularity must match the invariant) so an unrelated untracked file never
+/// triggers a spurious reconcile commit. The journal `include`s the budget file, so one check
+/// of the journal validates the pair.
 pub async fn reconcile(hledger: &Hledger) -> Result<Option<CommitOid>, WriteError> {
     let Some(journal) = hledger.journal_path() else {
         return Ok(None);
@@ -859,13 +888,17 @@ pub async fn reconcile(hledger: &Hledger) -> Result<Option<CommitOid>, WriteErro
     let _flock = acquire_write_flock(&dir).await?;
     sweep_candidate_temps(&dir);
     let repo = GitRepo::open_or_init(&dir)?;
-    if !repo.is_path_dirty(&journal_relpath(journal)?)? {
+    let journal_rel = journal_relpath(journal)?;
+    let budget_rel = Path::new(budget::BUDGET_FILE);
+    let budget_dirty =
+        budget::budget_file_path(journal).exists() && repo.is_path_dirty(budget_rel)?;
+    if !repo.is_path_dirty(&journal_rel)? && !budget_dirty {
         return Ok(None);
     }
     match hledger.check_strict(journal).await {
         Ok(()) => {
             let oid =
-                repo.commit_path(&journal_relpath(journal)?, "reconcile uncommitted journal")?;
+                repo.commit_paths(&[&journal_rel, budget_rel], "reconcile uncommitted journal")?;
             tracing::warn!(commit = %oid, "reconciled an uncommitted but valid journal at startup");
             Ok(Some(oid))
         }
