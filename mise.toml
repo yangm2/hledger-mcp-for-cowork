@@ -16,11 +16,21 @@ min_version = "2024.1.0"
 # Mutation testing — measures whether tests *catch* injected faults (assertion
 # strength), complementing llvm-cov's line execution. Periodic / on-demand, not in
 # the Stop-hook gate (too slow). See `mutants` + `mutants-diff` tasks.
-"cargo:cargo-mutants" = "27.0.0"
+"cargo:cargo-mutants" = "27.1.0"
 # NOTE: tla-checker (the M3 model checker) is deliberately NOT a [tools] entry: mise's own
 # HTTP client cannot reach crates.io under the Claude Code sandbox (TLS OSStatus -26276),
 # and a single failing [tools] entry hard-fails every sandboxed `mise exec`. The `tla` task
 # self-provisions it via `cargo install` (cargo's fetch works sandboxed) into target/.
+
+[settings]
+# Compile cargo-backend tools from source instead of binstalling prebuilt GitHub
+# release artifacts. cargo-mutants ships a macOS x86_64-only asset, so on Apple
+# Silicon binstall yields an Intel binary that runs under Rosetta — and, via macOS
+# spawn arch-preference inheritance, drags the universal xcrun/clang it invokes
+# into Rosetta too (Activity Monitor shows them as `Intel`). Building from source
+# targets the host (aarch64), keeping the whole `mutants-diff` subtree native.
+# (mise has no honored *per-tool* binstall toggle; this global setting is the knob.)
+cargo.binstall = false
 
 [env]
 # Per-clone env file holding the absolute path to the pinned hledger binary.
@@ -217,14 +227,15 @@ echo "golden: regenerated fixtures in $dir (scrubbed). Review the diff before co
 '''
 
 [tasks.mutants]
-description = "Mutation testing on the pure, high-stakes modules (assertion strength; periodic/on-demand, not in the Stop-hook gate). Surviving mutants = test gaps. Pass file paths to scope to just those (default: the parser + amount modules)."
+description = "Mutation testing on the pure, high-stakes modules (assertion strength; periodic/on-demand, not in the Stop-hook gate). Surviving mutants = test gaps. Pass --files to scope to just those (default: the parser + amount modules)."
 # Scope to pure correctness-critical code where a surviving mutant is a real hole;
 # the subprocess/transport/logging glue is excluded (mutants there mostly time out).
 # Default in-scope (M1): the -O json parser + the exact-decimal amount. Extend the default as
-# modules land (M2 formatter, M3 CAS, M4 domain); override per-run with file args, e.g.
-# `mise run mutants src/hledger/json.rs` to mutate only the file you just touched.
+# modules land (M2 formatter, M3 CAS, M4 domain); override per-run with --files, e.g.
+# `mise run mutants --files src/hledger/json.rs` to mutate only the file you just touched
+# (repeat the flag for several: `--files src/epoch.rs --files src/flags.rs`).
 usage = '''
-arg "<files>" var=#true help="Source files to mutate (default: src/hledger/json.rs + src/hledger/amount.rs)"
+flag "-f --files <files>" var=#true help="Source files to mutate (default: src/hledger/json.rs + src/hledger/amount.rs)"
 '''
 run = '''
 #!/usr/bin/env bash

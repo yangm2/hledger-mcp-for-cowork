@@ -135,9 +135,9 @@ Gate (run via `mise`, hledger 1.52 from `.env.local`):
   readback-tested, per the apple-log gotcha. Both are accepted; the total clears the bar.)
 - `mise run mutants` (scoped to `json.rs` + `amount.rs`) — **0 survived** (initial run: 24
   mutants, 18 caught / 6 unviable). Re-verified after the code-review hardening of
-  `parse_balance` — `mise run mutants src/hledger/json.rs`: 11 mutants, 4 caught / 7 unviable /
-  **0 survived**. Zero survivors already meets the stricter M2 bar. (`mutants` now accepts file
-  args to scope a run.)
+  `parse_balance` — `mise run mutants --files src/hledger/json.rs`: 11 mutants, 4 caught / 7
+  unviable / **0 survived**. Zero survivors already meets the stricter M2 bar. (`mutants` scopes
+  a run via the repeatable `--files` flag.)
 
 Checklist:
 
